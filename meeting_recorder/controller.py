@@ -37,7 +37,8 @@ class Controller:
         self.state = State.IDLE
         self._app: str | None = None
         self._ignored_session = False
-        self._widget = None          # floating RecordingWidget (if display present)
+        self._widget = None          # active tray or floating recording controls
+        self._tray = None            # AppIndicator reused across recordings
         self._timer_source = None    # GLib timeout id for the elapsed-time updates
         self._session = None         # Wayland ScreenCast session, while recording
         self._pending_path = None    # output path awaiting the portal handshake
@@ -271,7 +272,12 @@ class Controller:
                       on_stop=self._on_widget_stop)
         try:
             from .tray_indicator import RecordingTray
-            return RecordingTray(**kwargs)
+
+            # Reuse the indicator because its D-Bus object stays registered.
+            if self._tray is None:
+                self._tray = RecordingTray(**kwargs)
+
+            return self._tray
         except Exception:
             LOG.warning("Tray icon unavailable, falling back to the floating "
                         "pill", exc_info=True)
