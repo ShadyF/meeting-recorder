@@ -1,0 +1,42 @@
+<TaskerData sr="" dvi="1" tv="6.6.20">
+  <Task sr="task9200">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>9200</id>
+    <nme>MR Query Bridge</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>130</code>
+      <Str sr="arg0" ve="3">MR Inspect Meetings</Str>
+      <Int sr="arg1"><var>%priority</var></Int>
+      <Int sr="arg10" val="1" />
+      <Str sr="arg2" ve="3" />
+      <Str sr="arg3" ve="3" />
+      <Str sr="arg4" ve="3" />
+      <Int sr="arg5" val="0" />
+      <Int sr="arg6" val="0" />
+      <Str sr="arg7" ve="3" />
+      <Int sr="arg8" val="0" />
+      <Int sr="arg9" val="0" />
+    </Action>
+    <Action sr="act1" ve="7">
+      <code>105</code>
+      <Str sr="arg0" ve="3">BRIDGE
+package=%anpackage()
+id=%anid()
+tag=%antag()
+key=%ankey()
+title=%antitle()
+text=%antext()
+category=%ancategoryname()
+persistent=%anpersistent()
+status=%anstatus()
+button1=%anbutton1text()
+button2=%anbutton2text()
+button3=%anbutton3text()</Str>
+      <Int sr="arg1" val="0" />
+      <Str sr="arg2" ve="3" />
+      <Int sr="arg3" val="0" />
+    </Action>
+  </Task>
+</TaskerData>
