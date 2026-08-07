@@ -1,0 +1,259 @@
+<TaskerData sr="" dvi="1" tv="6.6.20">
+  <Profile sr="prof100" ve="2">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>100</id>
+    <mid0>200</mid0>
+    <nme>MR Calendar Test</nme>
+    <State sr="con0" ve="2">
+      <code>5</code>
+      <Str sr="arg0" ve="3">*MR TEST*</Str>
+      <Str sr="arg1" ve="3" />
+      <Str sr="arg2" ve="3" />
+      <Int sr="arg3" val="0" />
+      <Str sr="arg4" ve="3" />
+    </State>
+  </Profile>
+  <Profile sr="prof101" ve="2">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>101</id>
+    <mid0>201</mid0>
+    <nme>MR Meeting Apps</nme>
+    <App sr="con0" ve="2">
+      <flags>2</flags>
+      <label0>Meet</label0>
+      <pkg0>com.google.android.apps.tachyon</pkg0>
+      <label1>Zoom</label1>
+      <pkg1>us.zoom.videomeetings</pkg1>
+      <label2>Webex</label2>
+      <pkg2>com.cisco.webex.meetings</pkg2>
+      <label3>Teams</label3>
+      <pkg3>com.microsoft.teams</pkg3>
+    </App>
+  </Profile>
+  <Profile sr="prof102" ve="2">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>102</id>
+    <mid0>202</mid0>
+    <nme>MR Notify Meet</nme>
+    <Event sr="con0" ve="2">
+      <code>461</code>
+      <App sr="arg0">
+        <appClass />
+        <appPkg>com.google.android.apps.tachyon</appPkg>
+        <label>Meet</label>
+      </App>
+      <Str sr="arg1" ve="3" />
+      <Str sr="arg2" ve="3" />
+      <Str sr="arg3" ve="3" />
+      <Str sr="arg4" ve="3" />
+      <Str sr="arg5" ve="3" />
+      <Str sr="arg6" ve="3" />
+      <Int sr="arg7" val="1" />
+    </Event>
+  </Profile>
+  <Profile sr="prof103" ve="2">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>103</id>
+    <mid0>202</mid0>
+    <nme>MR Notify Zoom</nme>
+    <Event sr="con0" ve="2">
+      <code>461</code>
+      <App sr="arg0">
+        <appClass />
+        <appPkg>us.zoom.videomeetings</appPkg>
+        <label>Zoom</label>
+      </App>
+      <Str sr="arg1" ve="3" />
+      <Str sr="arg2" ve="3" />
+      <Str sr="arg3" ve="3" />
+      <Str sr="arg4" ve="3" />
+      <Str sr="arg5" ve="3" />
+      <Str sr="arg6" ve="3" />
+      <Int sr="arg7" val="1" />
+    </Event>
+  </Profile>
+  <Profile sr="prof104" ve="2">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>104</id>
+    <mid0>202</mid0>
+    <nme>MR Notify Webex</nme>
+    <Event sr="con0" ve="2">
+      <code>461</code>
+      <App sr="arg0">
+        <appClass />
+        <appPkg>com.cisco.webex.meetings</appPkg>
+        <label>Webex</label>
+      </App>
+      <Str sr="arg1" ve="3" />
+      <Str sr="arg2" ve="3" />
+      <Str sr="arg3" ve="3" />
+      <Str sr="arg4" ve="3" />
+      <Str sr="arg5" ve="3" />
+      <Str sr="arg6" ve="3" />
+      <Int sr="arg7" val="1" />
+    </Event>
+  </Profile>
+  <Profile sr="prof105" ve="2">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>105</id>
+    <mid0>202</mid0>
+    <nme>MR Notify Teams</nme>
+    <Event sr="con0" ve="2">
+      <code>461</code>
+      <App sr="arg0">
+        <appClass />
+        <appPkg>com.microsoft.teams</appPkg>
+        <label>Teams</label>
+      </App>
+      <Str sr="arg1" ve="3" />
+      <Str sr="arg2" ve="3" />
+      <Str sr="arg3" ve="3" />
+      <Str sr="arg4" ve="3" />
+      <Str sr="arg5" ve="3" />
+      <Str sr="arg6" ve="3" />
+      <Int sr="arg7" val="1" />
+    </Event>
+  </Profile>
+  <Project sr="proj0" ve="2">
+    <cdate>1786060800000</cdate>
+    <name>Meeting ASR Pixel 7</name>
+    <pids>100,101,102,103,104,105</pids>
+    <tids>200,201,202,203,204,205</tids>
+  </Project>
+  <Task sr="task200">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>200</id>
+    <nme>Signal Calendar</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>129</code>
+      <Str sr="arg0" ve="3">var now = Number(global('TIMES')) || Math.floor(Date.now()/1000);
+var cooldown = Number(global('MR_COOLDOWN_UNTIL')) || 0;
+if (now &gt;= cooldown) {
+  setGlobal('MR_COOLDOWN_UNTIL', String(now + 2700));
+  performTask('Prompt', 100, '', '');
+}</Str>
+      <Str sr="arg1" ve="3" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="45" />
+    </Action>
+  </Task>
+  <Task sr="task201">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>201</id>
+    <nme>Signal App</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>129</code>
+      <Str sr="arg0" ve="3">var now = Number(global('TIMES')) || Math.floor(Date.now()/1000);
+setGlobal('MR_APP_AT', String(now));
+var cooldown = Number(global('MR_COOLDOWN_UNTIL')) || 0;
+var notification = Number(global('MR_NOTIFICATION_AT')) || 0;
+if (now &gt;= cooldown &amp;&amp; notification !== 0 &amp;&amp; now - notification &lt;= 600 &amp;&amp; now - notification &gt;= 0) {
+  setGlobal('MR_COOLDOWN_UNTIL', String(now + 2700));
+  performTask('Prompt', 100, '', '');
+}</Str>
+      <Str sr="arg1" ve="3" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="45" />
+    </Action>
+  </Task>
+  <Task sr="task202">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>202</id>
+    <nme>Signal Notification</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>129</code>
+      <Str sr="arg0" ve="3">var now = Number(global('TIMES')) || Math.floor(Date.now()/1000);
+setGlobal('MR_NOTIFICATION_AT', String(now));
+var cooldown = Number(global('MR_COOLDOWN_UNTIL')) || 0;
+var app = Number(global('MR_APP_AT')) || 0;
+if (now &gt;= cooldown &amp;&amp; app !== 0 &amp;&amp; now - app &lt;= 600 &amp;&amp; now - app &gt;= 0) {
+  setGlobal('MR_COOLDOWN_UNTIL', String(now + 2700));
+  performTask('Prompt', 100, '', '');
+}</Str>
+      <Str sr="arg1" ve="3" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="45" />
+    </Action>
+  </Task>
+  <Task sr="task203">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>203</id>
+    <nme>Prompt</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>523</code>
+      <Str sr="arg0" ve="3">Meeting detected</Str>
+      <Str sr="arg1" ve="3">Open ASR to record</Str>
+      <Str sr="arg10" ve="3" />
+      <Str sr="arg11" ve="3" />
+      <Img sr="arg2" ve="2" />
+      <Int sr="arg3" val="0" />
+      <Int sr="arg4" val="1" />
+      <Int sr="arg5" val="3" />
+      <Int sr="arg6" val="0" />
+      <Int sr="arg7" val="1" />
+      <Int sr="arg8" val="0" />
+      <Str sr="arg9" ve="3" />
+      <ListElementItem sr="item0">
+        <label>Open ASR</label>
+        <Action sr="action" ve="7">
+          <code>130</code>
+          <Str sr="arg0" ve="3">Launch ASR</Str>
+          <Int sr="arg1"><var>%priority</var></Int>
+          <Int sr="arg10" val="1" />
+          <Str sr="arg2" ve="3" />
+          <Str sr="arg3" ve="3" />
+          <Str sr="arg4" ve="3" />
+          <Int sr="arg5" val="0" />
+          <Int sr="arg6" val="0" />
+          <Str sr="arg7" ve="3" />
+          <Int sr="arg8" val="0" />
+          <Int sr="arg9" val="0" />
+        </Action>
+      </ListElementItem>
+    </Action>
+  </Task>
+  <Task sr="task204">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>204</id>
+    <nme>Launch ASR</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>129</code>
+      <Str sr="arg0" ve="3">loadApp('com.nll.asr', undefined, false);</Str>
+      <Str sr="arg1" ve="3" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="45" />
+    </Action>
+  </Task>
+  <Task sr="task205">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>205</id>
+    <nme>Manual Re-arm</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>129</code>
+      <Str sr="arg0" ve="3">setGlobal('MR_COOLDOWN_UNTIL', '');
+setGlobal('MR_APP_AT', '');
+setGlobal('MR_NOTIFICATION_AT', '');</Str>
+      <Str sr="arg1" ve="3" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="45" />
+    </Action>
+  </Task>
+</TaskerData>

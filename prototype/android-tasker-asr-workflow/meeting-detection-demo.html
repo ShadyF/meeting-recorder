@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meeting detection logic demo</title>
+  <style>
+    :root { --ink:#18313a; --muted:#60727a; --paper:#f7f4ed; --panel:#fffdf8; --line:#d6ddd8; --accent:#b9552d; --accent-dark:#8d3e20; --soft:#edf3f0; --warn:#f7e9d8; --shadow:0 16px 40px rgba(24,49,58,.09); }
+    * { box-sizing:border-box; }
+    body { margin:0; background:linear-gradient(135deg,#f7f4ed 0%,#edf3f0 100%); color:var(--ink); font:16px/1.5 Georgia, "Times New Roman", serif; }
+    main { max-width:1160px; margin:0 auto; padding:44px 24px 64px; }
+    .eyebrow { margin:0 0 12px; color:var(--accent-dark); font:700 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing:.13em; text-transform:uppercase; }
+    h1,h2,h3 { line-height:1.12; margin:0; } h1 { max-width:820px; font-size:clamp(2rem,5vw,3.75rem); letter-spacing:-.045em; } h2 { font-size:1.45rem; } h3 { font-size:1rem; }
+    .lede { max-width:720px; margin:18px 0 0; color:#35505a; font-size:1.1rem; }
+    .notice { margin:26px 0 30px; max-width:800px; padding:14px 16px; border-left:4px solid var(--accent); background:rgba(255,253,248,.72); color:#3b4d52; }
+    .layout { display:grid; grid-template-columns:minmax(0,1.18fr) minmax(310px,.82fr); gap:22px; align-items:start; }
+    .stack { display:grid; gap:22px; }
+    .panel { background:rgba(255,253,248,.88); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); padding:24px; }
+    .section-note { margin:8px 0 20px; color:var(--muted); font-size:.94rem; }
+    .control-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    button { appearance:none; width:100%; min-height:44px; padding:10px 13px; border:1px solid #9baaa9; border-radius:7px; background:var(--panel); color:var(--ink); cursor:pointer; font:700 14px/1.15 ui-monospace, SFMono-Regular, Menlo, monospace; text-align:left; transition:transform .15s ease, background .15s ease, border-color .15s ease; }
+    button:hover { transform:translateY(-1px); border-color:var(--accent); background:#fff8f3; } button:focus-visible { outline:3px solid #4d8795; outline-offset:2px; } button.primary { background:var(--accent); border-color:var(--accent); color:white; } button.primary:hover { background:var(--accent-dark); }
+    .time-controls { display:flex; flex-wrap:wrap; gap:8px; } .time-controls button { width:auto; }
+    .asr { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); }
+    .asr-actions { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:12px; }
+    .scenarios { display:grid; gap:10px; }
+    .scenario { display:grid; grid-template-columns:1fr auto; gap:12px; align-items:center; padding:13px; border:1px solid var(--line); border-radius:8px; background:#fffefa; }
+    .scenario p { margin:4px 0 0; color:var(--muted); font-size:.88rem; } .scenario button { width:auto; white-space:nowrap; }
+    .guide-runner { margin-top:14px; padding:13px; border-radius:8px; background:var(--soft); } .guide-runner p { margin:0 0 10px; font-size:.93rem; }
+    .state-card { position:sticky; top:18px; }
+    .decision { margin:16px 0 18px; padding:14px; border-radius:8px; background:var(--warn); border:1px solid #e9cda9; } .decision strong { display:block; margin-bottom:3px; }
+    dl { display:grid; grid-template-columns:minmax(130px,.8fr) 1.2fr; margin:0; border-top:1px solid var(--line); font:14px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; } dt,dd { margin:0; padding:10px 0; border-bottom:1px solid var(--line); } dt { color:var(--muted); } dd { font-weight:700; text-align:right; word-break:break-word; }
+    .legend { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; } .chip { padding:4px 8px; border-radius:999px; background:var(--soft); color:#36535a; font:12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    footer { margin-top:22px; color:var(--muted); font-size:.85rem; }
+    @media (max-width:800px) { main { padding:30px 16px 48px; } .layout { grid-template-columns:1fr; } .state-card { position:static; } }
+    @media (max-width:460px) { .control-grid,.asr-actions { grid-template-columns:1fr; } .scenario { grid-template-columns:1fr; } .scenario button { width:100%; } }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Throwaway prototype · local simulation only</p>
+    <h1>Can three meeting signals yield one useful ASR prompt?</h1>
+    <p class="lede">This explores whether a selected Calendar event, a foreground meeting app, and a matching meeting notification can prompt once without repeated prompts.</p>
+    <p class="notice"><strong>Important:</strong> this only models when to show a prompt. Tasker can prompt or launch ASR, but shortcut and auto-start behavior is unproven per device. One user tap to Start is an acceptable fallback; silent recording is not assumed to be reliable.</p>
+
+    <div class="layout">
+      <div class="stack">
+        <section class="panel" aria-labelledby="free-play-title">
+          <p class="eyebrow">Free play</p>
+          <h2 id="free-play-title">Send a simulated signal</h2>
+          <p class="section-note">Calendar may prompt on its own. App and notification are weak until they arrive within ten minutes of each other.</p>
+          <div class="control-grid">
+            <button class="primary" data-action="CALENDAR">Selected calendar event is active</button>
+            <button data-action="APP">Meeting app moved to foreground</button>
+            <button data-action="NOTIFICATION">Matching meeting notification arrived</button>
+            <button data-action="REARM">Manual re-arm — clear cooldown + signals</button>
+          </div>
+          <div class="asr">
+            <h3>Prompt follow-through</h3>
+            <p class="section-note">Tasker can prompt or launch ASR. Auto-start is unproven per device; one user tap is an acceptable fallback.</p>
+            <div class="asr-actions">
+              <button data-action="LAUNCH_ASR">Launch ASR from prompt</button>
+              <button data-action="TAP_ASR">User tapped Start in ASR</button>
+            </div>
+          </div>
+          <div class="asr">
+            <h3>Advance simulated time</h3>
+            <div class="time-controls">
+              <button data-action="ADVANCE" data-minutes="1">+1 minute</button>
+              <button data-action="ADVANCE" data-minutes="5">+5 minutes</button>
+              <button data-action="ADVANCE" data-minutes="10">+10 minutes</button>
+              <button data-action="ADVANCE" data-minutes="45">+45 minutes</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="guided-title">
+          <p class="eyebrow">Guided scenarios</p>
+          <h2 id="guided-title">Walk the decision path</h2>
+          <p class="section-note">Loading a scenario resets the simulation. Use “run next step” to see every state change.</p>
+          <div class="scenarios" id="scenario-list"></div>
+          <div class="guide-runner" id="guide-runner" hidden>
+            <p id="guide-copy"></p>
+            <button class="primary" id="run-guide" type="button">Run next guided step</button>
+          </div>
+        </section>
+      </div>
+
+      <aside class="panel state-card" aria-labelledby="state-title" aria-live="polite">
+        <p class="eyebrow">Live state</p>
+        <h2 id="state-title">Decision record</h2>
+        <div class="decision"><strong id="decision-title">Waiting for a signal</strong><span id="decision-reason">Choose a signal or a guided scenario.</span></div>
+        <dl>
+          <dt>Simulated time</dt><dd id="now"></dd>
+          <dt>Calendar signal</dt><dd id="calendar-signal"></dd>
+          <dt>Foreground app signal</dt><dd id="app-signal"></dd>
+          <dt>Meeting notification</dt><dd id="notification-signal"></dd>
+          <dt>Cooldown until</dt><dd id="cooldown"></dd>
+          <dt>Prompt count</dt><dd id="prompt-count"></dd>
+          <dt>Prompt status</dt><dd id="prompt-status"></dd>
+          <dt>ASR launch status</dt><dd id="launch-status"></dd>
+          <dt>ASR tap status</dt><dd id="tap-status"></dd>
+          <dt>Guided scenario</dt><dd id="guide-status"></dd>
+        </dl>
+        <div class="legend"><span class="chip">Calendar: strong</span><span class="chip">App: weak</span><span class="chip">Notification: weak</span><span class="chip">Cooldown: 45 min</span></div>
+      </aside>
+    </div>
+    <footer>All data stays in this page and disappears on refresh.</footer>
+  </main>
+
+  <script>
+    /* Pure meeting-detection state module: no DOM access, storage, or network calls. */
+    const MeetingLogic = (() => {
+      const CORRELATION_WINDOW = 10;
+      const COOLDOWN = 45;
+      const scenarios = {
+        calendar: { title: "Calendar happy path", summary: "A selected active event is enough to prompt.", steps: [{ type:"CALENDAR", label:"Selected calendar event becomes active." }] },
+        correlation: { title: "App + notification correlation", summary: "Two weak signals become useful when close together.", steps: [{ type:"APP", label:"Meeting app enters the foreground." }, { type:"ADVANCE", minutes:4, label:"Advance four minutes." }, { type:"NOTIFICATION", label:"Matching meeting notification arrives." }] },
+        duplicate: { title: "Duplicate suppression", summary: "A second strong signal stays quiet during cooldown.", steps: [{ type:"CALENDAR", label:"Calendar prompts once." }, { type:"ADVANCE", minutes:2, label:"Advance two minutes." }, { type:"CALENDAR", label:"Another calendar signal arrives during cooldown." }] },
+        weak: { title: "Weak signal rejection", summary: "One weak signal never prompts by itself.", steps: [{ type:"APP", label:"Meeting app enters the foreground alone." }, { type:"ADVANCE", minutes:11, label:"Advance past the correlation window." }, { type:"NOTIFICATION", label:"Matching notification arrives too late to correlate." }] },
+        rearm: { title: "Manual re-arm", summary: "Re-arm clears the cooldown, shown prompt, and every recorded signal.", steps: [{ type:"CALENDAR", label:"Calendar prompts and begins cooldown." }, { type:"ADVANCE", minutes:5, label:"Advance five minutes." }, { type:"APP", label:"A weak app signal is recorded during cooldown." }, { type:"REARM", label:"Person manually re-arms; cooldown, prompt, and all signal timestamps clear." }, { type:"NOTIFICATION", label:"A new notification arrives alone and cannot correlate with the cleared app signal." }, { type:"CALENDAR", label:"A new calendar signal can prompt again." }] }
+      };
+      const initialState = () => ({ now:540, signals:{ calendar:null, app:null, notification:null }, cooldownUntil:null, promptCount:0, promptVisible:false, asrLaunch:"Not launched", asrTap:"No tap yet", decision:{ title:"Waiting for a signal", reason:"Choose a signal or a guided scenario." }, guide:null });
+      const inCooldown = state => state.cooldownUntil !== null && state.now < state.cooldownUntil;
+      const setDecision = (state, title, reason) => ({ ...state, decision:{ title, reason } });
+      const prompt = (state, reason) => setDecision({ ...state, promptCount:state.promptCount + 1, promptVisible:true, cooldownUntil:state.now + COOLDOWN, asrLaunch:"Not launched", asrTap:"No tap yet" }, "Prompt shown", reason + " Cooldown starts now for 45 minutes.");
+      const signal = (state, kind) => {
+        const next = { ...state, signals:{ ...state.signals, [kind]:state.now } };
+        if (inCooldown(next)) return setDecision(next, "No prompt — cooldown active", "Signal recorded, but prompts are paused until " + formatTime(next.cooldownUntil) + ".");
+        if (kind === "calendar") return prompt(next, "Selected calendar event is active, a strong signal.");
+        const peer = kind === "app" ? next.signals.notification : next.signals.app;
+        if (peer !== null && next.now - peer >= 0 && next.now - peer <= CORRELATION_WINDOW) return prompt(next, "Foreground meeting app and matching notification correlated within " + CORRELATION_WINDOW + " minutes.");
+        return setDecision(next, "No prompt — weak signal", (kind === "app" ? "Foreground meeting app" : "Matching meeting notification") + " is recorded but cannot prompt alone.");
+      };
+      const reduce = (state, action) => {
+        switch (action.type) {
+          case "CALENDAR": return signal(state, "calendar");
+          case "APP": return signal(state, "app");
+          case "NOTIFICATION": return signal(state, "notification");
+          case "ADVANCE": return setDecision({ ...state, now:state.now + action.minutes }, "Time advanced", "Advanced simulated time by " + action.minutes + " minute" + (action.minutes === 1 ? "." : "s."));
+          case "REARM": return setDecision({ ...state, cooldownUntil:null, promptVisible:false, signals:{ calendar:null, app:null, notification:null } }, "Manual re-arm complete", "Cooldown and shown prompt cleared. Calendar, foreground app, and notification timestamps were also cleared, so only new signals can qualify.");
+          case "LAUNCH_ASR": return state.promptVisible ? setDecision({ ...state, asrLaunch:"Launched from prompt" }, "ASR launch requested", "Tasker can launch ASR, but shortcut and auto-start behavior is unproven per device. A user tap to Start is an acceptable fallback; silent recording is not modeled.") : setDecision(state, "ASR not launched", "Show a meeting prompt first.");
+          case "TAP_ASR": return state.asrLaunch === "Launched from prompt" ? setDecision({ ...state, asrTap:"User tapped Start" }, "ASR start confirmed", "This models an explicit user tap, not silent recording.") : setDecision(state, "ASR start not confirmed", "Launch ASR from a shown prompt before tapping Start.");
+          case "LOAD_GUIDE": return { ...initialState(), guide:{ id:action.id, next:0 }, decision:{ title:"Guided scenario loaded", reason:scenarios[action.id].summary } };
+          case "RUN_GUIDE": {
+            if (!state.guide) return setDecision(state, "No guided scenario selected", "Load a scenario first.");
+            const scenario = scenarios[state.guide.id], step = scenario.steps[state.guide.next];
+            if (!step) return setDecision(state, "Guided scenario complete", "Load another scenario or continue in free play.");
+            const result = reduce(state, step);
+            return { ...result, guide:{ ...state.guide, next:state.guide.next + 1 } };
+          }
+          default: return state;
+        }
+      };
+      const formatTime = minutes => {
+        const day = Math.floor(minutes / 1440), clock = minutes % 1440, hour = Math.floor(clock / 60), minute = clock % 60;
+        return "Day " + (day + 1) + " · " + String(hour).padStart(2, "0") + ":" + String(minute).padStart(2, "0");
+      };
+      return { initialState, reduce, scenarios, formatTime };
+    })();
+
+    /* DOM layer: renders the pure state and sends user actions to the reducer. */
+    let state = MeetingLogic.initialState();
+    const $ = id => document.getElementById(id);
+    const signalField = value => value === null ? "None" : MeetingLogic.formatTime(value);
+    const render = () => {
+      $("now").textContent = MeetingLogic.formatTime(state.now);
+      $("calendar-signal").textContent = signalField(state.signals.calendar);
+      $("app-signal").textContent = signalField(state.signals.app);
+      $("notification-signal").textContent = signalField(state.signals.notification);
+      $("cooldown").textContent = state.cooldownUntil === null ? "Not active" : MeetingLogic.formatTime(state.cooldownUntil);
+      $("prompt-count").textContent = String(state.promptCount);
+      $("prompt-status").textContent = state.promptVisible ? "Shown" : "Not shown";
+      $("launch-status").textContent = state.asrLaunch;
+      $("tap-status").textContent = state.asrTap;
+      $("decision-title").textContent = state.decision.title;
+      $("decision-reason").textContent = state.decision.reason;
+      const scenario = state.guide && MeetingLogic.scenarios[state.guide.id];
+      $("guide-status").textContent = scenario ? scenario.title + " · " + Math.min(state.guide.next, scenario.steps.length) + "/" + scenario.steps.length : "None";
+      $("guide-runner").hidden = !scenario || state.guide.next >= scenario.steps.length;
+      if (scenario && state.guide.next < scenario.steps.length) $("guide-copy").textContent = "Next: " + scenario.steps[state.guide.next].label;
+    };
+    const dispatch = action => { state = MeetingLogic.reduce(state, action); render(); };
+    document.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", () => dispatch({ type:button.dataset.action, minutes:Number(button.dataset.minutes) || undefined })));
+    Object.entries(MeetingLogic.scenarios).forEach(([id, scenario]) => {
+      const item = document.createElement("article"); item.className = "scenario";
+      item.innerHTML = "<div><h3>" + scenario.title + "</h3><p>" + scenario.summary + "</p></div><button type=\"button\">Load</button>";
+      item.querySelector("button").addEventListener("click", () => dispatch({ type:"LOAD_GUIDE", id }));
+      $("scenario-list").append(item);
+    });
+    $("run-guide").addEventListener("click", () => dispatch({ type:"RUN_GUIDE" }));
+    render();
+  </script>
+</body>
+</html>
