@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Capture mode prompt — interaction prototype</title>
+  <style>
+    :root { --ink:#11211f; --paper:#f4f0e8; --line:#d8d1c4; --muted:#706d68; --green:#1e6d5b; --green-dark:#0d4e40; --mint:#bdebd5; --yellow:#f2bd3e; --rose:#bc5050; --night:#182526; --panel:#fffdf8; --shadow:0 22px 55px rgba(22,35,33,.13); }
+    * { box-sizing:border-box; }
+    body { margin:0; min-width:320px; color:var(--ink); background:radial-gradient(circle at 78% 7%, #c3e6d8 0 12%, transparent 35%), var(--paper); font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    button, input, textarea { font:inherit; } button { cursor:pointer; } button:focus-visible, input:focus-visible, textarea:focus-visible { outline:3px solid var(--yellow); outline-offset:3px; }
+    .page { max-width:1220px; min-height:100vh; margin:auto; padding:28px 28px 112px; }
+    .eyebrow { display:flex; align-items:center; gap:9px; color:var(--green-dark); font-size:11px; font-weight:800; letter-spacing:.12em; text-transform:uppercase; } .eyebrow::before { content:""; width:8px; height:8px; border-radius:99px; background:var(--yellow); box-shadow:0 0 0 4px #fff3c7; }
+    h1, h2, h3, p { margin-top:0; } h1, h2 { font-family:Iowan Old Style, Palatino Linotype, Book Antiqua, Georgia, serif; letter-spacing:-.04em; }
+    h1 { max-width:900px; margin:13px 0 10px; font-size:clamp(2.35rem,6vw,5.25rem); line-height:.91; } .question { max-width:730px; color:#3f4c49; font-family:Iowan Old Style, Palatino Linotype, Georgia, serif; font-size:clamp(1.08rem,2vw,1.38rem); line-height:1.35; }
+    .facts { display:flex; flex-wrap:wrap; gap:8px; margin:23px 0 34px; } .fact { padding:7px 10px; border:1px solid var(--line); background:rgba(255,253,248,.66); color:var(--muted); font-size:11px; } .fact strong { color:var(--green-dark); }
+    .layout { display:grid; grid-template-columns:minmax(0,1fr) 312px; align-items:start; gap:24px; }
+    .stage { position:relative; overflow:hidden; min-height:560px; padding:30px; border:1px solid #29443e; background:linear-gradient(145deg,#203b38,#102321); box-shadow:var(--shadow); } .stage::after { content:""; position:absolute; inset:0; pointer-events:none; opacity:.18; background-image:linear-gradient(90deg,transparent 96%,#fff 96%),linear-gradient(transparent 96%,#fff 96%); background-size:18px 18px; mask-image:linear-gradient(to bottom,black,transparent); }
+    .variant-kicker { position:relative; z-index:1; display:inline-flex; padding:6px 8px; border:1px solid rgba(255,255,255,.3); color:#d9efea; font-size:10px; font-weight:bold; letter-spacing:.12em; text-transform:uppercase; }
+    .stage-title { position:relative; z-index:1; margin:15px 0 3px; color:#fffdf8; font-size:clamp(1.7rem,3.2vw,2.55rem); line-height:1; } .stage-copy { position:relative; z-index:1; max-width:560px; color:#b9cfca; line-height:1.5; font-size:13px; }
+    .notification-zone { position:relative; z-index:1; display:flex; justify-content:center; align-items:center; min-height:355px; padding:28px 0; }
+    .notification { width:min(100%,620px); overflow:hidden; color:#17211f; border:1px solid rgba(255,255,255,.55); border-radius:17px; background:rgba(255,253,248,.98); box-shadow:0 22px 48px rgba(0,0,0,.33); animation:arrive .36s cubic-bezier(.2,.9,.2,1); } @keyframes arrive { from { opacity:0; transform:translateY(13px) scale(.98); } to { opacity:1; transform:none; } }
+    .notification-top { display:flex; align-items:center; justify-content:space-between; padding:13px 17px 0; color:#60706b; font-size:10px; letter-spacing:.08em; text-transform:uppercase; } .app-id { display:flex; align-items:center; gap:7px; } .app-dot { width:10px; height:10px; border-radius:3px; background:var(--green); } .timer { color:var(--rose); }
+    .notification-body { display:grid; grid-template-columns:48px 1fr; gap:14px; padding:17px; } .notice-icon { display:grid; place-items:center; width:48px; height:48px; border-radius:13px; background:var(--mint); color:var(--green-dark); font-size:23px; } .notice-title { margin:2px 0 5px; font-family:Iowan Old Style, Palatino Linotype, Georgia, serif; font-size:23px; line-height:1; } .notice-text { margin:0; color:#59645f; font-family:system-ui,sans-serif; font-size:13px; line-height:1.4; }
+    .action-row { display:grid; border-top:1px solid #dfded7; } .action-row.three { grid-template-columns:1fr 1fr 1fr; } .action-row.two { grid-template-columns:1fr 1fr; } .notification button { min-height:53px; padding:10px; border:0; border-right:1px solid #dfded7; background:transparent; color:#40504b; font-size:12px; font-weight:800; } .notification button:last-child { border-right:0; } .notification button:hover { background:#f2f6f2; } .notification button.primary { background:var(--green); color:white; } .notification button.primary:hover { background:var(--green-dark); } .notification button.danger { color:#9a3e3e; }
+    .audio-first { display:grid; grid-template-columns:1.1fr .9fr; } .audio-first .notice-icon { width:100%; height:100%; min-height:129px; border-radius:0; background:#ffe7a6; font-size:40px; } .audio-first .notice-copy { padding:25px 24px; } .audio-first .notice-title { font-size:29px; } .audio-first .action-row { grid-column:1 / -1; }
+    .mode-first { padding:18px; } .mode-first .notice-title { margin-bottom:7px; } .mode-choices { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:18px; } .notification .mode-choice { min-height:112px; padding:16px; border:1px solid #d8ddd6; border-radius:10px; background:#f6f8f4; text-align:left; } .notification .mode-choice:hover { border-color:var(--green); background:#edf6f0; } .choice-icon { display:block; margin-bottom:12px; color:var(--green); font-size:21px; } .choice-name { display:block; color:var(--ink); font-size:14px; } .choice-detail { display:block; margin-top:4px; color:var(--muted); font-family:system-ui,sans-serif; font-size:11px; font-weight:400; }
+    .confirm { padding:25px; text-align:center; } .confirm-mark { display:grid; place-items:center; width:52px; height:52px; margin:0 auto 13px; border-radius:50%; background:var(--mint); color:var(--green-dark); font-size:26px; } .confirm h3 { margin:0 0 7px; font-family:Iowan Old Style, Palatino Linotype, Georgia, serif; font-size:28px; letter-spacing:-.04em; } .confirm p { margin:0 auto 19px; max-width:370px; color:#59645f; font-family:system-ui,sans-serif; font-size:13px; line-height:1.45; }
+    .empty-notice { width:min(100%,520px); padding:35px 28px; color:#d5e2dc; border:1px dashed rgba(255,255,255,.35); text-align:center; } .empty-notice strong { display:block; margin-bottom:8px; color:white; font-family:Iowan Old Style, Georgia, serif; font-size:28px; } .empty-notice span { font-size:12px; line-height:1.5; }
+    .rail { display:grid; gap:14px; } .card { padding:17px; border:1px solid var(--line); background:rgba(255,253,248,.8); } .card h2 { margin-bottom:12px; font-size:23px; line-height:1; } .card h3 { margin:0 0 9px; color:var(--green-dark); font-size:11px; letter-spacing:.1em; text-transform:uppercase; }
+    .switch { display:grid; grid-template-columns:1fr 1fr; gap:7px; } .switch button, .scenario, .control { padding:10px; border:1px solid var(--line); background:#fffdf8; color:var(--ink); text-align:left; font-size:11px; font-weight:bold; } .switch button[aria-pressed="true"] { border-color:var(--green); background:var(--green); color:white; }
+    .scenario-list, .control-list { display:grid; gap:7px; } .scenario { position:relative; padding-left:31px; } .scenario::before { position:absolute; left:11px; color:var(--green); content:"→"; } .scenario:hover, .control:hover { border-color:var(--green); background:#edf6f0; } .control { display:flex; justify-content:space-between; align-items:center; } .control b { color:var(--green-dark); }
+    .toggle { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px; border:1px solid var(--line); font-size:11px; font-weight:bold; } .toggle input { appearance:none; position:relative; width:35px; height:20px; margin:0; border-radius:20px; background:#b9c2be; transition:.2s; } .toggle input::after { content:""; position:absolute; top:3px; left:3px; width:14px; height:14px; border-radius:50%; background:white; transition:.2s; } .toggle input:checked { background:var(--green); } .toggle input:checked::after { transform:translateX(15px); }
+    .state { display:grid; gap:7px; } .state-line { display:flex; justify-content:space-between; gap:10px; padding-bottom:7px; border-bottom:1px solid #e5e0d7; color:var(--muted); font-size:10px; } .state-line:last-child { border:0; padding:0; } .state-line strong { color:var(--ink); font-size:10px; text-align:right; } .outcome { margin-top:10px; padding:10px; border-left:3px solid var(--yellow); background:#fff4d5; color:#4a412c; font-family:system-ui,sans-serif; font-size:12px; line-height:1.35; }
+    .feedback { grid-column:1 / -1; margin-top:2px; padding:19px 21px; border:1px solid #a7cfc0; background:#dff2e9; } .feedback h2 { margin-bottom:7px; font-size:26px; } .feedback p { margin-bottom:10px; color:#3e5750; font-family:system-ui,sans-serif; font-size:13px; } textarea { display:block; width:100%; min-height:76px; resize:vertical; padding:10px; border:1px solid #9ebfaf; background:#fafffc; color:var(--ink); font-family:system-ui,sans-serif; font-size:13px; }
+    .bottom-nav { position:fixed; z-index:4; bottom:17px; left:50%; display:flex; align-items:center; gap:8px; padding:7px; border:1px solid #39534b; border-radius:99px; background:var(--night); box-shadow:0 12px 30px rgba(0,0,0,.25); transform:translateX(-50%); } .bottom-nav button { padding:9px 13px; border:0; border-radius:99px; background:transparent; color:#eaf3ef; font-size:11px; font-weight:bold; } .bottom-nav button:hover { background:#314943; } .bottom-nav .count { min-width:50px; color:#b2cbc2; font-size:10px; text-align:center; }
+    @media (max-width:860px) { .layout { grid-template-columns:1fr; } .rail { grid-template-columns:repeat(2,minmax(0,1fr)); } .rail .card:first-child { grid-column:1 / -1; } }
+    @media (max-width:560px) { .page { padding:20px 16px 100px; } .stage { min-height:490px; padding:20px; } .rail { grid-template-columns:1fr; } .rail .card:first-child { grid-column:auto; } .notification-zone { min-height:285px; padding:18px 0; } .audio-first { grid-template-columns:1fr; } .audio-first .notice-icon { min-height:65px; } .mode-choices { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="eyebrow">Prototype — not production</div>
+    <h1>Choose the capture mode<br>without a surprise recording.</h1>
+    <p class="question"><strong>Question:</strong> How should the existing desktop notification expose video, audio-only, and ignore while preserving immediate audio-only behavior when auto-record is enabled?</p>
+    <div class="facts"><span class="fact"><strong>Capture mode:</strong> audio-only or audio-video</span><span class="fact"><strong>Video source:</strong> chosen later</span><span class="fact"><strong>Close / timeout:</strong> never records</span></div>
+
+    <section class="layout" aria-label="Capture mode prompt simulator">
+      <section class="stage" aria-live="polite">
+        <span class="variant-kicker" id="variantKicker"></span>
+        <h2 class="stage-title" id="variantTitle"></h2>
+        <p class="stage-copy" id="variantCopy"></p>
+        <div class="notification-zone" id="notificationZone"></div>
+      </section>
+
+      <aside class="rail">
+        <section class="card"><h3>Recording condition</h3><label class="toggle">Auto-record enabled <input id="autoRecord" type="checkbox" role="switch"></label><p style="margin:10px 0 0;color:var(--muted);font:11px/1.45 system-ui,sans-serif;">When enabled, detection always starts audio-only immediately. No prompt is shown.</p></section>
+        <section class="card"><h3>Guided scenarios</h3><div class="scenario-list"><button class="scenario" data-scenario="video">Prompted video</button><button class="scenario" data-scenario="audio">Prompted audio-only</button><button class="scenario" data-scenario="dismiss">Ignored / closed / timeout</button><button class="scenario" data-scenario="auto">Auto-record: immediate audio-only</button><button class="scenario" data-scenario="fallback">No-action fallback</button></div></section>
+        <section class="card"><h3>Event lab</h3><div class="control-list"><button class="control" data-event="DETECT"><span>Detect meeting</span><b>↗</b></button><button class="control" data-event="VIDEO"><span>Video action</span><b>V</b></button><button class="control" data-event="AUDIO"><span>Audio-only action</span><b>A</b></button><button class="control" data-event="IGNORE"><span>Ignore action</span><b>×</b></button><button class="control" data-event="CLOSE"><span>Close notification</span><b>⌫</b></button><button class="control" data-event="TIMEOUT"><span>Notification timeout</span><b>⌛</b></button><button class="control" data-event="NO_SUPPORT"><span>Missing action-button support</span><b>!</b></button><button class="control" data-event="RESET"><span>Reset result</span><b>↺</b></button></div></section>
+        <section class="card"><h3>Visible state</h3><div class="state" id="statePanel"></div><div class="outcome" id="outcome"></div></section>
+      </aside>
+      <section class="feedback"><h2>What feels right?</h2><p>Which variant has the clearest path to audio-only, video, and a privacy-first exit? Which part would you change?</p><textarea aria-label="Prototype feedback" placeholder="Feedback stays only in this page."></textarea></section>
+    </section>
+  </main>
+  <nav class="bottom-nav" aria-label="Variant navigation"><button id="previous" aria-label="Previous variant">← Previous</button><span class="count" id="variantCount"></span><button id="next" aria-label="Next variant">Next →</button></nav>
+
+  <script>
+    'use strict';
+    const variants = {
+      A: { name: 'A / direct three actions', title: 'One prompt. Three clear exits.', copy: 'The notification names both capture modes directly. It is the shortest path from detection to the requested recording.', tag: 'Direct action row' },
+      B: { name: 'B / audio-first, video confirms', title: 'Make audio-only the quick choice.', copy: 'Audio-only is a direct, low-friction default. Choosing video takes one deliberate confirmation step before recording.', tag: 'Default-first / two-step' },
+      C: { name: 'C / choose, then confirm', title: 'Separate choosing from starting.', copy: 'People first pick a capture mode, then explicitly confirm. This is the most deliberate option, with an extra step for both modes.', tag: 'Mode-first confirmation' }
+    };
+    const keys = Object.keys(variants);
+    const initialState = (autoRecord = false) => ({ autoRecord, actionSupport: true, controllerState: 'idle', promptVisible: false, requestedCaptureMode: null, outcome: 'Ready for a detected meeting.', stage: 'none' });
+    let variant = (() => { const requested = new URLSearchParams(location.search).get('variant'); return keys.includes(requested) ? requested : 'A'; })();
+    let state = initialState();
+
+    // Pure state machine: DOM rendering and all button wiring live below.
+    function reducer(current, event) {
+      const ignored = (reason) => ({ ...current, controllerState: 'ignored', promptVisible: false, requestedCaptureMode: null, outcome: `Ignored — ${reason}. No recording starts.`, stage: 'none' });
+      const recording = (mode, explanation) => ({ ...current, controllerState: 'recording', promptVisible: false, requestedCaptureMode: mode, outcome: `${mode === 'audio-video' ? 'Video' : 'Audio-only'} recording requested — ${explanation}`, stage: 'none' });
+      if (event.type === 'RESET') return initialState(current.autoRecord);
+      if (event.type === 'SET_AUTO') return initialState(event.value);
+      if (event.type === 'NO_SUPPORT') return { ...ignored('notification action buttons are unavailable'), actionSupport: false };
+      if (event.type === 'DETECT') {
+        if (current.autoRecord) return recording('audio-only', 'auto-record is enabled; the prompt was skipped.');
+        if (!current.actionSupport) return ignored('notification action buttons are unavailable');
+        return { ...current, controllerState: 'awaiting-capture-mode', promptVisible: true, requestedCaptureMode: null, outcome: 'Meeting detected — waiting for a capture mode.', stage: 'main' };
+      }
+      if (event.type === 'CLOSE') return current.promptVisible ? ignored('the notification was closed') : current;
+      if (event.type === 'TIMEOUT') return current.promptVisible ? ignored('the notification timed out') : current;
+      if (event.type === 'IGNORE') return current.promptVisible ? ignored('you chose Ignore') : current;
+      if (event.type === 'BACK' && current.promptVisible) return { ...current, controllerState: 'awaiting-capture-mode', requestedCaptureMode: null, stage: 'main', outcome: 'Back to capture mode choice.' };
+      if (event.type === 'VIDEO' && current.promptVisible) {
+        if (variant === 'A') return recording('audio-video', 'you chose Video.');
+        return { ...current, controllerState: 'awaiting-confirmation', requestedCaptureMode: 'audio-video', stage: 'confirm', outcome: 'Video selected — waiting for confirmation.' };
+      }
+      if (event.type === 'AUDIO' && current.promptVisible) {
+        if (variant === 'C') return { ...current, controllerState: 'awaiting-confirmation', requestedCaptureMode: 'audio-only', stage: 'confirm', outcome: 'Audio-only selected — waiting for confirmation.' };
+        return recording('audio-only', 'you chose Audio only.');
+      }
+      if (event.type === 'CONFIRM' && current.stage === 'confirm') return recording(current.requestedCaptureMode, 'you confirmed the selected mode.');
+      return current;
+    }
+    function dispatch(type, value) { state = reducer(state, { type, value }); render(); }
+    function action(label, type, cls = '') { return `<button class="${cls}" data-event="${type}">${label}</button>`; }
+    function renderPrompt() {
+      if (!state.promptVisible) return `<div class="empty-notice"><strong>${state.controllerState === 'recording' ? 'Recording requested' : state.controllerState === 'ignored' ? 'No recording' : 'Awaiting detection'}</strong><span>${state.outcome}</span></div>`;
+      if (state.stage === 'confirm') return `<article class="notification"><div class="confirm"><div class="confirm-mark">${state.requestedCaptureMode === 'audio-video' ? '◉' : '◌'}</div><h3>Start ${state.requestedCaptureMode === 'audio-video' ? 'video' : 'audio-only'} recording?</h3><p>${state.requestedCaptureMode === 'audio-video' ? 'Your video source is chosen after capture mode.' : 'Only meeting audio will be captured.'}</p></div><div class="action-row three">${action('Back', 'BACK')}${action('Ignore', 'IGNORE', 'danger')}${action('Start recording', 'CONFIRM', 'primary')}</div></article>`;
+      if (variant === 'A') return `<article class="notification"><div class="notification-top"><span class="app-id"><i class="app-dot"></i>Meeting Recorder</span><span class="timer">Needs a choice</span></div><div class="notification-body"><div class="notice-icon">◉</div><div><h3 class="notice-title">Meeting detected</h3><p class="notice-text">A call is in progress. Choose what to capture.</p></div></div><div class="action-row three">${action('Video', 'VIDEO')}${action('Audio only', 'AUDIO', 'primary')}${action('Ignore', 'IGNORE', 'danger')}</div></article>`;
+      if (variant === 'B') return `<article class="notification"><div class="audio-first"><div class="notice-icon">◌</div><div class="notice-copy"><div class="notification-top" style="padding:0"><span class="app-id"><i class="app-dot"></i>Meeting Recorder</span><span class="timer">Needs a choice</span></div><h3 class="notice-title">Record this meeting?</h3><p class="notice-text">Start with audio-only, or deliberately opt into video.</p></div><div class="action-row three">${action('Ignore', 'IGNORE', 'danger')}${action('Video…', 'VIDEO')}${action('Record audio only', 'AUDIO', 'primary')}</div></div></article>`;
+      return `<article class="notification"><div class="mode-first"><div class="notification-top" style="padding:0"><span class="app-id"><i class="app-dot"></i>Meeting Recorder</span><span class="timer">Step 1 of 2</span></div><h3 class="notice-title">Choose a capture mode</h3><p class="notice-text">Selecting a mode does not begin recording yet.</p><div class="mode-choices">${action('<span class="choice-icon">◉</span><span class="choice-name">Video</span><span class="choice-detail">Audio + video; source comes next</span>', 'VIDEO', 'mode-choice')}${action('<span class="choice-icon">◌</span><span class="choice-name">Audio only</span><span class="choice-detail">Meeting audio, no video</span>', 'AUDIO', 'mode-choice')}</div></div><div class="action-row">${action('Ignore', 'IGNORE', 'danger')}</div></article>`;
+    }
+    function render() {
+      const meta = variants[variant];
+      document.getElementById('variantKicker').textContent = meta.tag;
+      document.getElementById('variantTitle').textContent = meta.title;
+      document.getElementById('variantCopy').textContent = meta.copy;
+      document.getElementById('notificationZone').innerHTML = renderPrompt();
+      document.getElementById('autoRecord').checked = state.autoRecord;
+      document.getElementById('statePanel').innerHTML = [['controller state', state.controllerState], ['prompt visible', state.promptVisible ? 'yes' : 'no'], ['requested Capture mode', state.requestedCaptureMode || '—'], ['action support', state.actionSupport ? 'available' : 'missing']].map(([name, value]) => `<div class="state-line"><span>${name}</span><strong>${value}</strong></div>`).join('');
+      document.getElementById('outcome').textContent = state.outcome;
+      document.getElementById('variantCount').textContent = `${keys.indexOf(variant) + 1} / ${keys.length}`;
+      document.querySelectorAll('.switch button').forEach((button) => button.setAttribute('aria-pressed', button.dataset.variant === variant));
+    }
+    function changeVariant(nextVariant) { variant = nextVariant; history.replaceState(null, '', `?variant=${variant}`); state = initialState(state.autoRecord); render(); }
+    document.addEventListener('click', (event) => { const button = event.target.closest('[data-event]'); if (button) dispatch(button.dataset.event); const scenario = event.target.closest('[data-scenario]'); if (scenario) runScenario(scenario.dataset.scenario); });
+    document.getElementById('autoRecord').addEventListener('change', (event) => dispatch('SET_AUTO', event.target.checked));
+    document.getElementById('previous').addEventListener('click', () => changeVariant(keys[(keys.indexOf(variant) + keys.length - 1) % keys.length]));
+    document.getElementById('next').addEventListener('click', () => changeVariant(keys[(keys.indexOf(variant) + 1) % keys.length]));
+    document.addEventListener('keydown', (event) => { if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return; if (event.key === 'ArrowLeft') document.getElementById('previous').click(); if (event.key === 'ArrowRight') document.getElementById('next').click(); });
+    function runScenario(name) {
+      state = initialState(name === 'auto');
+      if (name === 'fallback') { dispatch('NO_SUPPORT'); return; }
+      dispatch('DETECT');
+      if (name === 'video') { dispatch('VIDEO'); if (state.stage === 'confirm') dispatch('CONFIRM'); }
+      if (name === 'audio') { dispatch('AUDIO'); if (state.stage === 'confirm') dispatch('CONFIRM'); }
+      if (name === 'dismiss') dispatch('TIMEOUT');
+    }
+    render();
+  </script>
+</body>
+</html>
