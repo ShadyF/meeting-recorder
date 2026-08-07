@@ -23,7 +23,7 @@
           <HasReplyAction-type>java.lang.Boolean</HasReplyAction-type>
           <ImageNames>&lt;null&gt;</ImageNames>
           <ImageNames-type>java.lang.String</ImageNames-type>
-          <InterceptApps>&lt;StringArray sr="" ve="3"&gt;&lt;_array_InterceptApps0&gt;com.google.android.apps.tachyon&lt;/_array_InterceptApps0&gt;&lt;/StringArray&gt;</InterceptApps>
+          <InterceptApps>&lt;StringArray sr=""&gt;&lt;_array_InterceptApps0&gt;com.google.android.apps.tachyon&lt;/_array_InterceptApps0&gt;&lt;/StringArray&gt;</InterceptApps>
           <InterceptApps-type>[Ljava.lang.String;</InterceptApps-type>
           <InterceptPersistent>&lt;null&gt;</InterceptPersistent>
           <InterceptPersistent-type>java.lang.String</InterceptPersistent-type>
