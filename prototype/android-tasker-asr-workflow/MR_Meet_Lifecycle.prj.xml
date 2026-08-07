@@ -1,7 +1,25 @@
 <TaskerData sr="" dvi="1" tv="6.6.20">
+  <Profile sr="prof9400" ve="2">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>9400</id>
+    <mid0>9300</mid0>
+    <nme>MR Lifecycle Placeholder</nme>
+    <State sr="con0" ve="2">
+      <code>165</code>
+      <ConditionList sr="if">
+        <Condition sr="c0" ve="3">
+          <lhs>%MRM_ENABLE</lhs>
+          <op>2</op>
+          <rhs>1</rhs>
+        </Condition>
+      </ConditionList>
+    </State>
+  </Profile>
   <Project sr="proj0" ve="2">
     <cdate>1786060800000</cdate>
     <name>MR Meet Lifecycle</name>
+    <pids>9400</pids>
     <tids>9300,9301,9302,9303,9304,9305,9306,9307</tids>
   </Project>
   <Task sr="task9300">
