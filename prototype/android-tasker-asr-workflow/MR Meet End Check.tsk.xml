@@ -56,9 +56,9 @@
     </Action>
     <Action sr="act5" ve="7">
       <code>129</code>
-      <Str sr="arg0" ve="3">(function () {
-  var mr_should_stop = '0';
-  var mr_stop_session = '';
+      <Str sr="arg0" ve="3">var mr_should_stop = '0';
+var mr_stop_session = '';
+(function () {
   function array(v) { return typeof v === 'undefined' || v === null || v === '' ? [] : Array.isArray(v) ? v : [v]; }
   function norm(v) { return String(v === null || typeof v === 'undefined' ? '' : v).trim().toLowerCase(); }
   function strictMeet() {
