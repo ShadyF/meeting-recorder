@@ -1,0 +1,36 @@
+# THROWAWAY PROTOTYPE ONLY. This image is not an application package.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install only the demonstrated Debian runtime dependencies and xdg-utils.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        python3 \
+        python3-gi \
+        gir1.2-gtk-3.0 \
+        gir1.2-notify-0.7 \
+        gir1.2-appindicator3-0.1 \
+        ffmpeg \
+        pulseaudio-utils \
+        xdg-desktop-portal \
+        gstreamer1.0-pipewire \
+        gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-tools \
+        xdg-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Provide stable mount targets without baking ownership for a specific user.
+RUN mkdir -p /home/meeting-recorder/.config /home/meeting-recorder/Recordings /run/user
+
+WORKDIR /opt/meeting-recorder
+
+# Copy only the application package so repository metadata stays outside the image.
+COPY meeting_recorder /opt/meeting-recorder/meeting_recorder
+
+ENV HOME=/home/meeting-recorder \
+    XDG_CONFIG_HOME=/home/meeting-recorder/.config
+
+# Run the existing source entry point as the numeric user selected by Quadlet.
+CMD ["python3", "-m", "meeting_recorder", "run"]

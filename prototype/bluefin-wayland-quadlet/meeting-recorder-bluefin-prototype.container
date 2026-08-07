@@ -1,0 +1,26 @@
+# THROWAWAY PROTOTYPE ONLY. Install this only with prototype.sh.
+[Unit]
+Description=Meeting Recorder Bluefin Wayland Quadlet prototype
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Container]
+Image=localhost/meeting-recorder-bluefin-prototype:latest
+ContainerName=meeting-recorder-bluefin-prototype
+UserNS=keep-id
+SecurityLabelDisable=true
+Environment=GSETTINGS_BACKEND=memory
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=XDG_SESSION_TYPE=wayland
+Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
+Volume=/run/user/%U/wayland-0:/run/user/%U/wayland-0:ro
+Volume=/run/user/%U/bus:/run/user/%U/bus:rw
+Volume=/run/user/%U/pulse/native:/run/user/%U/pulse/native:rw
+Volume=%h/.local/share/meeting-recorder-bluefin-prototype/config:/home/meeting-recorder/.config:Z
+Volume=%h/.local/share/meeting-recorder-bluefin-prototype/Recordings:/home/meeting-recorder/Recordings:Z
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
