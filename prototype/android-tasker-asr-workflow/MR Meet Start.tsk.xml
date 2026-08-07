@@ -1,0 +1,130 @@
+<TaskerData sr="" dvi="1" tv="6.6.20">
+  <Task sr="task9302">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>9302</id>
+    <nme>MR Meet Start</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>549</code>
+      <Str sr="arg0" ve="3">%anpackage/%ancategoryname/%anpersistent/%anbutton1text/%anqueryok</Str>
+      <Int sr="arg1" val="1" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="0" />
+    </Action>
+    <Action sr="act1" ve="7">
+      <code>130</code>
+      <Str sr="arg0" ve="3">MR Inspect Meetings</Str>
+      <Int sr="arg1"><var>%priority</var></Int>
+      <Int sr="arg10" val="1" />
+      <Str sr="arg2" ve="3" />
+      <Str sr="arg3" ve="3" />
+      <Str sr="arg4" ve="3" />
+      <Int sr="arg5" val="0" />
+      <Int sr="arg6" val="0" />
+      <Str sr="arg7" ve="3" />
+      <Int sr="arg8" val="0" />
+      <Int sr="arg9" val="0" />
+    </Action>
+    <Action sr="act2" ve="7">
+      <code>129</code>
+      <Str sr="arg0" ve="3">(function () {
+  var mr_should_launch = '0';
+  var mr_launch_session = '';
+  function array(v) { return typeof v === 'undefined' || v === null || v === '' ? [] : Array.isArray(v) ? v : [v]; }
+  function norm(v) { return String(v === null || typeof v === 'undefined' ? '' : v).trim().toLowerCase(); }
+  function strictMeet() {
+    var packages = array(typeof anpackage === 'undefined' ? undefined : anpackage);
+    var categories = array(typeof ancategoryname === 'undefined' ? undefined : ancategoryname);
+    var persistent = array(typeof anpersistent === 'undefined' ? undefined : anpersistent);
+    var button1 = array(typeof anbutton1text === 'undefined' ? undefined : anbutton1text);
+    var count = Math.max(packages.length, categories.length, persistent.length, button1.length);
+    for (var i = 0; i &lt; count; i++) {
+      if (norm(packages[i]) === 'com.google.android.apps.tachyon' &amp;&amp; norm(categories[i]) === 'ongoing call' &amp;&amp; (norm(persistent[i]) === 'true' || norm(persistent[i]) === '1') &amp;&amp; norm(button1[i]) === 'hang up') return true;
+    }
+    return false;
+  }
+  var state = String(global('MRM_STATE') || 'IDLE');
+  if (state !== 'OFFERED') return;
+  var queryOk = norm(typeof anqueryok === 'undefined' ? undefined : anqueryok);
+  if (queryOk.indexOf('1') === -1 &amp;&amp; queryOk.indexOf('true') === -1) {
+    setGlobal('MRM_STATE', 'ATTENTION');
+    setGlobal('MRM_ERROR', 'START_QUERY_FAILED');
+    setGlobal('MRM_END_TOKEN', '');
+    performTask('MR Meet Attention', 100, '', '', '', false, false, '', false);
+  } else if (!strictMeet()) {
+    setGlobal('MRM_STATE', 'IDLE');
+    setGlobal('MRM_SESSION', '');
+    setGlobal('MRM_END_TOKEN', '');
+    setGlobal('MRM_ERROR', 'CALL_ENDED_BEFORE_START');
+  } else {
+    mr_launch_session = String(global('MRM_SESSION') || '');
+    if (!mr_launch_session) {
+      setGlobal('MRM_STATE', 'ATTENTION');
+      setGlobal('MRM_ERROR', 'START_SESSION_MISSING');
+      performTask('MR Meet Attention', 100, '', '', '', false, false, '', false);
+    } else {
+      setGlobal('MRM_STATE', 'STARTING');
+      setGlobal('MRM_ERROR', '');
+      mr_should_launch = '1';
+    }
+  }
+}());</Str>
+      <Str sr="arg1" ve="3" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="45" />
+    </Action>
+    <Action sr="act3" ve="7">
+      <code>779</code>
+      <Str sr="arg0" ve="3">Meet call detected</Str>
+      <Int sr="arg1" val="0" />
+      <ConditionList sr="if">
+        <Condition sr="c0" ve="3">
+          <lhs>%mr_should_launch</lhs>
+          <op>2</op>
+          <rhs>1</rhs>
+        </Condition>
+      </ConditionList>
+    </Action>
+    <Action sr="act4" ve="7">
+      <code>130</code>
+      <Str sr="arg0" ve="3">Launch ASR</Str>
+      <Int sr="arg1"><var>%priority</var></Int>
+      <Int sr="arg10" val="0" />
+      <Str sr="arg2" ve="3" />
+      <Str sr="arg3" ve="3" />
+      <Str sr="arg4" ve="3" />
+      <Int sr="arg5" val="0" />
+      <Int sr="arg6" val="0" />
+      <Str sr="arg7" ve="3" />
+      <Int sr="arg8" val="0" />
+      <Int sr="arg9" val="0" />
+      <ConditionList sr="if">
+        <Condition sr="c0" ve="3">
+          <lhs>%mr_should_launch</lhs>
+          <op>2</op>
+          <rhs>1</rhs>
+        </Condition>
+      </ConditionList>
+    </Action>
+    <Action sr="act5" ve="7">
+      <code>129</code>
+      <Str sr="arg0" ve="3">(function () {
+  if (String(typeof mr_should_launch === 'undefined' ? '' : mr_should_launch) !== '1') return;
+  var session = String(typeof mr_launch_session === 'undefined' ? '' : mr_launch_session);
+  if (session &amp;&amp; String(global('MRM_STATE') || 'IDLE') === 'STARTING' &amp;&amp; String(global('MRM_SESSION') || '') === session) {
+    setGlobal('MR_ASR_ACTIVE', '1');
+    setGlobal('MRM_STATE', 'RECORDING');
+    setGlobal('MRM_ERROR', '');
+  } else {
+    setGlobal('MRM_STATE', 'ATTENTION');
+    setGlobal('MRM_ERROR', 'START_TRANSITION_STALE');
+    performTask('MR Meet Attention', 100, '', '', '', false, false, '', false);
+  }
+}());</Str>
+      <Str sr="arg1" ve="3" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="45" />
+    </Action>
+  </Task>
+</TaskerData>

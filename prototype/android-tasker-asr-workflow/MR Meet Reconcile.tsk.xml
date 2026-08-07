@@ -1,0 +1,74 @@
+<TaskerData sr="" dvi="1" tv="6.6.20">
+  <Task sr="task9300">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>9300</id>
+    <nme>MR Meet Reconcile</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>549</code>
+      <Str sr="arg0" ve="3">%anpackage/%ancategoryname/%anpersistent/%anbutton1text/%anqueryok</Str>
+      <Int sr="arg1" val="1" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="0" />
+    </Action>
+    <Action sr="act1" ve="7">
+      <code>130</code>
+      <Str sr="arg0" ve="3">MR Inspect Meetings</Str>
+      <Int sr="arg1"><var>%priority</var></Int>
+      <Int sr="arg10" val="1" />
+      <Str sr="arg2" ve="3" />
+      <Str sr="arg3" ve="3" />
+      <Str sr="arg4" ve="3" />
+      <Int sr="arg5" val="0" />
+      <Int sr="arg6" val="0" />
+      <Str sr="arg7" ve="3" />
+      <Int sr="arg8" val="0" />
+      <Int sr="arg9" val="0" />
+    </Action>
+    <Action sr="act2" ve="7">
+      <code>129</code>
+      <Str sr="arg0" ve="3">(function () {
+  function array(v) { return typeof v === 'undefined' || v === null || v === '' ? [] : Array.isArray(v) ? v : [v]; }
+  function norm(v) { return String(v === null || typeof v === 'undefined' ? '' : v).trim().toLowerCase(); }
+  function strictMeet() {
+    var packages = array(typeof anpackage === 'undefined' ? undefined : anpackage);
+    var categories = array(typeof ancategoryname === 'undefined' ? undefined : ancategoryname);
+    var persistent = array(typeof anpersistent === 'undefined' ? undefined : anpersistent);
+    var button1 = array(typeof anbutton1text === 'undefined' ? undefined : anbutton1text);
+    var count = Math.max(packages.length, categories.length, persistent.length, button1.length);
+    for (var i = 0; i &lt; count; i++) {
+      if (norm(packages[i]) === 'com.google.android.apps.tachyon' &amp;&amp; norm(categories[i]) === 'ongoing call' &amp;&amp; (norm(persistent[i]) === 'true' || norm(persistent[i]) === '1') &amp;&amp; norm(button1[i]) === 'hang up') return true;
+    }
+    return false;
+  }
+  function token() { return String(Date.now()) + '-' + Math.random().toString(36).slice(2); }
+  var state = String(global('MRM_STATE') || 'IDLE');
+  var queryOk = norm(typeof anqueryok === 'undefined' ? undefined : anqueryok);
+  if (queryOk.indexOf('1') === -1 &amp;&amp; queryOk.indexOf('true') === -1) {
+    if (state !== 'IDLE') {
+      setGlobal('MRM_STATE', 'ATTENTION');
+      setGlobal('MRM_ERROR', 'QUERY_FAILED');
+      setGlobal('MRM_END_TOKEN', '');
+      performTask('MR Meet Attention', 100, '', '', '', false, false, '', false);
+    }
+  } else if (strictMeet()) {
+    setGlobal('MRM_END_TOKEN', '');
+    setGlobal('MRM_ERROR', '');
+    if (state === 'IDLE') {
+      setGlobal('MRM_SESSION', token());
+      setGlobal('MRM_STATE', 'OFFERED');
+      performTask('MR Meet Offer', 100, '', '', '', false, false, '', false);
+    }
+  } else if ((state === 'OFFERED' || state === 'STARTING' || state === 'RECORDING') &amp;&amp; !global('MRM_END_TOKEN')) {
+    var endToken = token();
+    setGlobal('MRM_END_TOKEN', endToken);
+    performTask('MR Meet End Check', 100, '', '', '', false, false, '', false);
+  }
+}());</Str>
+      <Str sr="arg1" ve="3" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="45" />
+    </Action>
+  </Task>
+</TaskerData>
