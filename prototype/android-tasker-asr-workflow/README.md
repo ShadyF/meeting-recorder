@@ -2,18 +2,18 @@
 
 **Throwaway Android-only prototype.** It is independent of the Linux recorder. Never put a real API secret in this repository or in screenshots.
 
-Target device: **Pixel 7**, Android 17 `CP2A.260705.006`, Tasker `6.6.20`, and the latest installed **ASR Voice Recorder** (`com.nll.asr`). The expected meeting apps are Meet (`com.google.android.apps.tachyon`), Zoom (`us.zoom.videomeetings`), Webex (`com.cisco.webex.meetings`), and Teams (`com.microsoft.teams`).
+Target device: **Pixel 7**, Android 17 `CP2A.260705.006`, Tasker `6.6.20`, and the latest installed **ASR Voice Recorder** (`com.nll.asr`). The expected meeting apps are Meet (`com.google.android.apps.tachyon`), Zoom (`us.zoom.videomeetings`), Webex (`com.cisco.wx2.android`), and Teams (`com.microsoft.teams`).
 
 ## Import on the Pixel
 
-`Meeting_ASR_Pixel_7.prj.xml` is an **unverified direct-import candidate**, assembled from real Tasker 5.15/6.2 exports. Tasker has no official stable XML schema or public 6.6.20 export, so Pixel import validation is required. Labels can differ slightly by Tasker build.
+Use **`Meeting_ASR_Pixel_7_verified.prj.xml`** for subsequent Pixel imports. It was imported and re-exported by Tasker 6.6.20 on the Pixel 7, Android 17 `CP2A.260705.006`. `Meeting_ASR_Pixel_7.prj.xml` remains the unverified hand-assembled candidate kept as provenance. Tasker has no official stable XML schema, so behavior validation is still required. Labels can differ slightly by Tasker build.
 
-1. In Tasker, use project import and select `Meeting_ASR_Pixel_7.prj.xml`.
+1. In Tasker, use project import and select `Meeting_ASR_Pixel_7_verified.prj.xml`.
 2. Before enabling anything, inspect the six profiles (`MR Calendar Test`, `MR Meeting Apps`, and four `MR Notify …` profiles) and six tasks (`Signal Calendar`, `Signal App`, `Signal Notification`, `Prompt`, `Launch ASR`, `Manual Re-arm`).
 3. Grant Tasker the prompts it requests: **Calendar**, **Notification access**, **Accessibility/usage access** if requested for the selected contexts, and **Notifications**. In Android battery settings, set **Tasker** and **ASR Voice Recorder** to **Unrestricted**.
 4. The Calendar profile imports with title `*MR TEST*` and a wildcard calendar. Select the intended calendar after import, create an active event named `MR TEST Pixel`, and keep this test filter to avoid prompting on every event. After validation, replace it with the user's chosen meeting-title rule.
-5. Check the App/activity contexts and each Notification owner context after import. Their hand-authored package-only/empty-class entries are schema-sensitive. For first controlled validation, leave notification title/text filters blank; Owner Application and New Only constrain them while testing whether per-app text filters are viable.
-6. If import succeeds, export the imported project as **`Meeting_ASR_Pixel_7_verified.prj.xml`** and share it back. If import fails, report the exact Tasker import error before changing the candidate.
+5. The final normalized foreground **Application** profile contains all four apps. Webex is captured as `com.cisco.wx2.android` with `com.webex.teams.WebexLauncherActivity`. Check each Notification owner context after import. For first controlled validation, leave notification title/text filters blank; Owner Application and New Only constrain them while testing whether per-app text filters are viable.
+6. If a subsequent import fails, report the exact Tasker import error before changing either XML file.
 
 ## Manual fallback
 
@@ -35,7 +35,7 @@ Tasker can launch ASR, but no documented public ASR intent here promises a silen
 
 ## Export and capture
 
-After a successful import, export the imported project as **`Meeting_ASR_Pixel_7_verified.prj.xml`** and share it back for repository capture. Do not treat the candidate as verified until that import/export succeeds.
+The verified file is the captured Tasker 6.6.20 normalized re-export. Preserve the original candidate as provenance; do not treat import success as behavior validation.
 
 Run the cases in [VALIDATION_MATRIX.md](VALIDATION_MATRIX.md) before treating this prototype as usable.
 
