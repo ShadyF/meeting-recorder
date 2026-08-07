@@ -1,0 +1,29 @@
+# Google Calendar API constraints
+
+## Confirmed facts
+
+### Authorization and consent
+
+- For one Google account with a calendar chooser, request `calendar.calendarlist.readonly` and `calendar.events.readonly`. `calendar.readonly` is broader. Calendar event access is sensitive; public production use can require OAuth verification. [Calendar authorization](https://developers.google.com/workspace/calendar/api/auth)
+- Use the installed-app authorization-code flow: a Desktop OAuth client opens the system browser and receives the redirect on a random-port `127.0.0.1` or `::1` loopback listener. Use PKCE S256 with a random 43--128-character verifier, a random `state`, and the same redirect URI and verifier at token exchange. Check the granted scopes. Installed apps cannot keep a client secret; OOB and embedded-browser flows are unsupported. [Native apps](https://developers.google.com/identity/protocols/oauth2/native-app) · [Web-server flow](https://developers.google.com/identity/protocols/oauth2/web-server)
+- `access_type=offline` requests a refresh token; `include_granted_scopes` supports incremental authorization. Refresh tokens may fail because of revocation, six months of inactivity, policy, expiry, token limits, or security events; handle `invalid_grant` by reauthorizing. There is a limit of 100 live refresh tokens per user/client. [Token expiration](https://developers.google.com/identity/protocols/oauth2#expiration)
+- External apps in Testing support up to 100 test users, and Calendar refresh tokens normally expire after seven days. Published, unverified apps using sensitive scopes show a warning and have a 100-user cap; production normally requires verification. [Production readiness](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview) · [Sensitive-scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/sensitive-scope-verification) · [Policy compliance](https://developers.google.com/identity/protocols/oauth2/production-readiness/policy-compliance)
+
+### Calendar and event synchronization
+
+- `CalendarList.list` returns 100 items by default (250 maximum), supports `pageToken`/`nextPageToken` and an optional sync token. `selected` means selected in Google's UI, not this application's selection. A `410` response means rebuild the sync state. [CalendarList.list](https://developers.google.com/workspace/calendar/api/v3/reference/calendarList/list)
+- `events.list` is per selected calendar, returns 250 items by default (2,500 maximum), and must be paginated. `timeMin` is an exclusive lower bound on event end; `timeMax` is an exclusive upper bound on event start. Values are RFC 3339 with an offset. `singleEvents=true` expands recurrence and enables `orderBy=startTime`; retain `recurringEventId` and `originalStartTime`. [Events.list](https://developers.google.com/workspace/calendar/api/v3/reference/events/list) · [Recurring events](https://developers.google.com/workspace/calendar/api/guides/recurringevents) · [Pagination](https://developers.google.com/workspace/calendar/api/guides/pagination)
+- For incremental sync, save the final `nextSyncToken` and reuse the same request parameters. A sync token cannot be combined with `timeMin`, `timeMax`, `updatedMin`, `orderBy`, `q`, and related filters; it includes deletions. A `410` requires a full rebuild. [Events.list](https://developers.google.com/workspace/calendar/api/v3/reference/events/list)
+- Cancelled/deleted event entries can be sparse. Private fields depend on `accessRole`; attendee and organizer `displayName`/`email` are optional; `attendeesOmitted` can indicate incomplete attendee data. Treat every metadata field as optional and never infer hidden data. [Event resource](https://developers.google.com/workspace/calendar/api/v3/reference/events) · [Sharing](https://developers.google.com/workspace/calendar/api/guides/sharing)
+
+### Reliability, quotas, and policy
+
+- Documented quotas are 10,000 requests/minute/project and 600 requests/minute/user/project. Handle `401` with refresh or reauthorization, permission `403` separately, rate-limit `403`/`429` with bounded jittered backoff, `410` with sync reset, `400` as permanent until corrected, and network failures as unavailable enrichment. [Quota](https://developers.google.com/workspace/calendar/api/guides/quota) · [Errors](https://developers.google.com/workspace/calendar/api/guides/errors)
+- The Google API Services User Data Policy requires disclosure, least privilege, secure handling, feature-only use, and Limited Use compliance. [User Data Policy](https://developers.google.com/terms/api-services-user-data-policy)
+
+## Recommendations for this repository
+
+- Keep Calendar optional and non-blocking: do not poll for each recording; sync asynchronously at startup, on manual request, or conservatively.
+- Persist application-selected opaque calendar IDs, not the API `selected` flag, and persist only the minimum matched Meeting metadata needed for the feature.
+- Store refresh tokens securely outside JSON files and logs. Provide disconnect, token revocation, and local-data deletion.
+- Keep Calendar consent separate from recording consent and Speakr transfer. Start browser OAuth from GTK/CLI; the user service should only refresh credentials and enrich metadata.
