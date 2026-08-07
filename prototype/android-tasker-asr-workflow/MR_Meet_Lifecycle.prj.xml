@@ -86,7 +86,7 @@
   } else if ((state === 'OFFERED' || state === 'STARTING' || state === 'RECORDING') &amp;&amp; !global('MRM_END_TOKEN')) {
     var endToken = token();
     setGlobal('MRM_END_TOKEN', endToken);
-    performTask('MR Meet End Check', 100, endToken, '');
+    performTask('MR Meet End Check', 100, String(endToken), '', '', false, false, '', false);
   }
 }());</Str>
       <Str sr="arg1" ve="3" />
@@ -197,7 +197,7 @@
     var session = String(global('MRM_SESSION') || '');
     setGlobal('MRM_STATE', 'STARTING');
     setGlobal('MRM_ERROR', '');
-    performTask('MR Meet Launch', 100, session, '');
+    performTask('MR Meet Launch', 100, String(session), '', '', false, false, '', false);
   }
 }());</Str>
       <Str sr="arg1" ve="3" />
@@ -323,7 +323,7 @@
     var session = String(global('MRM_SESSION') || '');
     setGlobal('MRM_STATE', 'STOPPING');
     setGlobal('MRM_END_TOKEN', '');
-    performTask('MR Meet Stop', 100, session, '');
+    performTask('MR Meet Stop', 100, String(session), '', '', false, false, '', false);
   }
 }());</Str>
       <Str sr="arg1" ve="3" />
