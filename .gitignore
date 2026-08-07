@@ -23,3 +23,8 @@ venv/
 
 # Local planning notes (not part of the release)
 i-want-smart-meeting-*.md
+
+# BEGIN oh-my-opencode-slim worktrees
+.slim/worktrees/
+.slim/worktrees.json
+# END oh-my-opencode-slim worktrees
