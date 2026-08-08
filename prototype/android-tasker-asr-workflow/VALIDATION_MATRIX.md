@@ -26,10 +26,10 @@
 | Direct/auto start vs tap | Passed | ASR opened and began recording without an additional start tap. |
 | Continued background recording | Passed | ASR continued recording after Tasker waited briefly and automatically returned to the previous meeting app with Back. |
 | Stop behavior | Passed | Leaving Meet triggered one automatic NLL stop after the 30-second end check; lifecycle returned to `IDLE` with `asr_active=0`, no error, and exactly one new recording file. |
-| Away-from-home Wi-Fi queue | Not run | |
-| Home Wi-Fi arrival upload | Not run | |
-| Failed retry | Not run | Verify 1–2 hour retry or manual queue upload. |
-| Duplicate replay exactly once | Not run | Verify server response/record ID shows one idempotent replay. |
+| Away-from-home Wi-Fi queue | Passed | With home Wi-Fi disconnected, ASR retained the stopped recording in its upload queue instead of publishing it. |
+| Home Wi-Fi arrival upload | Passed | Rejoining home Wi-Fi cleared the ASR queue and created exactly one new Speakr recording. |
+| Failed retry | Not run | Deliberately skipped during Pixel validation; automatic/manual recovery from an attempted failed upload remains unverified. |
+| Duplicate replay exactly once | Passed | Manually replaying the same ASR recording reused the existing Speakr recording instead of creating a duplicate. |
 
 ## Galaxy Tab S9
 
