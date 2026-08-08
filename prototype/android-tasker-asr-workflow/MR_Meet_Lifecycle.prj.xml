@@ -61,7 +61,7 @@
     var button1 = array(typeof anbutton1text === 'undefined' ? undefined : anbutton1text);
     var count = Math.max(packages.length, categories.length, persistent.length, button1.length);
     for (var i = 0; i &lt; count; i++) {
-      if (norm(packages[i]) === 'com.google.android.apps.tachyon' &amp;&amp; norm(categories[i]) === 'ongoing call' &amp;&amp; (norm(persistent[i]) === 'true' || norm(persistent[i]) === '1') &amp;&amp; norm(button1[i]) === 'hang up') return true;
+      if (norm(packages[i]) === 'com.google.android.apps.tachyon' &amp;&amp; (norm(categories[i]) === 'ongoing call' || norm(categories[i]) === '') &amp;&amp; (norm(persistent[i]) === 'true' || norm(persistent[i]) === '1') &amp;&amp; norm(button1[i]) === 'hang up') return true;
     }
     return false;
   }
@@ -178,7 +178,7 @@ var mr_launch_session = '';
     var button1 = array(typeof anbutton1text === 'undefined' ? undefined : anbutton1text);
     var count = Math.max(packages.length, categories.length, persistent.length, button1.length);
     for (var i = 0; i &lt; count; i++) {
-      if (norm(packages[i]) === 'com.google.android.apps.tachyon' &amp;&amp; norm(categories[i]) === 'ongoing call' &amp;&amp; (norm(persistent[i]) === 'true' || norm(persistent[i]) === '1') &amp;&amp; norm(button1[i]) === 'hang up') return true;
+      if (norm(packages[i]) === 'com.google.android.apps.tachyon' &amp;&amp; (norm(categories[i]) === 'ongoing call' || norm(categories[i]) === '') &amp;&amp; (norm(persistent[i]) === 'true' || norm(persistent[i]) === '1') &amp;&amp; norm(button1[i]) === 'hang up') return true;
     }
     return false;
   }
@@ -334,7 +334,7 @@ var mr_stop_session = '';
     var button1 = array(typeof anbutton1text === 'undefined' ? undefined : anbutton1text);
     var count = Math.max(packages.length, categories.length, persistent.length, button1.length);
     for (var i = 0; i &lt; count; i++) {
-      if (norm(packages[i]) === 'com.google.android.apps.tachyon' &amp;&amp; norm(categories[i]) === 'ongoing call' &amp;&amp; (norm(persistent[i]) === 'true' || norm(persistent[i]) === '1') &amp;&amp; norm(button1[i]) === 'hang up') return true;
+      if (norm(packages[i]) === 'com.google.android.apps.tachyon' &amp;&amp; (norm(categories[i]) === 'ongoing call' || norm(categories[i]) === '') &amp;&amp; (norm(persistent[i]) === 'true' || norm(persistent[i]) === '1') &amp;&amp; norm(button1[i]) === 'hang up') return true;
     }
     return false;
   }
