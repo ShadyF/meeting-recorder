@@ -77,7 +77,7 @@ var mr_stop_session = '';
   var state = String(global('MRM_STATE') || 'IDLE');
   if (!endToken || !endSession || endToken !== String(global('MRM_END_TOKEN') || '') || endSession !== String(global('MRM_SESSION') || '') || (state !== 'OFFERED' &amp;&amp; state !== 'STARTING' &amp;&amp; state !== 'RECORDING')) return;
   var queryOk = norm(typeof anqueryok === 'undefined' ? undefined : anqueryok);
-  if (queryOk.indexOf('1') === -1 &amp;&amp; queryOk.indexOf('true') === -1) {
+  if (queryOk &amp;&amp; queryOk.indexOf('1') === -1 &amp;&amp; queryOk.indexOf('true') === -1) {
     setGlobal('MRM_END_TOKEN', '');
     setGlobal('MRM_STATE', 'ATTENTION');
     setGlobal('MRM_ERROR', 'END_QUERY_FAILED');

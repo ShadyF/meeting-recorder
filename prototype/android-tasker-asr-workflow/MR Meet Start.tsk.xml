@@ -47,7 +47,7 @@ var mr_launch_session = '';
   var state = String(global('MRM_STATE') || 'IDLE');
   if (state !== 'OFFERED') return;
   var queryOk = norm(typeof anqueryok === 'undefined' ? undefined : anqueryok);
-  if (queryOk.indexOf('1') === -1 &amp;&amp; queryOk.indexOf('true') === -1) {
+  if (queryOk &amp;&amp; queryOk.indexOf('1') === -1 &amp;&amp; queryOk.indexOf('true') === -1) {
     setGlobal('MRM_STATE', 'ATTENTION');
     setGlobal('MRM_ERROR', 'START_QUERY_FAILED');
     setGlobal('MRM_END_TOKEN', '');

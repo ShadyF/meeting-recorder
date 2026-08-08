@@ -45,7 +45,7 @@
   function token() { return String(Date.now()) + '-' + Math.random().toString(36).slice(2); }
   var state = String(global('MRM_STATE') || 'IDLE');
   var queryOk = norm(typeof anqueryok === 'undefined' ? undefined : anqueryok);
-  if (queryOk.indexOf('1') === -1 &amp;&amp; queryOk.indexOf('true') === -1) {
+  if (queryOk &amp;&amp; queryOk.indexOf('1') === -1 &amp;&amp; queryOk.indexOf('true') === -1) {
     if (state !== 'IDLE') {
       setGlobal('MRM_STATE', 'ATTENTION');
       setGlobal('MRM_ERROR', 'QUERY_FAILED');
