@@ -1,12 +1,14 @@
 # Detection rules
 
-**Prototype only.** This Android workflow is independent of the Linux recorder. The six-profile Pixel candidate below detects context and asks the user to open ASR. The separately validated Galaxy Meet lifecycle launches, records, and stops through device-authored Tasker actions.
+**Prototype only.** This Android workflow is independent of the Linux recorder. The six-profile Pixel candidate below detects context and asks the user to open ASR. The separately validated Galaxy Tab S9 (Android 16 `BP4A.251205.006.X710XXS6EZG3`, Tasker 6.6.20) Meet lifecycle launches and stops through device-authored Tasker actions, but NLL does not capture active Meet-call audio on this device.
 
 ## Validated Galaxy Meet lifecycle
 
 Import `MR_Meet_Lifecycle.prj.xml` and the normalized Galaxy standalone exports for `MR Inspect Meetings`, `Launch ASR`, `MR Stop ASR`, and `MR Meet Posted Wake`. Keep exactly one profile named **`MR Meet Posted Wake`**; do not rename it. Its AutoNotification status is **both Created and Cancelled** and it performs **`MR Meet Reconcile`** with no parameters.
 
-The Galaxy Meet notification signature is package `com.google.android.apps.tachyon`, empty category, persistent `true`, and button 1 `Hang Up`. `%anqueryok` may be unset, so it is not a required match. `MR Stop ASR` presses NLL **Stop and save** and then sets `%MR_ASR_ACTIVE=0`; the validated end path returns to `IDLE` with one saved file.
+The Galaxy Meet notification signature is package `com.google.android.apps.tachyon`, empty category, persistent `true`, and button 1 `Hang Up`. `%anqueryok` may be unset, so it is not a required match. `MR Stop ASR` presses NLL **Stop and save** and then sets `%MR_ASR_ACTIVE=0`; the validated end path returns to `IDLE` with one saved file, not a valid in-call recording.
+
+**Do not rely on this Galaxy workflow for Meet recording.** Tasker detection, prompt, launch, auto-stop, state, queue, and upload mechanics work, but Galaxy voice-communication microphone priority/silencing silences the ordinary NLL recorder for the active call, even while its timer/service runs. Meet-muted and Meet-unmuted segments are silent; audio is audible only after leaving. NLL started before Meet records before the call, becomes blank immediately on joining, and resumes after leaving. Meet has input priority; this is not a Tasker timing or NLL permission failure. See Android's [audio-input sharing](https://developer.android.com/media/platform/sharing-audio-input) and [concurrent audio capture](https://source.android.com/docs/core/audio/concurrent) documentation. Same-tablet Tasker/NLL has no supported workaround: muting Meet, starting NLL first, Samsung Mic mode, Separate App Sound, screen recording, or extra Tasker permissions do not override audio policy. Use Meet native recording where available and consented, or a second physical recorder. Issue #10 acceptance remains open and unmet.
 
 The rules below are retained as provenance for the older six-profile Pixel candidate, not as the Galaxy lifecycle configuration.
 

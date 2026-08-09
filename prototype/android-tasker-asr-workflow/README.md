@@ -2,15 +2,17 @@
 
 **Throwaway Android-only prototype.** It is independent of the Linux recorder. Never put a real API secret in this repository or in screenshots.
 
-The original candidate targets a **Pixel 7**, Android 17 `CP2A.260705.006`, Tasker `6.6.20`, and the latest installed **ASR Voice Recorder** (`com.nll.asr`). Its expected meeting apps are Meet (`com.google.android.apps.tachyon`), Zoom (`us.zoom.videomeetings`), Webex (`com.cisco.wx2.android`), and Teams (`com.microsoft.teams`). The separate Meet lifecycle is physically validated on the Galaxy Tab S9, Android 16 `BP4A.251205.006.X710XXS6EZG3`, with Tasker `6.6.20`.
+The original candidate targets a **Pixel 7**, Android 17 `CP2A.260705.006`, Tasker `6.6.20`, and the latest installed **ASR Voice Recorder** (`com.nll.asr`). Its expected meeting apps are Meet (`com.google.android.apps.tachyon`), Zoom (`us.zoom.videomeetings`), Webex (`com.cisco.wx2.android`), and Teams (`com.microsoft.teams`). The separate Meet lifecycle automation is physically validated on the Galaxy Tab S9, Android 16 `BP4A.251205.006.X710XXS6EZG3`, with Tasker `6.6.20`.
 
-## Validated Galaxy Meet lifecycle
+## Galaxy Meet lifecycle
+
+> **Warning:** Do not rely on or advertise Galaxy Meet recording through NLL ASR. On the Galaxy Tab S9 (Android 16 `BP4A.251205.006.X710XXS6EZG3`, Tasker 6.6.20), Tasker detection, prompt, launch, auto-stop, state, queue, and upload mechanics work, but NLL captures silence throughout an active Meet call despite its timer/service running. Meet-muted and Meet-unmuted segments are silent; audio is audible only after leaving. Starting NLL before Meet records before the call, becomes blank immediately on joining, and resumes after leaving. Android voice-communication microphone priority/silencing—not Tasker timing or NLL permissions—is the cause ([audio-input sharing](https://developer.android.com/media/platform/sharing-audio-input), [concurrent audio capture](https://source.android.com/docs/core/audio/concurrent)). Same-tablet Tasker/NLL has no supported workaround: muting Meet, starting NLL first, Samsung Mic mode, Separate App Sound, screen recording, or extra Tasker permissions do not override audio policy. Use consented Google Meet native recording where available, or a second physical recorder. Issue #10 acceptance remains open and unmet.
 
 Import `MR_Meet_Lifecycle.prj.xml`, grant Tasker notification access and the permissions it requests, and keep Tasker and ASR Voice Recorder unrestricted for battery use. Then import the normalized device-authored `MR Inspect Meetings`, `Launch ASR`, and `MR Stop ASR` tasks plus the `MR Meet Posted Wake` profile; do not substitute the older Pixel candidate tasks.
 
 There is exactly one wake profile: **`MR Meet Posted Wake`**. Its AutoNotification status is **both Created and Cancelled**, and it performs **`MR Meet Reconcile` with no parameters**. Do not rename the profile. Its calibrated Galaxy Meet signature is package `com.google.android.apps.tachyon`, empty category, persistent `true`, and button 1 `Hang Up`; `%anqueryok` may be unset.
 
-The validated lifecycle launches ASR, records in the background, and automatically stops after the Meet end check. `MR Stop ASR` presses NLL **Stop and save**, then sets `%MR_ASR_ACTIVE=0`, returning the lifecycle to `IDLE` and saving one file.
+The validated automation lifecycle launches ASR and automatically stops after the Meet end check. `MR Stop ASR` presses NLL **Stop and save**, then sets `%MR_ASR_ACTIVE=0`, returning the lifecycle to `IDLE` and saving one file; that file is not evidence of in-call audio.
 
 ## Import on the Pixel
 
@@ -50,7 +52,7 @@ Run the cases in [VALIDATION_MATRIX.md](VALIDATION_MATRIX.md) before treating th
 ## Sources and tracking
 
 - [Tasker user guide / action index](https://tasker.joaoapps.com/userguide/en/help/ah_index.html) and [Tasker Android power guidance](https://tasker.joaoapps.com/userguide/en/androidpowermanagement.html)
-- [Android background activity starts](https://developer.android.com/guide/components/activities/background-starts) and [microphone foreground-service restrictions](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)
+- [Android background activity starts](https://developer.android.com/guide/components/activities/background-starts), [microphone foreground-service restrictions](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start), [audio-input sharing](https://developer.android.com/media/platform/sharing-audio-input), and [concurrent audio capture](https://source.android.com/docs/core/audio/concurrent)
 - [NLL ASR Voice Recorder](https://nllapps.com/apps/asr/) and [ASR cloud/WebHook documentation](https://nllapps.com/common/cloud2/)
 - [Samsung battery optimization guidance](https://www.samsung.com/us/support/answer/ANS10002588/)
 - [Speakr ASR upload contract tests](https://github.com/murtaza-nasir/speakr/blob/v0.10.3-alpha/tests/test_asr_voice_recorder_upload.py) and [repository issue tracker](https://github.com/ShadyF/meeting-recorder/issues)
