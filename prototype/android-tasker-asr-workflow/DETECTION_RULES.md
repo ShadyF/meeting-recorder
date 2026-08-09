@@ -1,6 +1,14 @@
 # Detection rules
 
-**Prototype only.** This Android workflow is independent of the Linux recorder. It detects context and asks the user to open ASR; it does not authorize silent recording.
+**Prototype only.** This Android workflow is independent of the Linux recorder. The six-profile Pixel candidate below detects context and asks the user to open ASR. The separately validated Galaxy Meet lifecycle launches, records, and stops through device-authored Tasker actions.
+
+## Validated Galaxy Meet lifecycle
+
+Import `MR_Meet_Lifecycle.prj.xml` and the normalized Galaxy standalone exports for `MR Inspect Meetings`, `Launch ASR`, `MR Stop ASR`, and `MR Meet Posted Wake`. Keep exactly one profile named **`MR Meet Posted Wake`**; do not rename it. Its AutoNotification status is **both Created and Cancelled** and it performs **`MR Meet Reconcile`** with no parameters.
+
+The Galaxy Meet notification signature is package `com.google.android.apps.tachyon`, empty category, persistent `true`, and button 1 `Hang Up`. `%anqueryok` may be unset, so it is not a required match. `MR Stop ASR` presses NLL **Stop and save** and then sets `%MR_ASR_ACTIVE=0`; the validated end path returns to `IDLE` with one saved file.
+
+The rules below are retained as provenance for the older six-profile Pixel candidate, not as the Galaxy lifecycle configuration.
 
 ## Signals and state
 

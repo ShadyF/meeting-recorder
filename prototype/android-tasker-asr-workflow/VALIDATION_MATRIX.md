@@ -35,34 +35,35 @@
 
 | Metadata | Value |
 | --- | --- |
-| Device | Galaxy Tab S9 (pending) |
-| Android build | Pending |
-| Tasker | Pending |
-| ASR | Pending |
-| Project export | Pending |
+| Device | Galaxy Tab S9 |
+| Android build | Android 16 `BP4A.251205.006.X710XXS6EZG3` |
+| Tasker | 6.6.20 |
+| ASR | Latest installed `com.nll.asr` |
+| Project export | `MR_Meet_Lifecycle.prj.xml` plus normalized Galaxy standalone exports: `MR Inspect Meetings`, `Launch ASR`, `MR Stop ASR`, and `MR Meet Posted Wake` |
 
 | Test | Status | Evidence / notes |
 | --- | --- | --- |
-| Project import | Not run | |
+| Project import | Passed | Lifecycle project imported and reset successfully. |
+| Meet notification lifecycle | Passed | Galaxy signature is Meet package, empty category, persistent `true`, button 1 `Hang Up`; `%anqueryok` is unset. The single Created/Cancelled wake profile triggered the prompt and end check automatically. |
 | Calendar strong signal | Not run | |
 | App alone rejection | Not run | |
 | Notification alone rejection | Not run | |
 | App + notification within 10 min | Not run | |
 | Cooldown duplicate suppression | Not run | |
 | Manual re-arm | Not run | |
-| ASR launch | Not run | |
-| Direct/auto start vs tap | Not run | Record whether launch starts recording or needs a user tap. |
-| Continued background recording | Not run | |
-| Stop behavior | Not run | Confirm manual ASR stop; silent Tasker stop is not assumed. |
-| Away-from-home Wi-Fi queue | Not run | |
-| Home Wi-Fi arrival upload | Not run | |
-| Failed retry | Not run | Verify 1–2 hour retry or manual queue upload. |
-| Duplicate replay exactly once | Not run | Verify server response/record ID shows one idempotent replay. |
+| ASR launch | Passed | `Launch ASR` opened NLL ASR from the Meet prompt. |
+| Direct/auto start vs tap | Passed | ASR began recording without another tap. |
+| Continued background recording | Passed | ASR continued while the Meet call remained active. |
+| Stop behavior | Passed | Leaving Meet triggered one automatic `Stop and save` after the 30-second end check; the device-authored stop task cleared `%MR_ASR_ACTIVE`, returning the lifecycle to `IDLE` without a warning and saving one file. |
+| Away-from-home Wi-Fi queue | Passed | With home Wi-Fi disconnected, the completed Meet recording remained queued instead of uploading. |
+| Home Wi-Fi arrival upload | Passed | Rejoining home Wi-Fi cleared the queue and created exactly one Speakr recording. |
+| Failed retry | Not run | Deliberately skipped; automatic/manual recovery from an attempted failed upload remains unverified. |
+| Duplicate replay exactly once | Passed | Re-uploading the same Galaxy recording reused the existing Speakr recording instead of creating a duplicate. |
 
 ## Unresolved limitations
 
-- The original `Meeting_ASR_Pixel_7.prj.xml` remains an unverified hand-assembled provenance candidate. `Meeting_ASR_Pixel_7_verified.prj.xml` was normalized by Tasker import/re-export, but behavior validation remains required.
+- The original six-profile `Meeting_ASR_Pixel_7.prj.xml` remains an unverified hand-assembled provenance candidate. The separate Meet lifecycle artifacts are physically validated on Pixel and Galaxy.
 - The final normalized export captures Webex foreground and notification contexts as `com.cisco.wx2.android` with `com.webex.teams.WebexLauncherActivity`; behavior validation remains required.
-- ASR does not provide a documented public Tasker start/stop intent for this workflow. Android background-start policy can require the `Open ASR` tap.
+- ASR does not provide a documented public Tasker start/stop intent. The validated lifecycle uses Tasker's `loadApp()` plus NLL's live `Stop and save` notification action, which remains device-authored.
 - Notification wording and `New Only` behavior vary by app and Tasker/Android version; test the individual owner-app profiles.
-- Samsung battery management may affect profile delivery, ASR launch, recording, and queued upload behavior; the Galaxy result cannot be inferred from the Pixel.
+- Galaxy Meet exposes an empty notification category and no `%anqueryok`; the lifecycle accepts that calibrated signature while retaining package, persistence, and `Hang Up` checks.

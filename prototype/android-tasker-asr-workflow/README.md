@@ -1,8 +1,16 @@
-# Meeting ASR: Pixel 7 Tasker prototype
+# Meeting ASR: Tasker prototype
 
 **Throwaway Android-only prototype.** It is independent of the Linux recorder. Never put a real API secret in this repository or in screenshots.
 
-Target device: **Pixel 7**, Android 17 `CP2A.260705.006`, Tasker `6.6.20`, and the latest installed **ASR Voice Recorder** (`com.nll.asr`). The expected meeting apps are Meet (`com.google.android.apps.tachyon`), Zoom (`us.zoom.videomeetings`), Webex (`com.cisco.wx2.android`), and Teams (`com.microsoft.teams`).
+The original candidate targets a **Pixel 7**, Android 17 `CP2A.260705.006`, Tasker `6.6.20`, and the latest installed **ASR Voice Recorder** (`com.nll.asr`). Its expected meeting apps are Meet (`com.google.android.apps.tachyon`), Zoom (`us.zoom.videomeetings`), Webex (`com.cisco.wx2.android`), and Teams (`com.microsoft.teams`). The separate Meet lifecycle is physically validated on the Galaxy Tab S9, Android 16 `BP4A.251205.006.X710XXS6EZG3`, with Tasker `6.6.20`.
+
+## Validated Galaxy Meet lifecycle
+
+Import `MR_Meet_Lifecycle.prj.xml`, grant Tasker notification access and the permissions it requests, and keep Tasker and ASR Voice Recorder unrestricted for battery use. Then import the normalized device-authored `MR Inspect Meetings`, `Launch ASR`, and `MR Stop ASR` tasks plus the `MR Meet Posted Wake` profile; do not substitute the older Pixel candidate tasks.
+
+There is exactly one wake profile: **`MR Meet Posted Wake`**. Its AutoNotification status is **both Created and Cancelled**, and it performs **`MR Meet Reconcile` with no parameters**. Do not rename the profile. Its calibrated Galaxy Meet signature is package `com.google.android.apps.tachyon`, empty category, persistent `true`, and button 1 `Hang Up`; `%anqueryok` may be unset.
+
+The validated lifecycle launches ASR, records in the background, and automatically stops after the Meet end check. `MR Stop ASR` presses NLL **Stop and save**, then sets `%MR_ASR_ACTIVE=0`, returning the lifecycle to `IDLE` and saving one file.
 
 ## Import on the Pixel
 
@@ -31,11 +39,11 @@ The rule values and Tasker expressions are deliberately specified in [DETECTION_
    - disable **Auto disconnect** for a home-only endpoint.
 3. Expect ASR to attempt an upload about 30–60 seconds after a recording and to retry queued failures about every 1–2 hours. The ASR queue can also be uploaded manually.
 
-Tasker can launch ASR, but no documented public ASR intent here promises a silent start or stop. The `Open ASR` button may open ASR and require one user tap to begin recording. Test background-start behavior on the device; Android may block launches without user interaction.
+The legacy Pixel candidate can launch ASR, but no documented public ASR intent promises a silent start or stop. The validated Galaxy Meet lifecycle instead uses the device-authored NLL notification action for **Stop and save**.
 
 ## Export and capture
 
-The verified file is the captured Tasker 6.6.20 normalized re-export. Preserve the original candidate as provenance; do not treat import success as behavior validation.
+The verified Pixel file is the captured Tasker 6.6.20 normalized re-export. Preserve the original six-profile candidate as provenance; do not treat import success as behavior validation. The Galaxy standalone exports are separately device-authored and normalized when captured.
 
 Run the cases in [VALIDATION_MATRIX.md](VALIDATION_MATRIX.md) before treating this prototype as usable.
 
@@ -44,5 +52,5 @@ Run the cases in [VALIDATION_MATRIX.md](VALIDATION_MATRIX.md) before treating th
 - [Tasker user guide / action index](https://tasker.joaoapps.com/userguide/en/help/ah_index.html) and [Tasker Android power guidance](https://tasker.joaoapps.com/userguide/en/androidpowermanagement.html)
 - [Android background activity starts](https://developer.android.com/guide/components/activities/background-starts) and [microphone foreground-service restrictions](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)
 - [NLL ASR Voice Recorder](https://nllapps.com/apps/asr/) and [ASR cloud/WebHook documentation](https://nllapps.com/common/cloud2/)
-- [Samsung battery optimization guidance](https://www.samsung.com/us/support/answer/ANS10002588/) (relevant when validating the Galaxy)
+- [Samsung battery optimization guidance](https://www.samsung.com/us/support/answer/ANS10002588/)
 - [Speakr ASR upload contract tests](https://github.com/murtaza-nasir/speakr/blob/v0.10.3-alpha/tests/test_asr_voice_recorder_upload.py) and [repository issue tracker](https://github.com/ShadyF/meeting-recorder/issues)

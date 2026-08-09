@@ -1,0 +1,115 @@
+<TaskerData sr="" dvi="1" tv="6.6.20">
+  <Profile sr="prof9401" ve="2">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <flags>8</flags>
+    <id>9401</id>
+    <mid0>9300</mid0>
+    <nme>MR Meet Posted Wake</nme>
+    <Event sr="con0" ve="2">
+      <code>1520257414</code>
+      <pri>0</pri>
+      <Bundle sr="arg0">
+        <Vals sr="val">
+          <InterceptApps>&lt;StringArray sr=""&gt;&lt;_array_InterceptApps0&gt;com.google.android.apps.tachyon&lt;/_array_InterceptApps0&gt;&lt;/StringArray&gt;</InterceptApps>
+          <InterceptApps-type>[Ljava.lang.String;</InterceptApps-type>
+          <InterceptPersistent>0</InterceptPersistent>
+          <InterceptPersistent-type>java.lang.String</InterceptPersistent-type>
+          <Type>2</Type>
+          <Type-type>java.lang.String</Type-type>
+          <com.twofortyfouram.locale.intent.extra.BLURB>Event Behaviour: true
+Persistency Type: Both
+Notification Apps: Meet</com.twofortyfouram.locale.intent.extra.BLURB>
+          <com.twofortyfouram.locale.intent.extra.BLURB-type>java.lang.String</com.twofortyfouram.locale.intent.extra.BLURB-type>
+          <net.dinglisch.android.tasker.EXTRA_NSR_DEPRECATED>true</net.dinglisch.android.tasker.EXTRA_NSR_DEPRECATED>
+          <net.dinglisch.android.tasker.EXTRA_NSR_DEPRECATED-type>java.lang.Boolean</net.dinglisch.android.tasker.EXTRA_NSR_DEPRECATED-type>
+          <net.dinglisch.android.tasker.extras.REQUESTED_TIMEOUT>0</net.dinglisch.android.tasker.extras.REQUESTED_TIMEOUT>
+          <net.dinglisch.android.tasker.extras.REQUESTED_TIMEOUT-type>java.lang.Integer</net.dinglisch.android.tasker.extras.REQUESTED_TIMEOUT-type>
+          <net.dinglisch.android.tasker.extras.VARIABLE_REPLACE_KEYS>InterceptApps Type InterceptPersistent plugininstanceid plugintypeid </net.dinglisch.android.tasker.extras.VARIABLE_REPLACE_KEYS>
+          <net.dinglisch.android.tasker.extras.VARIABLE_REPLACE_KEYS-type>java.lang.String</net.dinglisch.android.tasker.extras.VARIABLE_REPLACE_KEYS-type>
+          <net.dinglisch.android.tasker.subbundled>true</net.dinglisch.android.tasker.subbundled>
+          <net.dinglisch.android.tasker.subbundled-type>java.lang.Boolean</net.dinglisch.android.tasker.subbundled-type>
+          <plugininstanceid>0ba7da4d-1af6-469f-a5f8-bab743061c45</plugininstanceid>
+          <plugininstanceid-type>java.lang.String</plugininstanceid-type>
+          <plugintypeid>com.joaomgcd.autonotification.intent.IntentInterceptNotificationEvent</plugintypeid>
+          <plugintypeid-type>java.lang.String</plugintypeid-type>
+        </Vals>
+      </Bundle>
+      <Str sr="arg1" ve="3">com.joaomgcd.autonotification</Str>
+      <Str sr="arg2" ve="3">com.joaomgcd.autonotification.activity.ActivityConfigNotificationInterceptTaskerEvent</Str>
+      <Int sr="arg3" val="1" />
+    </Event>
+  </Profile>
+  <Task sr="task9300">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>9300</id>
+    <nme>MR Meet Reconcile</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>549</code>
+      <Str sr="arg0" ve="3">%anpackage/%ancategoryname/%anpersistent/%anbutton1text/%anqueryok</Str>
+      <Int sr="arg1" val="1" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="0" />
+    </Action>
+    <Action sr="act1" ve="7">
+      <code>130</code>
+      <Str sr="arg0" ve="3">MR Inspect Meetings</Str>
+      <Int sr="arg1"><var>%priority</var></Int>
+      <Int sr="arg10" val="1" />
+      <Str sr="arg2" ve="3" />
+      <Str sr="arg3" ve="3" />
+      <Str sr="arg4" ve="3" />
+      <Int sr="arg5" val="0" />
+      <Int sr="arg6" val="0" />
+      <Str sr="arg7" ve="3" />
+      <Int sr="arg8" val="0" />
+      <Int sr="arg9" val="0" />
+    </Action>
+    <Action sr="act2" ve="7">
+      <code>129</code>
+      <Str sr="arg0" ve="3">(function () {
+  function array(v) { return typeof v === 'undefined' || v === null || v === '' ? [] : Array.isArray(v) ? v : [v]; }
+  function norm(v) { return String(v === null || typeof v === 'undefined' ? '' : v).trim().toLowerCase(); }
+  function strictMeet() {
+    var packages = array(typeof anpackage === 'undefined' ? undefined : anpackage);
+    var categories = array(typeof ancategoryname === 'undefined' ? undefined : ancategoryname);
+    var persistent = array(typeof anpersistent === 'undefined' ? undefined : anpersistent);
+    var button1 = array(typeof anbutton1text === 'undefined' ? undefined : anbutton1text);
+    var count = Math.max(packages.length, categories.length, persistent.length, button1.length);
+    for (var i = 0; i &lt; count; i++) {
+      if (norm(packages[i]) === 'com.google.android.apps.tachyon' &amp;&amp; (norm(categories[i]) === 'ongoing call' || norm(categories[i]) === '') &amp;&amp; (norm(persistent[i]) === 'true' || norm(persistent[i]) === '1') &amp;&amp; norm(button1[i]) === 'hang up') return true;
+    }
+    return false;
+  }
+  function token() { return String(Date.now()) + '-' + Math.random().toString(36).slice(2); }
+  var state = String(global('MRM_STATE') || 'IDLE');
+  var queryOk = norm(typeof anqueryok === 'undefined' ? undefined : anqueryok);
+  if (queryOk &amp;&amp; queryOk.indexOf('1') === -1 &amp;&amp; queryOk.indexOf('true') === -1) {
+    if (state !== 'IDLE') {
+      setGlobal('MRM_STATE', 'ATTENTION');
+      setGlobal('MRM_ERROR', 'QUERY_FAILED');
+      setGlobal('MRM_END_TOKEN', '');
+      performTask('MR Meet Attention', 100, '', '', '', false, false, '', false);
+    }
+  } else if (strictMeet()) {
+    setGlobal('MRM_END_TOKEN', '');
+    setGlobal('MRM_ERROR', '');
+    if (state === 'IDLE') {
+      setGlobal('MRM_SESSION', token());
+      setGlobal('MRM_STATE', 'OFFERED');
+      performTask('MR Meet Offer', 100, '', '', '', false, false, '', false);
+    }
+  } else if ((state === 'OFFERED' || state === 'STARTING' || state === 'RECORDING') &amp;&amp; !global('MRM_END_TOKEN')) {
+    var endToken = token();
+    setGlobal('MRM_END_TOKEN', endToken);
+    performTask('MR Meet End Check', 100, '', '', '', false, false, '', false);
+  }
+}());</Str>
+      <Str sr="arg1" ve="3" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="45" />
+    </Action>
+  </Task>
+</TaskerData>

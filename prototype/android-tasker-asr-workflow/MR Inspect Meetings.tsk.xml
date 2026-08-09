@@ -1,0 +1,87 @@
+<TaskerData sr="" dvi="1" tv="6.6.20">
+  <Task sr="task9101">
+    <cdate>1786060800000</cdate>
+    <edate>1786060800000</edate>
+    <id>9101</id>
+    <nme>MR Inspect Meetings</nme>
+    <pri>100</pri>
+    <Action sr="act0" ve="7">
+      <code>565385068</code>
+      <Bundle sr="arg0">
+        <Vals sr="val">
+          <AllFields>false</AllFields>
+          <AllFields-type>java.lang.Boolean</AllFields-type>
+          <BigImageNames>&lt;null&gt;</BigImageNames>
+          <BigImageNames-type>java.lang.String</BigImageNames-type>
+          <BigTextNames>&lt;null&gt;</BigTextNames>
+          <BigTextNames-type>java.lang.String</BigTextNames-type>
+          <GetAsJson>false</GetAsJson>
+          <GetAsJson-type>java.lang.Boolean</GetAsJson-type>
+          <HasMediaSession>false</HasMediaSession>
+          <HasMediaSession-type>java.lang.Boolean</HasMediaSession-type>
+          <HasReplyAction>false</HasReplyAction>
+          <HasReplyAction-type>java.lang.Boolean</HasReplyAction-type>
+          <ImageNames>&lt;null&gt;</ImageNames>
+          <ImageNames-type>java.lang.String</ImageNames-type>
+          <InterceptApps>&lt;StringArray sr=""&gt;&lt;_array_InterceptApps0&gt;com.google.android.apps.tachyon&lt;/_array_InterceptApps0&gt;&lt;/StringArray&gt;</InterceptApps>
+          <InterceptApps-type>[Ljava.lang.String;</InterceptApps-type>
+          <InterceptPersistent>&lt;null&gt;</InterceptPersistent>
+          <InterceptPersistent-type>java.lang.String</InterceptPersistent-type>
+          <InternalActionsBig>&lt;null&gt;</InternalActionsBig>
+          <InternalActionsBig-type>java.lang.String</InternalActionsBig-type>
+          <InternalActionsSmall>&lt;null&gt;</InternalActionsSmall>
+          <InternalActionsSmall-type>java.lang.String</InternalActionsSmall-type>
+          <QueryAnyMatch>&lt;null&gt;</QueryAnyMatch>
+          <QueryAnyMatch-type>java.lang.String</QueryAnyMatch-type>
+          <QueryAppName>&lt;null&gt;</QueryAppName>
+          <QueryAppName-type>java.lang.String</QueryAppName-type>
+          <QueryAppPackage>&lt;null&gt;</QueryAppPackage>
+          <QueryAppPackage-type>java.lang.String</QueryAppPackage-type>
+          <QueryText>&lt;null&gt;</QueryText>
+          <QueryText-type>java.lang.String</QueryText-type>
+          <QueryTitle>&lt;null&gt;</QueryTitle>
+          <QueryTitle-type>java.lang.String</QueryTitle-type>
+          <SnoozedNotifications>false</SnoozedNotifications>
+          <SnoozedNotifications-type>java.lang.Boolean</SnoozedNotifications-type>
+          <TextNames>&lt;null&gt;</TextNames>
+          <TextNames-type>java.lang.String</TextNames-type>
+          <UseRegex>false</UseRegex>
+          <UseRegex-type>java.lang.Boolean</UseRegex-type>
+          <blurb>Notification Apps: Meet</blurb>
+          <blurb-type>java.lang.String</blurb-type>
+          <VARIABLE_REPLACE_KEYS>InterceptApps plugininstanceid plugintypeid </VARIABLE_REPLACE_KEYS>
+          <VARIABLE_REPLACE_KEYS-type>java.lang.String</VARIABLE_REPLACE_KEYS-type>
+          <subbundled>true</subbundled>
+          <subbundled-type>java.lang.Boolean</subbundled-type>
+          <plugininstanceid>8af7e844-bf64-43d0-9a4c-c998cd3bdf11</plugininstanceid>
+          <plugininstanceid-type>java.lang.String</plugininstanceid-type>
+          <plugintypeid>com.joaomgcd.autonotification.intent.IntentNotificationQuery</plugintypeid>
+          <plugintypeid-type>java.lang.String</plugintypeid-type>
+        </Vals>
+      </Bundle>
+      <Str sr="arg1" ve="3">com.joaomgcd.autonotification</Str>
+      <Str sr="arg2" ve="3">com.joaomgcd.autonotification.activity.ActivityConfigNotificationQuery</Str>
+      <Int sr="arg3" val="20" />
+      <Int sr="arg4" val="1" />
+    </Action>
+    <Action sr="act1" ve="7">
+      <code>105</code>
+      <Str sr="arg0" ve="3">package=%anpackage()
+category=%ancategoryname()
+persistent=%anpersistent()
+button1=%anbutton1text()
+button2=%anbutton2text()</Str>
+      <Int sr="arg1" val="0" />
+      <Str sr="arg2" ve="3" />
+      <Int sr="arg3" val="0" />
+    </Action>
+    <Action sr="act2" ve="7">
+      <code>126</code>
+      <Str sr="arg0" ve="3" />
+      <Int sr="arg1" val="1" />
+      <Int sr="arg2" val="1" />
+      <Int sr="arg3" val="1" />
+      <Str sr="arg4" ve="3">%an*</Str>
+    </Action>
+  </Task>
+</TaskerData>
