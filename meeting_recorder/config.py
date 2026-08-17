@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .domain import VideoSource
 from .utils import LOG, expand_path
 
 # Ships inside the package so it resolves the same from a source checkout and an
@@ -35,7 +36,7 @@ class AllowEntry:
 class Config:
     output_dir: Path
     record_screen: bool
-    video_source: str           # "fullscreen" | "window" | "area"
+    video_source: VideoSource
     capture_region: str         # "x,y,w,h" used when video_source == "area"
     show_cursor: bool           # draw the mouse pointer into the video
     wayland_restore_token: str  # portal ScreenCast token, so we prompt only once
@@ -65,7 +66,7 @@ class Config:
         return cls(
             output_dir=expand_path(data["output_dir"]),
             record_screen=bool(data["record_screen"]),
-            video_source=str(data.get("video_source", "fullscreen")),
+            video_source=VideoSource.parse(data.get("video_source", "fullscreen")),
             capture_region=str(data.get("capture_region", "")),
             show_cursor=bool(data.get("show_cursor", True)),
             wayland_restore_token=str(data.get("wayland_restore_token", "")),

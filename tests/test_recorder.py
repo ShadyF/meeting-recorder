@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from meeting_recorder.config import load_config
-from meeting_recorder.domain import CaptureMode
+from meeting_recorder.domain import CaptureMode, VideoSource
 from meeting_recorder.recorder import (
     CaptureDevices,
     audio_roles,
@@ -105,7 +105,7 @@ def test_capture_audio_only_has_no_video():
 
 
 def test_capture_mode_controls_video_independently_of_shared_preference():
-    cfg = _cfg(record_screen=False, video_source="area",
+    cfg = _cfg(record_screen=False, video_source=VideoSource.AREA,
                record_mic=True, record_system_audio=False)
     audio_only = " ".join(build_ffmpeg_cmd(
         cfg, OUT, DEV, CaptureMode.AUDIO_ONLY))
@@ -159,7 +159,7 @@ def test_pipewire_pump_matches_the_caps_ffmpeg_expects():
 
 def test_pipewire_pump_crops_for_area_capture():
     """'area' has no portal equivalent, so the region is cropped in the pump."""
-    cfg = _cfg(record_screen=True, video_source="area",
+    cfg = _cfg(record_screen=True, video_source=VideoSource.AREA,
                capture_region="100,50,800,600")
     joined = " ".join(build_pipewire_cmd(cfg, 42, 7, "1920x1080", "/tmp/seg.fifo",
                                          crop=(100, 50, 800, 600)))
@@ -168,17 +168,17 @@ def test_pipewire_pump_crops_for_area_capture():
 
 
 def test_pipewire_capture_size_uses_region_then_stream():
-    assert pipewire_capture_size(_cfg(video_source="fullscreen"), (1920, 1080)) == "1920x1080"
+    assert pipewire_capture_size(_cfg(video_source=VideoSource.FULLSCREEN), (1920, 1080)) == "1920x1080"
     assert pipewire_capture_size(
-        _cfg(video_source="area", capture_region="0,0,800,600"), (1920, 1080)) == "800x600"
+        _cfg(video_source=VideoSource.AREA, capture_region="0,0,800,600"), (1920, 1080)) == "800x600"
     # Rounded down to a stride-safe width (multiple of 8) and an even height:
     # x264/yuv420p needs even dimensions, and anything not a multiple of 8
     # makes GStreamer pad its rows, which shears the picture. See
     # test_pipewire_size_is_always_stride_safe.
-    assert pipewire_capture_size(_cfg(video_source="fullscreen"), (1367, 769)) == "1360x768"
+    assert pipewire_capture_size(_cfg(video_source=VideoSource.FULLSCREEN), (1367, 769)) == "1360x768"
     # A bad region falls back to the whole stream rather than failing.
     assert pipewire_capture_size(
-        _cfg(video_source="area", capture_region="bogus"), (1920, 1080)) == "1920x1080"
+        _cfg(video_source=VideoSource.AREA, capture_region="bogus"), (1920, 1080)) == "1920x1080"
 
 
 def test_pipewire_size_is_always_stride_safe():
@@ -198,7 +198,7 @@ def test_pipewire_size_is_always_stride_safe():
                            (None, (1366, 768)),      # full screen, odd width
                            (None, (1920, 1080))]:
         cfg = _cfg(record_screen=True,
-                   video_source="area" if region else "fullscreen",
+                   video_source=VideoSource.AREA if region else VideoSource.FULLSCREEN,
                    capture_region=region or "")
         size = pipewire_capture_size(cfg, stream)
         width = int(size.split("x")[0])
@@ -308,13 +308,13 @@ def test_parse_region():
 
 
 def test_video_geometry_fullscreen_and_bad_area_fallback():
-    x, y, size = video_geometry(_cfg(video_source="fullscreen"))
+    x, y, size = video_geometry(_cfg(video_source=VideoSource.FULLSCREEN))
     assert (x, y) == (0, 0) and "x" in size
-    x, y, size = video_geometry(_cfg(video_source="unexpected"))
+    x, y, size = video_geometry(_cfg(video_source=VideoSource.parse("unexpected")))
     assert (x, y) == (0, 0) and "x" in size
-    x, y, size = video_geometry(_cfg(video_source="area", capture_region=""))
+    x, y, size = video_geometry(_cfg(video_source=VideoSource.AREA, capture_region=""))
     assert (x, y) == (0, 0)
-    x, y, size = video_geometry(_cfg(video_source="area", capture_region="10,20,801,601"))
+    x, y, size = video_geometry(_cfg(video_source=VideoSource.AREA, capture_region="10,20,801,601"))
     assert (x, y) == (10, 20) and size == "800x600"
 
 
@@ -325,9 +325,9 @@ def test_video_source_selects_fullscreen_window_and_area_on_x11():
     rec.screen_resolution = lambda: "1920x1080"
     rec.active_window_geometry = lambda: (20, 30, 800, 600)
     try:
-        assert video_geometry(_cfg(video_source="fullscreen")) == (0, 0, "1920x1080")
-        assert video_geometry(_cfg(video_source="window")) == (20, 30, "800x600")
-        assert video_geometry(_cfg(video_source="area", capture_region="10,20,801,601")) == (
+        assert video_geometry(_cfg(video_source=VideoSource.FULLSCREEN)) == (0, 0, "1920x1080")
+        assert video_geometry(_cfg(video_source=VideoSource.WINDOW)) == (20, 30, "800x600")
+        assert video_geometry(_cfg(video_source=VideoSource.AREA, capture_region="10,20,801,601")) == (
             10, 20, "800x600")
     finally:
         rec.screen_resolution, rec.active_window_geometry = previous

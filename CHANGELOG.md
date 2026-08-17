@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- Video source now separately selects fullscreen, the current window, or an
+  area, while Capture mode describes the media composition for each recording.
+- Existing `capture_mode` configuration values remain supported and are saved
+  as the canonical `video_source` key.
+
 ## [0.3.5] — 2026-07-19
 
 ### Fixed

@@ -31,7 +31,7 @@ from pathlib import Path
 
 from . import audio
 from .config import Config
-from .domain import CaptureMode
+from .domain import CaptureMode, VideoSource
 from .utils import LOG, expand_path
 
 _LIMITER = "alimiter=limit=0.95"
@@ -130,13 +130,13 @@ def video_geometry(cfg: Config) -> tuple[int, int, str]:
 
     Falls back to full screen if a window/area can't be determined.
     """
-    if cfg.video_source == "window":
+    if cfg.video_source is VideoSource.WINDOW:
         geo = active_window_geometry()
         if geo:
             x, y, w, h = geo
             return x, y, f"{_even(w)}x{_even(h)}"
         LOG.warning("Window capture unavailable; using full screen")
-    elif cfg.video_source == "area":
+    elif cfg.video_source is VideoSource.AREA:
         geo = parse_region(cfg.capture_region)
         if geo:
             size = screen_resolution()
@@ -230,7 +230,7 @@ def build_pipewire_cmd(cfg: Config, node_id: int, fd: int, size: str,
 def pipewire_region(cfg: Config,
                     session_size: tuple[int, int]) -> tuple[int, int, int, int] | None:
     """The crop rectangle for "area" capture, clamped to the portal stream."""
-    if cfg.video_source != "area":
+    if cfg.video_source is not VideoSource.AREA:
         return None
     geo = parse_region(cfg.capture_region)
     if not geo:
@@ -255,7 +255,7 @@ def pipewire_output_size(cfg: Config,
     if geo:
         w, h = geo[2], geo[3]
     else:
-        if cfg.video_source == "area":
+        if cfg.video_source is VideoSource.AREA:
             LOG.warning("No valid capture_region; using the full portal stream")
         w, h = session_size
     return _packed_width(w), _even(h)
@@ -565,6 +565,9 @@ class Recorder:
             f".{self._final_path.stem}.part{len(self._parts)}{self._final_path.suffix}")
         dev = resolve_devices(self.cfg, self._session)
         requested_mode = self._requested_capture_mode
+
+        # Try PipeWire before locking the first segment's actual video layout;
+        # concat requires later segments to match, so derive its effective mode here.
         if self._wants_pipewire and self._has_video is not False:
             self._start_pump(part, dev)
             if not dev.video_fifo:

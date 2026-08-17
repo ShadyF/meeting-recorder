@@ -12,7 +12,7 @@ import types
 
 from meeting_recorder.config import load_config
 from meeting_recorder.controller import Controller
-from meeting_recorder.domain import CaptureMode
+from meeting_recorder.domain import CaptureMode, VideoSource
 
 
 def test_build_controls_calls_the_tray_with_arguments_it_accepts():
@@ -107,11 +107,11 @@ def test_manual_start_derives_a_per_run_capture_mode_without_changing_config():
     controller._show_widget = lambda: None
 
     cfg.record_screen = False
-    cfg.video_source = "area"
+    cfg.video_source = VideoSource.AREA
     controller.start_manual()
     assert recorder.capture_mode is CaptureMode.AUDIO_ONLY
     assert cfg.record_screen is False
-    assert cfg.video_source == "area"
+    assert cfg.video_source is VideoSource.AREA
 
     controller.stop_manual()
     cfg.record_screen = True
@@ -149,7 +149,7 @@ def test_manual_video_source_selects_the_matching_portal_source_type():
     try:
         cfg = load_config()
         cfg.record_screen = True
-        cfg.video_source = "window"
+        cfg.video_source = VideoSource.WINDOW
         controller = Controller(cfg, FakeNotifier(), FakeRecorder())
         controller._show_widget = lambda: None
         controller.start_manual()

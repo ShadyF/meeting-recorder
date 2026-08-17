@@ -23,6 +23,7 @@ import os
 import random
 from typing import Callable
 
+from .domain import VideoSource
 from .utils import LOG
 
 # `gi` is imported lazily, not at module scope: `use_portal_capture()` is called
@@ -288,9 +289,9 @@ class ScreenCastSession:
             LOG.debug("closing ScreenCast session failed: %s", exc)
 
 
-def source_types_for(video_source: str) -> int:
+def source_types_for(video_source: VideoSource) -> int:
     """Portal source bitmask for a configured video source.
 
     'area' has no portal equivalent — we take a monitor and crop it downstream.
     """
-    return SOURCE_WINDOW if video_source == "window" else SOURCE_MONITOR
+    return SOURCE_WINDOW if video_source is VideoSource.WINDOW else SOURCE_MONITOR

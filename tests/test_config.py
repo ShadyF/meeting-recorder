@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 from meeting_recorder.config import load_config, load_raw_config, save_user_config
+from meeting_recorder.domain import VideoSource
 
 
 def _with_user_config(data, check):
@@ -27,7 +28,7 @@ def _with_user_config(data, check):
 
 def test_legacy_capture_mode_loads_as_video_source_for_typed_and_raw_config():
     def check(_path):
-        assert load_config().video_source == "area"
+        assert load_config().video_source is VideoSource.AREA
         raw = load_raw_config()
         assert raw["video_source"] == "area"
         assert "capture_mode" not in raw
@@ -37,10 +38,19 @@ def test_legacy_capture_mode_loads_as_video_source_for_typed_and_raw_config():
 
 def test_canonical_video_source_wins_over_legacy_capture_mode():
     def check(_path):
-        assert load_config().video_source == "window"
+        assert load_config().video_source is VideoSource.WINDOW
         assert load_raw_config()["video_source"] == "window"
 
     _with_user_config({"capture_mode": "area", "video_source": "window"}, check)
+
+
+def test_invalid_legacy_or_canonical_source_falls_back_in_typed_config():
+    def check(_path):
+        assert load_config().video_source is VideoSource.FULLSCREEN
+        assert load_raw_config()["video_source"] == "unexpected"
+
+    _with_user_config({"capture_mode": "unexpected"}, check)
+    _with_user_config({"video_source": "unexpected"}, check)
 
 
 def test_saving_config_omits_legacy_capture_mode():

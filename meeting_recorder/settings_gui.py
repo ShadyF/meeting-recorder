@@ -17,13 +17,14 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk  # noqa: E402
 
 from .config import load_defaults, load_raw_config, save_user_config
+from .domain import VideoSource
 from .utils import LOG, expand_path
 
 CONTAINERS = ["mkv", "mp4"]
 # (config value, display label)
-VIDEO_SOURCES = [("fullscreen", "Full screen"),
-                 ("window", "Current window"),
-                 ("area", "Selected area")]
+VIDEO_SOURCES = [(VideoSource.FULLSCREEN.value, "Full screen"),
+                 (VideoSource.WINDOW.value, "Current window"),
+                 (VideoSource.AREA.value, "Selected area")]
 
 
 class SettingsWindow(Gtk.Window):
