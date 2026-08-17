@@ -4,5 +4,6 @@
     "dockerfile": "Dockerfile",
     "context": ".."
   },
-  "remoteUser": "developer"
+  "remoteUser": "ubuntu",
+  "updateRemoteUserUID": true
 }

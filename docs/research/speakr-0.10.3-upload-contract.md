@@ -55,18 +55,3 @@ Sources: [`filename_dates.py`](https://raw.githubusercontent.com/murtaza-nasir/s
 **Planning implications**
 
 - The desktop publisher should send a timezone-aware `meeting_date` and use `file_last_modified` as its fallback. It should not depend on the disabled filename parser.
-
-## ASR Voice Recorder integration upload
-
-**Facts**
-
-- `POST /api/v1/integrations/asr-voice-recorder/upload` accepts a secret token, `file`, and optional `file_name`, `date`, `note`, and `duration`; `duration` is ignored.
-- It returns `200 OK`, including for the fileless test case.
-- A retry within the replay window that matches user, content, filename, note, and date returns the original ID with `idempotent_replay`.
-- This endpoint has no `title` or `participants` fields; exact metadata requires a later `PATCH`.
-
-Source: [ASR Voice Recorder upload tests](https://github.com/murtaza-nasir/speakr/blob/v0.10.3-alpha/tests/test_asr_voice_recorder_upload.py).
-
-**Planning implications**
-
-- Android NLL ASR should use a dedicated adapter for this endpoint so it can use its replay semantics without changing the desktop publisher contract.

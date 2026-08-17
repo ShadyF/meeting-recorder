@@ -7,6 +7,4 @@ RUN apt-get update \
         python3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --shell /bin/bash developer
-
-USER developer
+USER ubuntu

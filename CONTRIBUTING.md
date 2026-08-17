@@ -29,7 +29,7 @@ notification and tray: `meeting-recorder stop`.
 ## Devcontainer baseline
 
 Open this repository in a Development Container with your editor's **Reopen in Container** command.
-The Ubuntu 24.04 container runs as the non-root `developer` user and supports only the headless
+The Ubuntu 24.04 container runs as the non-root `ubuntu` user and supports only the headless
 checks below:
 
 ```bash
