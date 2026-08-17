@@ -35,8 +35,8 @@ class AllowEntry:
 class Config:
     output_dir: Path
     record_screen: bool
-    capture_mode: str           # "fullscreen" | "window" | "area"
-    capture_region: str         # "x,y,w,h" used when capture_mode == "area"
+    video_source: str           # "fullscreen" | "window" | "area"
+    capture_region: str         # "x,y,w,h" used when video_source == "area"
     show_cursor: bool           # draw the mouse pointer into the video
     wayland_restore_token: str  # portal ScreenCast token, so we prompt only once
     record_mic: bool
@@ -65,7 +65,7 @@ class Config:
         return cls(
             output_dir=expand_path(data["output_dir"]),
             record_screen=bool(data["record_screen"]),
-            capture_mode=str(data.get("capture_mode", "fullscreen")),
+            video_source=str(data.get("video_source", "fullscreen")),
             capture_region=str(data.get("capture_region", "")),
             show_cursor=bool(data.get("show_cursor", True)),
             wayland_restore_token=str(data.get("wayland_restore_token", "")),
@@ -100,19 +100,33 @@ def load_defaults() -> dict[str, Any]:
     return _load_defaults()
 
 
-def load_config() -> Config:
-    """Load defaults, deep-merge the user's config.json on top, return a Config."""
+def _normalize_user_overrides(user: dict[str, Any]) -> dict[str, Any]:
+    """Map the retired capture-mode key to the canonical video-source key."""
+    normalized = dict(user)
+    legacy_source = normalized.pop("capture_mode", None)
+    if "video_source" not in normalized and legacy_source is not None:
+        normalized["video_source"] = legacy_source
+    return normalized
+
+
+def _load_effective_config() -> dict[str, Any]:
+    """Merge normalized user overrides into the shipped defaults once."""
     data = _load_defaults()
     user_path = _user_config_path()
     if user_path.is_file():
         try:
             with user_path.open(encoding="utf-8") as fh:
-                user = json.load(fh)
+                user = _normalize_user_overrides(json.load(fh))
             data.update(user)  # shallow merge is enough for this flat schema
             LOG.info("Loaded user config from %s", user_path)
         except (json.JSONDecodeError, OSError) as exc:
             LOG.warning("Ignoring bad user config %s: %s", user_path, exc)
-    return Config.from_dict(data)
+    return data
+
+
+def load_config() -> Config:
+    """Load defaults, deep-merge the user's config.json on top, return a Config."""
+    return Config.from_dict(_load_effective_config())
 
 
 def write_default_user_config() -> Path:
@@ -135,22 +149,15 @@ def load_raw_config() -> dict[str, Any]:
     Unlike load_config(), this keeps the raw JSON shape so the settings GUI can
     edit a subset of keys and write everything (incl. the allowlist) back intact.
     """
-    data = _load_defaults()
-    path = _user_config_path()
-    if path.is_file():
-        try:
-            with path.open(encoding="utf-8") as fh:
-                data.update(json.load(fh))
-        except (json.JSONDecodeError, OSError) as exc:
-            LOG.warning("Ignoring bad user config %s: %s", path, exc)
-    return data
+    return _load_effective_config()
 
 
 def save_user_config(data: dict[str, Any]) -> Path:
     """Write the given config dict to the user config path (pretty JSON)."""
     dest = _user_config_path()
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    canonical_data = _normalize_user_overrides(data)
+    dest.write_text(json.dumps(canonical_data, indent=2) + "\n", encoding="utf-8")
     return dest
 
 

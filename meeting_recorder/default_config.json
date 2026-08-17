@@ -1,7 +1,7 @@
 {
   "output_dir": "~/Videos/MeetingRecorder",
   "record_screen": true,
-  "capture_mode": "fullscreen",
+  "video_source": "fullscreen",
   "capture_region": "",
   "show_cursor": true,
   "wayland_restore_token": "",

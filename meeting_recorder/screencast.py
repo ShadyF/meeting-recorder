@@ -288,9 +288,9 @@ class ScreenCastSession:
             LOG.debug("closing ScreenCast session failed: %s", exc)
 
 
-def source_types_for(capture_mode: str) -> int:
-    """Portal source bitmask for a capture_mode.
+def source_types_for(video_source: str) -> int:
+    """Portal source bitmask for a configured video source.
 
     'area' has no portal equivalent — we take a monitor and crop it downstream.
     """
-    return SOURCE_WINDOW if capture_mode == "window" else SOURCE_MONITOR
+    return SOURCE_WINDOW if video_source == "window" else SOURCE_MONITOR

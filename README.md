@@ -161,9 +161,10 @@ The GUI covers everything, but the config file is
 | `output_dir` | Where recordings are saved (default `~/Videos/MeetingRecorder`) |
 | `container` | `mkv` (default, crash-safe) or `mp4` |
 | `framerate`, `video_codec`, `video_preset` | Encoding options |
-| `record_screen` / `record_mic` / `record_system_audio` | Toggle capture sources |
-| `capture_mode` | `fullscreen`, `window` (focused window), or `area` |
-| `capture_region` | `"x,y,w,h"` when `capture_mode` is `area` |
+| `record_screen` | Default media composition for a manual recording: audio-video when true, audio-only when false |
+| `record_mic` / `record_system_audio` | Toggle independent audio sources |
+| `video_source` | `fullscreen`, `window` (focused window), or `area` |
+| `capture_region` | `"x,y,w,h"` when `video_source` is `area` |
 | `normalize_voice` | Normalize **both** your mic and the caller to the same loudness so both voices match (default `true`) |
 | `mic_volume` / `system_volume` | Fine-trim after normalization (`1.0` = equal). Raise `mic_volume` to sit above the caller |
 | `noise_cancellation` | Filter background noise from the mic (default `true`) |

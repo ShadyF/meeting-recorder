@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from meeting_recorder.config import load_config
+from meeting_recorder.domain import CaptureMode
 from meeting_recorder.recorder import (
     CaptureDevices,
     audio_roles,
@@ -96,10 +97,23 @@ def test_capture_screen_only_has_no_audio():
 
 def test_capture_audio_only_has_no_video():
     cmd = build_ffmpeg_cmd(
-        _cfg(record_screen=False, record_mic=True, record_system_audio=False), OUT, DEV)
+        _cfg(record_screen=False, record_mic=True, record_system_audio=False), OUT, DEV,
+        CaptureMode.AUDIO_ONLY)
     joined = " ".join(cmd)
     assert "x11grab" not in cmd
     assert "-map 0:a" in joined            # mic becomes input 0
+
+
+def test_capture_mode_controls_video_independently_of_shared_preference():
+    cfg = _cfg(record_screen=False, video_source="area",
+               record_mic=True, record_system_audio=False)
+    audio_only = " ".join(build_ffmpeg_cmd(
+        cfg, OUT, DEV, CaptureMode.AUDIO_ONLY))
+    audio_video = " ".join(build_ffmpeg_cmd(
+        cfg, OUT, DEV, CaptureMode.AUDIO_VIDEO))
+
+    assert "x11grab" not in audio_only
+    assert "x11grab" in audio_video
 
 
 # -- stage 1 on Wayland: portal stream instead of x11grab -----------------
@@ -145,7 +159,7 @@ def test_pipewire_pump_matches_the_caps_ffmpeg_expects():
 
 def test_pipewire_pump_crops_for_area_capture():
     """'area' has no portal equivalent, so the region is cropped in the pump."""
-    cfg = _cfg(record_screen=True, capture_mode="area",
+    cfg = _cfg(record_screen=True, video_source="area",
                capture_region="100,50,800,600")
     joined = " ".join(build_pipewire_cmd(cfg, 42, 7, "1920x1080", "/tmp/seg.fifo",
                                          crop=(100, 50, 800, 600)))
@@ -154,17 +168,17 @@ def test_pipewire_pump_crops_for_area_capture():
 
 
 def test_pipewire_capture_size_uses_region_then_stream():
-    assert pipewire_capture_size(_cfg(capture_mode="fullscreen"), (1920, 1080)) == "1920x1080"
+    assert pipewire_capture_size(_cfg(video_source="fullscreen"), (1920, 1080)) == "1920x1080"
     assert pipewire_capture_size(
-        _cfg(capture_mode="area", capture_region="0,0,800,600"), (1920, 1080)) == "800x600"
+        _cfg(video_source="area", capture_region="0,0,800,600"), (1920, 1080)) == "800x600"
     # Rounded down to a stride-safe width (multiple of 8) and an even height:
     # x264/yuv420p needs even dimensions, and anything not a multiple of 8
     # makes GStreamer pad its rows, which shears the picture. See
     # test_pipewire_size_is_always_stride_safe.
-    assert pipewire_capture_size(_cfg(capture_mode="fullscreen"), (1367, 769)) == "1360x768"
+    assert pipewire_capture_size(_cfg(video_source="fullscreen"), (1367, 769)) == "1360x768"
     # A bad region falls back to the whole stream rather than failing.
     assert pipewire_capture_size(
-        _cfg(capture_mode="area", capture_region="bogus"), (1920, 1080)) == "1920x1080"
+        _cfg(video_source="area", capture_region="bogus"), (1920, 1080)) == "1920x1080"
 
 
 def test_pipewire_size_is_always_stride_safe():
@@ -184,7 +198,7 @@ def test_pipewire_size_is_always_stride_safe():
                            (None, (1366, 768)),      # full screen, odd width
                            (None, (1920, 1080))]:
         cfg = _cfg(record_screen=True,
-                   capture_mode="area" if region else "fullscreen",
+                   video_source="area" if region else "fullscreen",
                    capture_region=region or "")
         size = pipewire_capture_size(cfg, stream)
         width = int(size.split("x")[0])
@@ -294,12 +308,29 @@ def test_parse_region():
 
 
 def test_video_geometry_fullscreen_and_bad_area_fallback():
-    x, y, size = video_geometry(_cfg(capture_mode="fullscreen"))
+    x, y, size = video_geometry(_cfg(video_source="fullscreen"))
     assert (x, y) == (0, 0) and "x" in size
-    x, y, size = video_geometry(_cfg(capture_mode="area", capture_region=""))
+    x, y, size = video_geometry(_cfg(video_source="unexpected"))
+    assert (x, y) == (0, 0) and "x" in size
+    x, y, size = video_geometry(_cfg(video_source="area", capture_region=""))
     assert (x, y) == (0, 0)
-    x, y, size = video_geometry(_cfg(capture_mode="area", capture_region="10,20,801,601"))
+    x, y, size = video_geometry(_cfg(video_source="area", capture_region="10,20,801,601"))
     assert (x, y) == (10, 20) and size == "800x600"
+
+
+def test_video_source_selects_fullscreen_window_and_area_on_x11():
+    import meeting_recorder.recorder as rec
+
+    previous = rec.screen_resolution, rec.active_window_geometry
+    rec.screen_resolution = lambda: "1920x1080"
+    rec.active_window_geometry = lambda: (20, 30, 800, 600)
+    try:
+        assert video_geometry(_cfg(video_source="fullscreen")) == (0, 0, "1920x1080")
+        assert video_geometry(_cfg(video_source="window")) == (20, 30, "800x600")
+        assert video_geometry(_cfg(video_source="area", capture_region="10,20,801,601")) == (
+            10, 20, "800x600")
+    finally:
+        rec.screen_resolution, rec.active_window_geometry = previous
 
 
 # -- pause/resume segmenting ----------------------------------------------
@@ -323,14 +354,14 @@ def test_pause_resume_creates_segments_and_tracks_elapsed():
     orig = (rec.subprocess.Popen, rec.resolve_devices, rec.build_ffmpeg_cmd)
     rec.subprocess.Popen = FakeProc
     rec.resolve_devices = lambda cfg, session=None: None
-    rec.build_ffmpeg_cmd = lambda cfg, out, dev: ["true"]
+    rec.build_ffmpeg_cmd = lambda cfg, out, dev, capture_mode: ["true"]
     # This test is about segment bookkeeping, not capture backends — pin the
     # backend so it behaves the same on an X11 and a Wayland machine.
     prev_backend = os.environ.get("MEETING_RECORDER_CAPTURE")
     os.environ["MEETING_RECORDER_CAPTURE"] = "x11"
     try:
         r = rec.Recorder(load_config())
-        r.start(Path("/tmp/seg.mkv"))
+        r.start(Path("/tmp/seg.mkv"), CaptureMode.AUDIO_VIDEO)
         assert r.is_recording and not r.is_paused
         assert len(r._parts) == 1
         r.pause()
@@ -361,8 +392,8 @@ def test_finalize_drops_video_when_none_was_captured():
     r._has_video = False                       # portal was denied
     captured = {}
 
-    def fake_finalize(cfg, *a, **k):
-        captured["record_screen"] = cfg.record_screen
+    def fake_finalize(_cfg, _listfile, _dest, _roles, _duration, capture_mode):
+        captured["capture_mode"] = capture_mode
         return ["true"]
 
     orig = rec.build_finalize_cmd
@@ -375,7 +406,40 @@ def test_finalize_drops_video_when_none_was_captured():
         rec.build_finalize_cmd = orig
         rec.subprocess.Popen = orig_popen
         Path("/tmp/.a.concat.txt").unlink(missing_ok=True)
-    assert captured["record_screen"] is False
+    assert captured["capture_mode"] is CaptureMode.AUDIO_ONLY
+
+
+def test_portal_unavailable_records_audio_only_for_an_audio_video_request():
+    """A failed portal must not turn an audio-video request into black video."""
+    import meeting_recorder.recorder as rec
+
+    class FakeProc:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = None
+
+        def poll(self):
+            return None
+
+    captured = []
+    original = rec.subprocess.Popen, rec.resolve_devices, rec.build_ffmpeg_cmd
+    previous_backend = os.environ.get("MEETING_RECORDER_CAPTURE")
+    rec.subprocess.Popen = FakeProc
+    rec.resolve_devices = lambda _cfg, _session=None: DEV
+    rec.build_ffmpeg_cmd = lambda _cfg, _path, _dev, capture_mode: (
+        captured.append(capture_mode) or ["true"])
+    os.environ["MEETING_RECORDER_CAPTURE"] = "portal"
+    try:
+        recorder = rec.Recorder(_cfg(record_screen=True))
+        recorder.start(Path("/tmp/portal-denied.mkv"), CaptureMode.AUDIO_VIDEO)
+    finally:
+        rec.subprocess.Popen, rec.resolve_devices, rec.build_ffmpeg_cmd = original
+        if previous_backend is None:
+            os.environ.pop("MEETING_RECORDER_CAPTURE", None)
+        else:
+            os.environ["MEETING_RECORDER_CAPTURE"] = previous_backend
+
+    assert recorder._has_video is False
+    assert captured == [CaptureMode.AUDIO_ONLY]
 
 
 def test_finalize_trims_tail_when_duration_given():

@@ -18,6 +18,7 @@ from __future__ import annotations
 import enum
 
 from .config import Config
+from .domain import CaptureMode
 from .notifier import Notifier
 from .recorder import Recorder
 from .utils import LOG, build_output_path, open_folder
@@ -42,6 +43,7 @@ class Controller:
         self._timer_source = None    # GLib timeout id for the elapsed-time updates
         self._session = None         # Wayland ScreenCast session, while recording
         self._pending_path = None    # output path awaiting the portal handshake
+        self._pending_capture_mode: CaptureMode | None = None
         self._run_done = False       # end-of-recording reported for this run?
         self._manual = False         # started by `record`, not by the detector
         # Called with the saved Path (or None) once a recording is fully
@@ -112,6 +114,8 @@ class Controller:
     def _begin_recording(self) -> None:
         path = build_output_path(self.cfg.output_dir, self._app or "Meeting",
                                  self.cfg.container)
+        capture_mode = (CaptureMode.AUDIO_VIDEO if self.cfg.record_screen
+                        else CaptureMode.AUDIO_ONLY)
         self.state = State.RECORDING
         self._run_done = False
         # Show the controls straight away, before any capture starts. On Wayland
@@ -119,16 +123,17 @@ class Controller:
         # dialog), and leaving the screen empty in the meantime reads as "Record
         # did nothing" — the tray icon is the only feedback the user gets.
         self._show_widget()
-        if self._needs_portal():
+        if self._needs_portal(capture_mode):
             # Wayland: the compositor must hand us a stream before we can
             # capture anything, and that handshake is asynchronous.
             self._pending_path = path
+            self._pending_capture_mode = capture_mode
             self._open_portal()
             return
-        self._start_capture(path)
+        self._start_capture(path, capture_mode)
 
-    def _needs_portal(self) -> bool:
-        if not self.cfg.record_screen:
+    def _needs_portal(self, capture_mode: CaptureMode) -> bool:
+        if capture_mode is CaptureMode.AUDIO_ONLY:
             return False
         from .screencast import use_portal_capture
         return use_portal_capture()
@@ -139,7 +144,7 @@ class Controller:
         # No "preparing" notification: the portal puts its own dialog on screen,
         # which is a clearer prompt than anything we could add next to it.
         self._session = ScreenCastSession()
-        self._session.open(source_types_for(self.cfg.capture_mode),
+        self._session.open(source_types_for(self.cfg.video_source),
                            self.cfg.wayland_restore_token,
                            self._on_portal_ready, self._on_portal_error,
                            cursor_mode=(CURSOR_EMBEDDED if self.cfg.show_cursor
@@ -154,7 +159,9 @@ class Controller:
             save_restore_token(session.restore_token)
         self.recorder.attach_session(session)
         path, self._pending_path = self._pending_path, None
-        self._start_capture(path)
+        capture_mode, self._pending_capture_mode = self._pending_capture_mode, None
+        assert capture_mode is not None
+        self._start_capture(path, capture_mode)
 
     def _on_portal_error(self, message: str) -> None:
         if self.state is not State.RECORDING or self._pending_path is None:
@@ -163,11 +170,13 @@ class Controller:
                     message)
         self._session = None
         path, self._pending_path = self._pending_path, None
-        self._start_capture(path)
+        capture_mode, self._pending_capture_mode = self._pending_capture_mode, None
+        assert capture_mode is not None
+        self._start_capture(path, capture_mode)
 
-    def _start_capture(self, path) -> None:
+    def _start_capture(self, path, capture_mode: CaptureMode) -> None:
         self._run_done = False
-        self.recorder.start(path)
+        self.recorder.start(path, capture_mode)
         self.state = State.RECORDING
         self._show_widget()  # no-op when _begin_recording already showed it
 
@@ -208,6 +217,7 @@ class Controller:
         """Release the ScreenCast session so the compositor stops the stream."""
         session, self._session = self._session, None
         self._pending_path = None
+        self._pending_capture_mode = None
         self.recorder.attach_session(None)
         if session is not None:
             session.close()

@@ -26,11 +26,12 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import audio
 from .config import Config
+from .domain import CaptureMode
 from .utils import LOG, expand_path
 
 _LIMITER = "alimiter=limit=0.95"
@@ -125,17 +126,17 @@ def clamp_region(geo: tuple[int, int, int, int],
 
 
 def video_geometry(cfg: Config) -> tuple[int, int, str]:
-    """Resolve (x_offset, y_offset, 'WxH') for the chosen capture_mode.
+    """Resolve (x_offset, y_offset, 'WxH') for the chosen video source.
 
     Falls back to full screen if a window/area can't be determined.
     """
-    if cfg.capture_mode == "window":
+    if cfg.video_source == "window":
         geo = active_window_geometry()
         if geo:
             x, y, w, h = geo
             return x, y, f"{_even(w)}x{_even(h)}"
         LOG.warning("Window capture unavailable; using full screen")
-    elif cfg.capture_mode == "area":
+    elif cfg.video_source == "area":
         geo = parse_region(cfg.capture_region)
         if geo:
             size = screen_resolution()
@@ -229,7 +230,7 @@ def build_pipewire_cmd(cfg: Config, node_id: int, fd: int, size: str,
 def pipewire_region(cfg: Config,
                     session_size: tuple[int, int]) -> tuple[int, int, int, int] | None:
     """The crop rectangle for "area" capture, clamped to the portal stream."""
-    if cfg.capture_mode != "area":
+    if cfg.video_source != "area":
         return None
     geo = parse_region(cfg.capture_region)
     if not geo:
@@ -254,7 +255,7 @@ def pipewire_output_size(cfg: Config,
     if geo:
         w, h = geo[2], geo[3]
     else:
-        if cfg.capture_mode == "area":
+        if cfg.video_source == "area":
             LOG.warning("No valid capture_region; using the full portal stream")
         w, h = session_size
     return _packed_width(w), _even(h)
@@ -281,7 +282,8 @@ def audio_roles(cfg: Config) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def build_ffmpeg_cmd(cfg: Config, output_path: Path, dev: CaptureDevices) -> list[str]:
+def build_ffmpeg_cmd(cfg: Config, output_path: Path, dev: CaptureDevices,
+                     capture_mode: CaptureMode = CaptureMode.AUDIO_VIDEO) -> list[str]:
     """Live capture: video + each audio source as its own untouched track."""
     cmd: list[str] = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
 
@@ -290,7 +292,7 @@ def build_ffmpeg_cmd(cfg: Config, output_path: Path, dev: CaptureDevices) -> lis
     tqs = ["-thread_queue_size", "1024"]
     next_index = 0
 
-    if cfg.record_screen:
+    if capture_mode is CaptureMode.AUDIO_VIDEO:
         if dev.video_fifo:
             # Wayland: frames arrive as raw I420 from the PipeWire pump. ffmpeg
             # cannot read PipeWire itself, so the pump does that part.
@@ -317,7 +319,7 @@ def build_ffmpeg_cmd(cfg: Config, output_path: Path, dev: CaptureDevices) -> lis
 
     # 'zerolatency' disables x264 lookahead/B-frames so frames are emitted
     # immediately (no startup stall); -g sets a ~2s keyframe interval.
-    if cfg.record_screen:
+    if capture_mode is CaptureMode.AUDIO_VIDEO:
         cmd += ["-map", "0:v", "-c:v", cfg.video_codec,
                 "-preset", cfg.video_preset, "-pix_fmt", "yuv420p",
                 "-g", str(cfg.framerate * 2)]
@@ -373,7 +375,8 @@ def _chain_for(cfg: Config, role: str) -> list[str]:
 
 
 def build_finalize_cmd(cfg: Config, listfile: Path, dest: Path,
-                       roles: list[str], duration: float | None = None) -> list[str]:
+                       roles: list[str], duration: float | None = None,
+                       capture_mode: CaptureMode = CaptureMode.AUDIO_VIDEO) -> list[str]:
     """Concat segments, process audio, copy video. Both sources are normalized to
     the same loudness target so the two voices come out equal.
 
@@ -398,7 +401,7 @@ def build_finalize_cmd(cfg: Config, listfile: Path, dest: Path,
         cmd += ["-filter_complex", graph, "-map", "[aout]",
                 "-c:a", "aac", "-b:a", "160k"]
 
-    if cfg.record_screen:
+    if capture_mode is CaptureMode.AUDIO_VIDEO:
         cmd += ["-map", "0:v", "-c:v", "copy"]
 
     cmd.append(str(dest))
@@ -417,6 +420,7 @@ class Recorder:
         # Wayland: an open screencast.ScreenCastSession supplying the video.
         # None on X11, where ffmpeg grabs the display directly.
         self._session = session
+        self._requested_capture_mode: CaptureMode | None = None
         self._proc: subprocess.Popen | None = None
         self._pump: subprocess.Popen | None = None
         self._fifo: Path | None = None
@@ -446,7 +450,7 @@ class Recorder:
     def is_paused(self) -> bool:
         return self._paused
 
-    def start(self, output_path: Path) -> None:
+    def start(self, output_path: Path, capture_mode: CaptureMode) -> None:
         if self.is_recording:
             LOG.warning("start() ignored: already recording")
             return
@@ -455,6 +459,7 @@ class Recorder:
         self._parts = []
         self._accum = 0.0
         self._paused = False
+        self._requested_capture_mode = capture_mode
         self._has_video = None   # decided by the first segment, see _start_segment
         LOG.info("Recording -> %s", output_path)
         self._start_segment()
@@ -555,10 +560,11 @@ class Recorder:
     # -- internals ---------------------------------------------------------
     def _start_segment(self) -> None:
         assert self._final_path is not None
+        assert self._requested_capture_mode is not None
         part = self._final_path.with_name(
             f".{self._final_path.stem}.part{len(self._parts)}{self._final_path.suffix}")
         dev = resolve_devices(self.cfg, self._session)
-        cfg = self.cfg
+        requested_mode = self._requested_capture_mode
         if self._wants_pipewire and self._has_video is not False:
             self._start_pump(part, dev)
             if not dev.video_fifo:
@@ -566,11 +572,11 @@ class Recorder:
                 # so keep the audio rather than writing a black video.
                 LOG.warning("Falling back to audio-only for this recording")
         if self._has_video is None:
-            self._has_video = bool(cfg.record_screen and
+            self._has_video = bool(requested_mode is CaptureMode.AUDIO_VIDEO and
                                    (not self._wants_pipewire or dev.video_fifo))
-        if not self._has_video:
-            cfg = replace(cfg, record_screen=False)
-        cmd = build_ffmpeg_cmd(cfg, part, dev)
+        capture_mode = (CaptureMode.AUDIO_VIDEO if self._has_video
+                        else CaptureMode.AUDIO_ONLY)
+        cmd = build_ffmpeg_cmd(self.cfg, part, dev, capture_mode)
         LOG.debug("capture cmd: %s", " ".join(cmd))
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE,
@@ -588,7 +594,8 @@ class Recorder:
         to degrade to audio-only instead of silently recording a black screen.
         """
         from .screencast import use_portal_capture
-        return bool(self.cfg.record_screen and use_portal_capture())
+        return bool(self._requested_capture_mode is CaptureMode.AUDIO_VIDEO and
+                    use_portal_capture())
 
     def attach_session(self, session) -> None:
         """Supply the open ScreenCastSession that video will be pumped from."""
@@ -677,11 +684,13 @@ class Recorder:
         # Map only what the segments really contain: if screen capture was
         # never granted, asking for 0:v here would fail the whole finalize and
         # throw away a perfectly good audio recording.
-        cfg = self.cfg
-        if not self._has_video and cfg.record_screen:
+        capture_mode = (CaptureMode.AUDIO_VIDEO if self._has_video
+                        else CaptureMode.AUDIO_ONLY)
+        if capture_mode is CaptureMode.AUDIO_ONLY:
             LOG.warning("No video was captured; saving audio only")
-            cfg = replace(cfg, record_screen=False)
-        cmd = build_finalize_cmd(cfg, listfile, dest, audio_roles(cfg), duration)
+        cfg = self.cfg
+        cmd = build_finalize_cmd(cfg, listfile, dest, audio_roles(cfg), duration,
+                                 capture_mode)
         LOG.info("Finalizing %d segment(s) -> %s", len(parts), dest.name)
         LOG.debug("finalize cmd: %s", " ".join(cmd))
         self._fin_proc = subprocess.Popen(

@@ -21,7 +21,7 @@ from .utils import LOG, expand_path
 
 CONTAINERS = ["mkv", "mp4"]
 # (config value, display label)
-CAPTURE_MODES = [("fullscreen", "Full screen"),
+VIDEO_SOURCES = [("fullscreen", "Full screen"),
                  ("window", "Current window"),
                  ("area", "Selected area")]
 
@@ -78,11 +78,11 @@ class SettingsWindow(Gtk.Window):
         self.screen_switch = self._switch(True)
         self._field(grid, "Screen", self.screen_switch)
 
-        self.capture_combo = Gtk.ComboBoxText()
-        for _val, label in CAPTURE_MODES:
-            self.capture_combo.append_text(label)
-        self.capture_combo.connect("changed", self._on_capture_mode_changed)
-        self._field(grid, "Capture area", self.capture_combo)
+        self.video_source_combo = Gtk.ComboBoxText()
+        for _val, label in VIDEO_SOURCES:
+            self.video_source_combo.append_text(label)
+        self.video_source_combo.connect("changed", self._on_video_source_changed)
+        self._field(grid, "Video source", self.video_source_combo)
 
         # Region row, only sensitive for "Selected area". Drag-select uses our
         # own GTK overlay (see region_select.py) rather than `slop`, so it works
@@ -178,9 +178,9 @@ class SettingsWindow(Gtk.Window):
         self.format_combo.set_active(
             CONTAINERS.index(container) if container in CONTAINERS else 0)
         self.screen_switch.set_active(bool(d.get("record_screen", True)))
-        mode = d.get("capture_mode", "fullscreen")
-        self.capture_combo.set_active(
-            next((i for i, (v, _l) in enumerate(CAPTURE_MODES) if v == mode), 0))
+        source = d.get("video_source", "fullscreen")
+        self.video_source_combo.set_active(
+            next((i for i, (v, _l) in enumerate(VIDEO_SOURCES) if v == source), 0))
         self.region_entry.set_text(d.get("capture_region", ""))
         self.cursor_switch.set_active(bool(d.get("show_cursor", True)))
         self.mic_switch.set_active(bool(d.get("record_mic", True)))
@@ -190,7 +190,7 @@ class SettingsWindow(Gtk.Window):
         self.sys_vol.set_value(float(d.get("system_volume", 1.0)))
         self.auto_switch.set_active(bool(d.get("auto_record", False)))
         self.stop_spin.set_value(float(d.get("stop_debounce_seconds", 3.0)))
-        self._on_capture_mode_changed(self.capture_combo)  # region sensitivity
+        self._on_video_source_changed(self.video_source_combo)  # region sensitivity
 
     # -- widget helpers ----------------------------------------------------
     def _section(self, grid: Gtk.Grid, title: str) -> None:
@@ -220,8 +220,8 @@ class SettingsWindow(Gtk.Window):
         return sw
 
     # -- capture-area handlers ---------------------------------------------
-    def _on_capture_mode_changed(self, combo: Gtk.ComboBoxText) -> None:
-        is_area = CAPTURE_MODES[max(0, combo.get_active())][0] == "area"
+    def _on_video_source_changed(self, combo: Gtk.ComboBoxText) -> None:
+        is_area = VIDEO_SOURCES[max(0, combo.get_active())][0] == "area"
         self.region_entry.set_sensitive(is_area)
         self.select_btn.set_sensitive(is_area)
         self.select_btn.set_tooltip_text(
@@ -316,13 +316,14 @@ class SettingsWindow(Gtk.Window):
         """
         folder = self.output_chooser.get_filename()
         # self.data came from load_raw_config(), so keys this window does not
-        # expose (allowlist, framerate, capture_mode, ...) are written back
+        # expose (allowlist, framerate, video_source, ...) are written back
         # exactly as they were.
         self.data.update({
             "output_dir": folder or self.data.get("output_dir", "~/Videos/MeetingRecorder"),
             "container": CONTAINERS[max(0, self.format_combo.get_active())],
             "record_screen": self.screen_switch.get_active(),
-            "capture_mode": CAPTURE_MODES[max(0, self.capture_combo.get_active())][0],
+            "video_source": VIDEO_SOURCES[
+                max(0, self.video_source_combo.get_active())][0],
             "capture_region": self.region_entry.get_text().strip(),
             "show_cursor": self.cursor_switch.get_active(),
             "record_mic": self.mic_switch.get_active(),
