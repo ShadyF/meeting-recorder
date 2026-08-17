@@ -1,0 +1,8 @@
+{
+  "name": "Meeting Recorder Linux Baseline",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "developer"
+}

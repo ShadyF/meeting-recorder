@@ -26,6 +26,21 @@ PyGObject, and the tests use a tiny zero-dependency runner — no pytest, no vir
 If you have the package installed, stop it first so two daemons don't fight over the same
 notification and tray: `meeting-recorder stop`.
 
+## Devcontainer baseline
+
+Open this repository in a Development Container with your editor's **Reopen in Container** command.
+The Ubuntu 24.04 container runs as the non-root `developer` user and supports only the headless
+checks below:
+
+```bash
+python3 tests/run_tests.py
+python3 -m compileall -q meeting_recorder
+```
+
+It deliberately has no desktop integration, capture runtime, host sockets, or credentials.
+`.deb` build and support are outside this development baseline; inherited Debian packaging files
+remain available for their separate workflows.
+
 ## Tests
 
 ```bash
