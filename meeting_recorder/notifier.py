@@ -7,16 +7,20 @@ Falls back to `notify-send` (no buttons) if the Notify typelib is unavailable.
 from __future__ import annotations
 
 import subprocess
-from typing import Callable
+from typing import Any, Callable
 
 from .utils import LOG
 
 _APP_NAME = "Smart Meeting Recorder"
+GLib: Any = None
+Notify: Any = None
 
 try:
     import gi
     gi.require_version("Notify", "0.7")
-    from gi.repository import Notify  # type: ignore
+    from gi.repository import GLib as _GLib, Notify as _Notify  # type: ignore
+    GLib = _GLib
+    Notify = _Notify
     _HAVE_NOTIFY = True
 except (ImportError, ValueError):  # pragma: no cover - depends on system typelibs
     _HAVE_NOTIFY = False
@@ -36,6 +40,8 @@ class Notifier:
                 LOG.exception("Notify.init failed; using notify-send fallback")
         # Keep a reference so the notification isn't GC'd before the user acts.
         self._active = None
+        self._prompt_generation = 0
+        self._prompt_timer_source = None
         self._live: set = set()  # notifications still awaiting a click/close
 
     # -- fallback -----------------------------------------------------------
@@ -113,6 +119,14 @@ class Notifier:
         summary = "Meeting detected"
         body = f"A {app_name} call is in progress. Choose what to capture."
 
+        # Invalidate and dismiss any older prompt before installing this one.
+        self._prompt_generation += 1
+        generation = self._prompt_generation
+        self._cancel_prompt_timeout()
+        previous_note, self._active = self._active, None
+        if previous_note is not None:
+            self._close_notification(previous_note)
+
         # A passive notification cannot collect consent, so never start a run.
         if not self._ready or not self._supports_actions():
             self._fallback(summary, body)
@@ -123,29 +137,54 @@ class Notifier:
         note.set_urgency(Notify.Urgency.CRITICAL)
         note.set_timeout(timeout_seconds * 1000)
         handled = False
+        callbacks = {
+            "video": on_video,
+            "audio-only": on_audio_only,
+            "ignore": on_ignore,
+        }
 
-        # Actions can be followed by a close signal; consume only the first event.
-        def _dispatch(callback: Callable[[], None]) -> None:
+        # Validate identity before consuming one terminal event for this prompt.
+        def _dispatch(action_id: str, close_note: bool = True) -> None:
             nonlocal handled
-            if handled:
+            if (handled or generation != self._prompt_generation or
+                    self._active is not note):
                 return
             handled = True
-            if self._active is note:
-                self._active = None
-            self._invoke(callback)
+            self._cancel_prompt_timeout()
+            self._active = None
+            if close_note:
+                self._close_notification(note)
+            self._invoke(callbacks.get(action_id, on_ignore))
 
-        note.add_action("video", "Video", lambda _n, _a: _dispatch(on_video))
-        note.add_action("audio-only", "Audio only",
-                        lambda _n, _a: _dispatch(on_audio_only))
-        note.add_action("ignore", "Ignore", lambda _n, _a: _dispatch(on_ignore))
-        note.connect("closed", lambda _n: _dispatch(on_ignore))
+        def _on_action(_note: Any, action_id: str) -> None:
+            _dispatch(action_id)
+
+        def _on_timeout() -> bool:
+            if (handled or generation != self._prompt_generation or
+                    self._active is not note):
+                return False
+            self._prompt_timer_source = None
+            _dispatch("ignore")
+            return False
+
+        note.add_action("video", "Video", _on_action)
+        note.add_action("audio-only", "Audio only", _on_action)
+        note.add_action("ignore", "Ignore", _on_action)
+        note.add_action("default", "", _on_action)
+        note.connect("closed", lambda _n: _dispatch("ignore", close_note=False))
         self._active = note
+        self._prompt_timer_source = self._schedule_prompt_timeout(
+            timeout_seconds, _on_timeout)
+        if self._prompt_timer_source is None:
+            self._fallback(summary, body)
+            _dispatch("ignore")
+            return
+
         try:
             note.show()
         except Exception:  # pragma: no cover
-            self._active = None
             self._fallback(summary, body)
-            _dispatch(on_ignore)
+            _dispatch("ignore")
 
     @staticmethod
     def _supports_actions() -> bool:
@@ -155,10 +194,40 @@ class Notifier:
         except Exception:  # pragma: no cover - server capability query failed
             return False
 
+    @staticmethod
+    def _schedule_prompt_timeout(timeout_seconds: int,
+                                 callback: Callable[[], bool]) -> Any | None:
+        """Arm a main-loop timeout rather than trusting the server hint alone."""
+        if GLib is None:
+            return None
+        try:
+            return GLib.timeout_add(max(1, timeout_seconds * 1000), callback)
+        except Exception:  # pragma: no cover - broken event-loop integration
+            LOG.exception("Could not schedule capture prompt timeout")
+            return None
+
+    def _cancel_prompt_timeout(self) -> None:
+        """Cancel the timer owned by the currently active prompt, if any."""
+        source, self._prompt_timer_source = self._prompt_timer_source, None
+        if source is None or GLib is None:
+            return
+        try:
+            GLib.source_remove(source)
+        except Exception:  # pragma: no cover - source already removed externally
+            LOG.debug("Could not remove capture prompt timeout", exc_info=True)
+
+    @staticmethod
+    def _close_notification(note: Any) -> None:
+        """Dismiss a native prompt without letting close failures escape."""
+        try:
+            note.close()
+        except Exception:  # pragma: no cover - notification server disappeared
+            LOG.debug("Could not close capture prompt", exc_info=True)
+
     def close_active(self) -> None:
-        if self._active is not None:
-            try:
-                self._active.close()
-            except Exception:  # pragma: no cover
-                pass
-            self._active = None
+        # Invalidate first so a delayed native close cannot affect a later prompt.
+        self._prompt_generation += 1
+        self._cancel_prompt_timeout()
+        note, self._active = self._active, None
+        if note is not None:
+            self._close_notification(note)

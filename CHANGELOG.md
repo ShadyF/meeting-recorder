@@ -7,6 +7,9 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Changed
+- Detected meetings now ask directly whether to record Video, Audio only, or
+  Ignore. Closing or leaving the prompt unanswered never starts a recording,
+  while auto-record continues to start audio-only without prompting.
 - Recording finalization now completes independently for each run, so a new
   recording can begin while an earlier file is still being finalized.
 - Video source now separately selects fullscreen, the current window, or an
