@@ -23,6 +23,8 @@ class FakeNotification:
         self.timeout = timeout
 
     def add_action(self, action_id, label, callback):
+        if not label:
+            raise ValueError("libnotify action labels must not be empty")
         self.actions[action_id] = (label, callback)
 
     def connect(self, signal, callback):
@@ -137,7 +139,7 @@ def test_capture_prompt_exposes_direct_video_audio_only_and_ignore_actions():
     assert visible_actions == {
         "video": "Video", "audio-only": "Audio only", "ignore": "Ignore",
     }
-    assert note.actions["default"][0] == ""
+    assert note.actions["default"][0] == "Dismiss"
     assert note.shown
     assert events == []
 

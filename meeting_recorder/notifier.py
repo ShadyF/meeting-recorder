@@ -170,7 +170,8 @@ class Notifier:
         note.add_action("video", "Video", _on_action)
         note.add_action("audio-only", "Audio only", _on_action)
         note.add_action("ignore", "Ignore", _on_action)
-        note.add_action("default", "", _on_action)
+        # The special default id handles body activation without adding a button.
+        note.add_action("default", "Dismiss", _on_action)
         note.connect("closed", lambda _n: _dispatch("ignore", close_note=False))
         self._active = note
         self._prompt_timer_source = self._schedule_prompt_timeout(

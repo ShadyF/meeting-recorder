@@ -1,7 +1,7 @@
 # Smart Meeting Recorder
 
-**Detects when you join an online meeting on Linux and asks before recording your screen, mic, and
-system audio. Stops automatically when the call ends.**
+**Detects when you join an online meeting on Linux and asks whether to capture video, audio only, or
+nothing. Stops automatically when the call ends.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux%20%7C%20X11%20%7C%20Wayland-blue)
@@ -10,12 +10,14 @@ system audio. Stops automatically when the call ends.**
 No more remembering to hit record. The app sits in the background, notices when a call starts, and
 asks:
 
-> **Meeting detected.** Start recording?  ▸ `Record`  `Ignore`
+> **Meeting detected.** Choose what to capture.  ▸ `Video`  `Audio only`  `Ignore`
 
-One click records the screen, your microphone and (optionally) system audio. When the call ends,
-recording stops on its own and the file is saved as `Zoom_2026-07-17_14-30-05.mkv`.
+Choose **Video** for the screen and audio, or **Audio only** when you do not need the screen. Closing
+the prompt or letting it time out starts nothing. When a recording ends, the file is saved as
+`Zoom_2026-07-17_14-30-05.mkv`.
 
-**Privacy-first:** it never records without your explicit consent.
+**Privacy-first:** it never records without your explicit consent unless you enable auto-record,
+which starts audio-only immediately without showing the prompt.
 
 | Tray controls | Settings |
 |---|---|
@@ -92,8 +94,9 @@ curl -L -o ~/.local/share/meeting-recorder/std.rnnn \
 
 ## Usage
 
-Once installed there's nothing to do — join a call and answer the popup. Recordings land in
-`~/Videos/MeetingRecorder/`.
+Once installed there's nothing to do — join a call and choose **Video**, **Audio only**, or
+**Ignore** in the popup. Closing it or leaving it unanswered starts no recording. Recordings land
+in `~/Videos/MeetingRecorder/`.
 
 ### Tray controls
 
@@ -169,8 +172,8 @@ The GUI covers everything, but the config file is
 | `mic_volume` / `system_volume` | Fine-trim after normalization (`1.0` = equal). Raise `mic_volume` to sit above the caller |
 | `noise_cancellation` | Filter background noise from the mic (default `true`) |
 | `noise_model_path` | Optional RNNoise `.rnnn` model for better denoising |
-| `auto_record` | Skip the popup and record automatically |
-| `prompt_timeout_seconds` | How long the popup waits for an answer |
+| `auto_record` | Skip the popup and start an audio-only recording immediately |
+| `prompt_timeout_seconds` | How long the popup waits before closing without recording |
 | `show_cursor` | Draw the mouse pointer into the recording. On X11 this is ffmpeg's `-draw_mouse`; on Wayland the compositor decides, so it is the portal's cursor mode. |
 | `start_debounce_seconds` / `stop_debounce_seconds` | How long audio must be present/absent before starting/stopping. Because muting releases the microphone, the stop delay is also the longest mute that won't end the recording — raise it if you mute for long stretches. The wait is trimmed off the saved file. |
 | `poll_interval_seconds` | How often capture streams are checked |
