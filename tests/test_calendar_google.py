@@ -1,6 +1,9 @@
 """Injected Google Calendar client checks with no live credentials or network."""
 
 import threading
+import io
+import http.client
+import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -156,3 +159,75 @@ def test_production_transport_rejects_invalid_utf8_json_and_oversized_bodies_red
             else:
                 raise AssertionError("invalid response was accepted")
         assert response.limit == google._MAX_RESPONSE_BYTES + 1
+
+
+def test_http_error_with_unusable_body_preserves_status_retry_and_token_policy():
+    class Response:
+        status = 200
+        headers = {}
+
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def read(self, _limit): return b'{"items": []}'
+
+    def error(status, body):
+        return urllib.error.HTTPError("https://example.invalid", status, "ignored", {}, io.BytesIO(body))
+
+    tokens, requests = [], []
+    with patch("meeting_recorder.calendar_google.urllib.request.urlopen",
+               side_effect=[error(401, b"\xffprivate"), Response()]):
+        client = google.GoogleCalendarClient(lambda: tokens.append("token") or f"token-{len(tokens)}")
+        assert client.list_calendars() == []
+    assert tokens == ["token", "token"]
+
+    for status, body in ((429, b""), (503, b"{"), (503, _BrokenBody())):
+        requests, delays = [], []
+        with patch("meeting_recorder.calendar_google.urllib.request.urlopen",
+                   side_effect=[error(status, body) if isinstance(body, bytes) else
+                                urllib.error.HTTPError("https://example.invalid", status, "ignored", {}, body)
+                                for _ in range(3)]):
+            client = google.GoogleCalendarClient(lambda: "private-token", sleep=delays.append,
+                                                 jitter=lambda: 0.0)
+            try:
+                client.list_calendars()
+            except google.CalendarApiError as exc:
+                assert exc.transient and exc.status == status
+                assert "private" not in str(exc).lower()
+            else:
+                raise AssertionError("unusable HTTP error body disabled retry policy")
+        assert len(delays) == 2
+
+    with patch("meeting_recorder.calendar_google.urllib.request.urlopen",
+               side_effect=http.client.HTTPException("private transport failure")):
+        try:
+            google._production_request_json("https://example.invalid", {"Authorization": "Bearer private-token"}, 1)
+        except google.CalendarApiError as exc:
+            assert exc.transient and "private" not in str(exc).lower()
+        else:
+            raise AssertionError("HTTP transport failure was not redacted")
+
+
+class _BrokenBody:
+    def read(self, _limit):
+        raise http.client.IncompleteRead(b"private")
+
+    def close(self):
+        return None
+
+
+def test_normalize_event_preserves_recurrence_identity_and_event_acceptance_rules():
+    moved = _event("instance", recurringEventId="series", originalStartTime={"dateTime": "2026-03-08T09:00:00-05:00"},
+                   start={"dateTime": "2026-03-08T11:00:00-05:00"},
+                   end={"dateTime": "2026-03-08T12:00:00-05:00"}, attendeesOmitted=True)
+    occurrence = google.normalize_event("calendar", moved)
+    assert occurrence is not None
+    assert occurrence.key.event_id == "series"
+    assert occurrence.key.original_start_utc == datetime(2026, 3, 8, 14, tzinfo=timezone.utc)
+    assert occurrence.start_utc == datetime(2026, 3, 8, 16, tzinfo=timezone.utc)
+    assert occurrence.end_utc == datetime(2026, 3, 8, 17, tzinfo=timezone.utc)
+    assert occurrence.participants_complete is False
+
+    for overrides in ({"start": {"date": "2026-03-08"}}, {"status": "cancelled"},
+                      {"attendees": [{"self": True, "responseStatus": "declined"}]}):
+        assert google.normalize_event("calendar", _event("excluded", **overrides)) is None
+    assert google.normalize_event("calendar", _event("tentative", status="tentative")) is not None

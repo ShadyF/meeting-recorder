@@ -36,7 +36,7 @@ class CalendarRefreshService:
                 return
 
     def stop(self, timeout: float) -> bool:
-        self._stop.set()
+        self._refresher.request_cancel(self._stop)
         if self._thread is None:
             return True
         self._thread.join(timeout)

@@ -560,3 +560,43 @@ def test_late_refresh_after_disconnect_cannot_store_without_a_remaining_token():
         os.environ.pop("XDG_CACHE_HOME", None)
     else:
         os.environ["XDG_CACHE_HOME"] = previous
+
+
+def test_connect_waits_for_active_refresh_lock_then_clears_cache_before_saving_token():
+    previous = os.environ.get("XDG_CACHE_HOME")
+    with tempfile.TemporaryDirectory() as temporary:
+        os.environ["XDG_CACHE_HOME"] = temporary
+        entered, release, complete = threading.Event(), threading.Event(), threading.Event()
+        events = []
+
+        class Client:
+            def list_occurrences(self, _calendar_id, _start, _end, *, cancel=None):
+                events.append("refresh")
+                entered.set()
+                release.wait()
+                return ()
+
+        class RecordingSecrets(_Secrets):
+            def save(self, token):
+                events.append("save")
+                super().save(token)
+
+        oauth = CalendarOAuth(_config(), secret_store=RecordingSecrets("old"), post_form=lambda *_: _response(),
+                              browser_open=lambda _url: True, server_factory=lambda *_: _Server(),
+                              cache_clear=lambda: events.append("cache"))
+        oauth._wait_for_callback = lambda _server, _state: "authorization-code"
+        refresh = threading.Thread(target=lambda: CalendarRefresher(
+            Client(), CalendarCache()).refresh(("calendar",), blocking=True))
+        connect = threading.Thread(target=lambda: (oauth.connect(), complete.set()))
+        refresh.start()
+        assert entered.wait(1)
+        connect.start()
+        assert not complete.is_set()
+        release.set()
+        refresh.join(1)
+        connect.join(1)
+        assert complete.is_set() and events == ["refresh", "cache", "save"]
+    if previous is None:
+        os.environ.pop("XDG_CACHE_HOME", None)
+    else:
+        os.environ["XDG_CACHE_HOME"] = previous

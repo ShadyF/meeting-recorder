@@ -72,21 +72,17 @@ def _cmd_run(cfg) -> int:
         except ValueError:
             return ()
 
-    calendar_service = CalendarRefreshService(
-        CalendarRefresher(GoogleCalendarClient(CalendarOAuth(cfg).access_token), CalendarCache()),
-        _selected_calendar_ids)
-    calendar_service.start()
-
-    shutdown_complete = False
+    calendar_service = None
+    try:
+        # Calendar is optional, so setup failures must not block meeting detection.
+        calendar_service = CalendarRefreshService(
+            CalendarRefresher(GoogleCalendarClient(CalendarOAuth(cfg).access_token), CalendarCache()),
+            _selected_calendar_ids)
+        calendar_service.start()
+    except Exception:
+        LOG.warning("Calendar background refresh is unavailable", exc_info=True)
 
     def _shutdown(*_a):
-        nonlocal shutdown_complete
-        if shutdown_complete:
-            return False
-        shutdown_complete = True
-        LOG.info("Shutting down")
-        calendar_service.stop(1)
-        controller.shutdown()
         loop.quit()
         return False
 
@@ -99,7 +95,18 @@ def _cmd_run(cfg) -> int:
     try:
         loop.run()
     finally:
-        _shutdown()
+        LOG.info("Shutting down")
+        # Stop optional Calendar work without skipping recorder finalization on failure.
+        if calendar_service is not None:
+            try:
+                if not calendar_service.stop(1):
+                    LOG.warning("Calendar background refresh did not stop before shutdown timeout")
+            except Exception:
+                LOG.warning("Calendar background refresh cleanup failed", exc_info=True)
+        try:
+            controller.shutdown()
+        except Exception:
+            LOG.warning("Recorder controller cleanup failed", exc_info=True)
     return 0
 
 
@@ -282,7 +289,6 @@ def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = 
 
     oauth = CalendarOAuth(cfg)
     try:
-        selected = validate_google_calendar_ids(load_raw_config().get("google_calendar_ids", []))
         if action == "select":
             if clear:
                 save_google_calendar_ids([])
@@ -298,11 +304,13 @@ def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = 
             print("Calendar: selection saved")
             return 0
         if action == "list":
+            selected = validate_google_calendar_ids(load_raw_config().get("google_calendar_ids", []))
             for item in GoogleCalendarClient(oauth.access_token).list_calendars():
                 marker = " selected" if item.id in selected else ""
                 print(f"{json.dumps(item.id)} {json.dumps(item.summary)}{marker}")
             return 0
         if action == "refresh":
+            selected = validate_google_calendar_ids(load_raw_config().get("google_calendar_ids", []))
             if not selected:
                 print("Calendar: refresh complete (no calendars selected)")
                 return 0

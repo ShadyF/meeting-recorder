@@ -2,6 +2,7 @@
 
 import json
 import os
+import errno
 import tempfile
 from unittest.mock import patch
 from pathlib import Path
@@ -240,3 +241,21 @@ def test_atomic_config_sets_private_mode_and_attempts_directory_fsync():
 
     import stat
     _with_user_config({}, check)
+
+
+def test_config_directory_fsync_propagates_real_io_failure_and_accepts_supported_success():
+    from meeting_recorder.config import _fsync_directory
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        with patch("meeting_recorder.config.os.fsync", side_effect=OSError(errno.EIO, "disk")):
+            try:
+                _fsync_directory(directory)
+            except OSError as exc:
+                assert exc.errno == errno.EIO
+            else:
+                raise AssertionError("durability failure was hidden")
+        calls = []
+        with patch("meeting_recorder.config.os.fsync", side_effect=lambda fd: calls.append(fd)):
+            _fsync_directory(directory)
+        assert calls

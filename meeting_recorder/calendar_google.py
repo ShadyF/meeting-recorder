@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import random
 import threading
@@ -130,7 +131,7 @@ def _read_json(response: Any, status: int) -> Any:
     """Read a sane bounded body and turn every decode failure into a redacted error."""
     try:
         body = response.read(_MAX_RESPONSE_BYTES + 1)
-    except (OSError, ValueError) as exc:
+    except (http.client.HTTPException, OSError, ValueError) as exc:
         raise CalendarApiError("Calendar response is unavailable", transient=True, status=status) from exc
     if not isinstance(body, bytes):
         raise CalendarApiError("Calendar response is malformed", transient=False, status=status)
@@ -138,7 +139,7 @@ def _read_json(response: Any, status: int) -> Any:
         raise CalendarApiError("Calendar response is too large", transient=False, status=status)
     try:
         return json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise CalendarApiError("Calendar response is malformed", transient=False, status=status) from exc
 
 
@@ -149,8 +150,13 @@ def _production_request_json(url: str, headers: Mapping[str, str], timeout: floa
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, _read_json(response, response.status), dict(response.headers.items())
     except urllib.error.HTTPError as exc:
-        return exc.code, _read_json(exc, exc.code), dict(exc.headers.items()) if exc.headers else {}
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # Preserve status policy even when an error response body is unusable.
+        try:
+            body = _read_json(exc, exc.code)
+        except CalendarApiError:
+            body = None
+        return exc.code, body, dict(exc.headers.items()) if exc.headers else {}
+    except (http.client.HTTPException, urllib.error.URLError, TimeoutError, OSError) as exc:
         raise CalendarApiError("Calendar request is temporarily unavailable", transient=True) from exc
 
 

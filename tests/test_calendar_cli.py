@@ -133,6 +133,29 @@ def test_calendar_config_write_oserror_returns_one_without_traceback():
     assert "misconfigured" in output.getvalue() and "traceback" not in output.getvalue().lower()
 
 
+def test_calendar_credential_actions_and_selection_recovery_ignore_malformed_existing_selection():
+    malformed = {"google_calendar_ids": "not-a-list"}
+    calls, saved = [], []
+
+    class Client:
+        def __init__(self, _token): calls.append("client")
+        def list_calendars(self): return [CalendarInfo("replacement", None)]
+
+    with patch("meeting_recorder.config.load_raw_config", return_value=malformed), \
+         patch("meeting_recorder.config.save_google_calendar_ids", side_effect=saved.append), \
+         patch("meeting_recorder.calendar_google.GoogleCalendarClient", Client), \
+         patch("meeting_recorder.calendar_oauth.CalendarOAuth.access_token", return_value="token"), \
+         patch("meeting_recorder.calendar_oauth.CalendarOAuth.connect", side_effect=lambda: calls.append("connect")), \
+         patch("meeting_recorder.calendar_oauth.CalendarOAuth.status", side_effect=lambda: calls.append("status") or SimpleNamespace(state="connected", detail="", exit_code=0)), \
+         patch("meeting_recorder.calendar_oauth.CalendarOAuth.disconnect", side_effect=lambda: calls.append("disconnect") or SimpleNamespace(state="disconnected", detail="", exit_code=0)):
+        for action in ("connect", "status", "disconnect"):
+            assert _cmd_calendar(SimpleNamespace(), action) == 0
+        assert _cmd_calendar(SimpleNamespace(), "select", clear=True) == 0
+        assert _cmd_calendar(SimpleNamespace(), "select", ["replacement"]) == 0
+    assert calls == ["connect", "status", "disconnect", "client"]
+    assert saved == [[], ["replacement"]]
+
+
 def test_run_starts_recorder_when_calendar_configuration_is_bad_and_shuts_down_once():
     events, signal_handlers = [], []
 
@@ -183,3 +206,108 @@ def test_run_starts_recorder_when_calendar_configuration_is_bad_and_shuts_down_o
         assert _cmd_run(cfg) == 0
     assert events.count("recorder") == events.count("detector") == events.count("service-start") == 1
     assert events.count("service-stop") == events.count("shutdown") == 1
+
+
+def test_run_tolerates_calendar_setup_and_cleanup_failures_on_normal_loop_exit():
+    events = []
+
+    class Loop:
+        def run(self): events.append("run")
+        def quit(self): events.append("quit")
+
+    class GLib:
+        PRIORITY_HIGH = 1
+        MainLoop = Loop
+        @staticmethod
+        def timeout_add(*_args): return 1
+        @staticmethod
+        def unix_signal_add(*_args): return 1
+
+    class Controller:
+        def __init__(self, *_args): pass
+        def on_meeting_start(self): pass
+        def on_meeting_stop(self): pass
+        def shutdown(self): events.append("shutdown")
+
+    class Detector:
+        def __init__(self, **_kwargs): events.append("detector")
+        def tick(self): return True
+
+    class FailingService:
+        def __init__(self, *_args): events.append("construct"); raise RuntimeError("calendar unavailable")
+
+    cfg = SimpleNamespace(allowlist=(), poll_interval_seconds=1, start_debounce_seconds=1,
+                          stop_debounce_seconds=1, google_calendar_client_id="bad", google_calendar_loopback_port=True)
+    gi, repository = types.ModuleType("gi"), types.ModuleType("gi.repository")
+    gi.require_version = lambda *_args: None
+    repository.GLib = GLib
+    with patch.dict(sys.modules, {"gi": gi, "gi.repository": repository}), \
+         patch("meeting_recorder.notifier.Notifier", lambda: object()), \
+         patch("meeting_recorder.recorder.Recorder", lambda _cfg: events.append("recorder")), \
+         patch("meeting_recorder.controller.Controller", Controller), \
+         patch("meeting_recorder.detector.MeetingDetector", Detector), \
+         patch("meeting_recorder.calendar_service.CalendarRefreshService", FailingService):
+        from meeting_recorder.__main__ import _cmd_run
+        assert _cmd_run(cfg) == 0
+    assert events == ["recorder", "detector", "construct", "run", "shutdown"]
+
+    class StartFails:
+        def __init__(self, *_args): events.append("construct")
+        def start(self): events.append("start"); raise RuntimeError("calendar start failed")
+        def stop(self, _timeout): events.append("stop"); return True
+
+    events.clear()
+    with patch.dict(sys.modules, {"gi": gi, "gi.repository": repository}), \
+         patch("meeting_recorder.notifier.Notifier", lambda: object()), \
+         patch("meeting_recorder.recorder.Recorder", lambda _cfg: events.append("recorder")), \
+         patch("meeting_recorder.controller.Controller", Controller), \
+         patch("meeting_recorder.detector.MeetingDetector", Detector), \
+         patch("meeting_recorder.calendar_service.CalendarRefreshService", StartFails):
+        assert _cmd_run(cfg) == 0
+    assert events == ["recorder", "detector", "construct", "start", "run", "stop", "shutdown"]
+
+
+def test_run_attempts_controller_cleanup_once_after_calendar_stop_timeout_or_exception():
+    def run_case(stop):
+        events = []
+
+        class Loop:
+            def run(self): events.append("run")
+            def quit(self): events.append("quit")
+
+        class GLib:
+            PRIORITY_HIGH = 1
+            MainLoop = Loop
+            @staticmethod
+            def timeout_add(*_args): return 1
+            @staticmethod
+            def unix_signal_add(*_args): return 1
+
+        class Controller:
+            def __init__(self, *_args): pass
+            def on_meeting_start(self): pass
+            def on_meeting_stop(self): pass
+            def shutdown(self): events.append("shutdown")
+
+        class Service:
+            def __init__(self, *_args): events.append("construct")
+            def start(self): events.append("start")
+            def stop(self, _timeout): events.append("stop"); return stop()
+
+        cfg = SimpleNamespace(allowlist=(), poll_interval_seconds=1, start_debounce_seconds=1,
+                              stop_debounce_seconds=1, google_calendar_client_id="bad", google_calendar_loopback_port=True)
+        gi, repository = types.ModuleType("gi"), types.ModuleType("gi.repository")
+        gi.require_version = lambda *_args: None
+        repository.GLib = GLib
+        with patch.dict(sys.modules, {"gi": gi, "gi.repository": repository}), \
+             patch("meeting_recorder.notifier.Notifier", lambda: object()), \
+             patch("meeting_recorder.recorder.Recorder", lambda _cfg: events.append("recorder")), \
+             patch("meeting_recorder.controller.Controller", Controller), \
+             patch("meeting_recorder.detector.MeetingDetector", lambda **_kwargs: SimpleNamespace(tick=lambda: True)), \
+             patch("meeting_recorder.calendar_service.CalendarRefreshService", Service):
+            from meeting_recorder.__main__ import _cmd_run
+            assert _cmd_run(cfg) == 0
+        assert events.count("stop") == events.count("shutdown") == 1
+
+    run_case(lambda: False)
+    run_case(lambda: (_ for _ in ()).throw(RuntimeError("stop failed")))

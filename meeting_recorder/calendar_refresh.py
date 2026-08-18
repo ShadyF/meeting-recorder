@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from threading import Event
+from threading import Event, Lock
 from typing import Callable, Sequence
 
 from .calendar_cache import CalendarCache, CalendarSnapshot, calendar_operation_lock, snapshot_window
@@ -33,8 +33,16 @@ class CalendarRefresher:
     """Fetch and commit each selected calendar independently under one operation lock."""
 
     def __init__(self, client: GoogleCalendarClient, cache: CalendarCache,
-                 now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 before_commit: Callable[[], None] = lambda: None) -> None:
         self.client, self.cache, self._now = client, cache, now
+        self._before_commit = before_commit
+        self._commit_gate = Lock()
+
+    def request_cancel(self, cancel: Event) -> None:
+        """Order cancellation against a pending snapshot commit."""
+        with self._commit_gate:
+            cancel.set()
 
     def refresh(self, calendar_ids: Sequence[str], *, blocking: bool = False,
                 cancel: Event | None = None) -> CalendarRefreshReport:
@@ -53,7 +61,13 @@ class CalendarRefresher:
                     occurrences = self.client.list_occurrences(calendar_id, start, end, cancel=cancel)
                     if cancel is not None and cancel.is_set():
                         raise CalendarRefreshCancelled()
-                    self.cache.store(CalendarSnapshot(1, calendar_id, now, start, end, occurrences))
+                    self._before_commit()
+
+                    # Make cancellation and the atomic cache replacement one ordered operation.
+                    with self._commit_gate:
+                        if cancel is not None and cancel.is_set():
+                            raise CalendarRefreshCancelled()
+                        self.cache.store(CalendarSnapshot(1, calendar_id, now, start, end, occurrences))
                     results.append(CalendarRefreshResult(calendar_id, True))
                 except CalendarRefreshCancelled:
                     results.append(CalendarRefreshResult(calendar_id, False, True, "cancelled"))

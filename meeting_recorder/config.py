@@ -6,6 +6,7 @@ Any key omitted there falls back to config/default_config.json.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import tempfile
@@ -234,8 +235,10 @@ def _fsync_directory(directory: Path) -> None:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-    except OSError:
-        pass
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
+            return
+        raise
 
 
 def validate_google_calendar_ids(value: object) -> tuple[str, ...]:

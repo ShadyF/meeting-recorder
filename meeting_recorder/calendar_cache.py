@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -165,8 +166,10 @@ def _fsync_directory(directory: Path) -> None:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-    except OSError:
-        pass
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
+            return
+        raise
 
 
 @contextmanager
@@ -187,5 +190,7 @@ def calendar_operation_lock(*, blocking: bool, root: Path | str | None = None) -
     try:
         yield True
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)

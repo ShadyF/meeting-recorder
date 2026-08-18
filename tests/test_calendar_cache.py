@@ -2,6 +2,7 @@
 
 import json
 import os
+import errno
 import stat
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -107,3 +108,44 @@ def test_cache_lock_handles_nonblocking_contention_and_closes_generic_flock_fail
             else:
                 raise AssertionError("generic flock failure was hidden")
         assert closed
+
+
+def test_cache_lock_closes_descriptor_when_unlock_fails():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "google-calendar"
+        real_close, closed = os.close, []
+
+        def flock(_descriptor, operation):
+            if operation == stat_module.LOCK_UN:
+                raise OSError("unlock failed")
+
+        import meeting_recorder.calendar_cache as cache_module
+        stat_module = cache_module.fcntl
+        with patch("meeting_recorder.calendar_cache.fcntl.flock", side_effect=flock), \
+             patch("meeting_recorder.calendar_cache.os.close", side_effect=lambda fd: closed.append(fd) or real_close(fd)):
+            try:
+                with calendar_operation_lock(blocking=True, root=root):
+                    pass
+            except OSError:
+                pass
+            else:
+                raise AssertionError("unlock failure was hidden")
+        assert closed
+
+
+def test_cache_directory_fsync_propagates_real_io_failure_and_accepts_supported_success():
+    from meeting_recorder.calendar_cache import _fsync_directory
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        with patch("meeting_recorder.calendar_cache.os.fsync", side_effect=OSError(errno.EIO, "disk")):
+            try:
+                _fsync_directory(directory)
+            except OSError as exc:
+                assert exc.errno == errno.EIO
+            else:
+                raise AssertionError("durability failure was hidden")
+        calls = []
+        with patch("meeting_recorder.calendar_cache.os.fsync", side_effect=lambda fd: calls.append(fd)):
+            _fsync_directory(directory)
+        assert calls
