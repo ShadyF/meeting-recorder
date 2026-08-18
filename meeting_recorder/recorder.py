@@ -27,11 +27,13 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 from . import audio
 from .config import Config
-from .domain import CaptureMode, VideoSource
+from .domain import CaptureMode, CompletedRecording, VideoSource
 from .utils import LOG, expand_path
 
 _LIMITER = "alimiter=limit=0.95"
@@ -408,6 +410,62 @@ def build_finalize_cmd(cfg: Config, listfile: Path, dest: Path,
     return cmd
 
 
+class FinalizationHandle:
+    """Owns one detached finalization process and its immutable run snapshot."""
+
+    def __init__(self, proc, target: Path | None, parts: list[Path], listfile: Path | None,
+                 source_app: str, requested_mode: CaptureMode, has_audio: bool,
+                 has_video: bool, started_at: datetime, ended_at: datetime):
+        self._proc = proc
+        self._target, self._parts, self._listfile = target, parts, listfile
+        self._source_app, self._requested_mode = source_app, requested_mode
+        self._has_audio, self._has_video = has_audio, has_video
+        self._started_at, self._ended_at = started_at, ended_at
+        self._result: CompletedRecording | None = None
+        self._complete = proc is None
+        if self._complete:
+            self._cleanup()
+
+    def _cleanup(self) -> None:
+        for part in self._parts:
+            part.unlink(missing_ok=True)
+        if self._listfile:
+            self._listfile.unlink(missing_ok=True)
+        self._parts = []
+        self._listfile = None
+
+    def _finish(self, success: bool) -> tuple[bool, CompletedRecording | None]:
+        if not self._complete:
+            target = self._target
+            if success and target and target.exists() and target.stat().st_size > 0:
+                self._result = CompletedRecording(
+                    target, self._source_app, self._requested_mode, self._has_audio,
+                    self._has_video, self._started_at, self._ended_at)
+            self._cleanup()
+            self._complete = True
+            self._proc = None
+        return True, self._result
+
+    def poll(self) -> tuple[bool, CompletedRecording | None]:
+        if self._complete:
+            return True, self._result
+        if self._proc.poll() is None:
+            return False, None
+        return self._finish(self._proc.returncode == 0)
+
+    def wait(self, timeout: float = 900) -> CompletedRecording | None:
+        if self._complete:
+            return self._result
+        try:
+            self._proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            LOG.error("Finalize timed out; killing")
+            self._proc.kill()
+            self._proc.wait()
+            return self._finish(False)[1]
+        return self._finish(self._proc.returncode == 0)[1]
+
+
 class Recorder:
     """Records as one or more segments; pause ends a segment, resume starts one.
 
@@ -415,11 +473,15 @@ class Recorder:
     finalize pass (video stream-copied), so paused time never reaches the file.
     """
 
-    def __init__(self, cfg: Config, session=None):
+    def __init__(self, cfg: Config, session=None,
+                 clock: Callable[[], datetime] | None = None):
         self.cfg = cfg
         # Wayland: an open screencast.ScreenCastSession supplying the video.
         # None on X11, where ffmpeg grabs the display directly.
         self._session = session
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._source_app: str | None = None
+        self._capture_started_at: datetime | None = None
         self._requested_capture_mode: CaptureMode | None = None
         self._proc: subprocess.Popen | None = None
         self._pump: subprocess.Popen | None = None
@@ -434,12 +496,6 @@ class Recorder:
         self._accum: float = 0.0        # active seconds from finished segments
         self._run_start: float = 0.0    # monotonic start of the live segment
         self._paused: bool = False
-        # Finalize runs in the background (loudnorm is ~45x realtime, so an hour
-        # of meeting takes minutes) — the daemon must stay responsive.
-        self._fin_proc: subprocess.Popen | None = None
-        self._fin_target: Path | None = None
-        self._fin_parts: list[Path] = []
-        self._fin_list: Path | None = None
 
     @property
     def is_recording(self) -> bool:
@@ -450,19 +506,25 @@ class Recorder:
     def is_paused(self) -> bool:
         return self._paused
 
-    def start(self, output_path: Path, capture_mode: CaptureMode) -> None:
+    def start(self, output_path: Path, source_app: str,
+              capture_mode: CaptureMode) -> bool:
         if self.is_recording:
             LOG.warning("start() ignored: already recording")
-            return
+            return False
         output_path.parent.mkdir(parents=True, exist_ok=True)
         self._final_path = output_path
         self._parts = []
         self._accum = 0.0
         self._paused = False
         self._requested_capture_mode = capture_mode
+        self._source_app = source_app
+        self._capture_started_at = None
         self._has_video = None   # decided by the first segment, see _start_segment
         LOG.info("Recording -> %s", output_path)
-        self._start_segment()
+        if self._start_segment():
+            return True
+        self._reset_active()
+        return False
 
     def pause(self) -> None:
         if not self.is_recording or self._paused:
@@ -476,23 +538,30 @@ class Recorder:
         if not self.is_recording or not self._paused:
             return
         self._paused = False
-        self._start_segment()
+        if not self._start_segment():
+            self._paused = True
         LOG.info("Recording resumed")
 
-    def stop(self, discard: bool = False, trim_end: float = 0.0) -> bool:
+    def stop(self, discard: bool = False, trim_end: float = 0.0) -> FinalizationHandle | None:
         """Stop capture and kick off the finalize pass in the background.
 
         `trim_end` drops that many seconds from the end of the saved file — the
         detector uses it to remove the tail recorded during its stop debounce.
-        Returns True if a finalize was started — poll it with poll_finalize().
+        Returns a per-run finalization handle after detaching active capture state.
         """
         if not self.is_recording:
-            return False
+            return None
         if not self._paused:
             self._accum += time.monotonic() - self._run_start
         self._stop_proc()
         final, parts = self._final_path, self._parts
-        self._final_path, self._parts, self._paused = None, [], False
+        started = self._capture_started_at or self._clock()
+        ended = max(started, self._clock() - timedelta(seconds=trim_end))
+        source_app = self._source_app or "Meeting"
+        requested = self._requested_capture_mode or CaptureMode.AUDIO_ONLY
+        has_audio = bool(self.cfg.record_mic or self.cfg.record_system_audio)
+        has_video = bool(self._has_video)
+        self._reset_active()
 
         parts = [p for p in parts if p.exists() and p.stat().st_size > 0]
         if discard or not parts or final is None:
@@ -500,56 +569,22 @@ class Recorder:
                 LOG.warning("Recording stopped but no output was produced")
             for p in parts:
                 p.unlink(missing_ok=True)
-            return False
+            return FinalizationHandle(None, final, parts, None, source_app, requested,
+                                      has_audio, has_video, started, ended)
         duration = None
         if trim_end > 0:
             duration = max(0.5, self._accum - trim_end)
             LOG.info("Trimming %.1fs of post-call tail (keeping %.1fs)",
                      trim_end, duration)
         try:
-            self._start_finalize(parts, final, duration)
+            return self._start_finalize(parts, final, duration, source_app, requested,
+                                        has_audio, has_video, started, ended)
         except OSError as exc:
             LOG.error("Could not start finalize: %s", exc)
             for p in parts:
                 p.unlink(missing_ok=True)
-            return False
-        return True
-
-    @property
-    def is_finalizing(self) -> bool:
-        return self._fin_proc is not None
-
-    def poll_finalize(self) -> tuple[bool, Path | None]:
-        """Return (done, saved_path). While running: (False, None)."""
-        if self._fin_proc is None:
-            return True, None
-        if self._fin_proc.poll() is None:
-            return False, None
-        rc = self._fin_proc.returncode
-        self._fin_proc = None
-        for p in self._fin_parts:
-            p.unlink(missing_ok=True)
-        if self._fin_list:
-            self._fin_list.unlink(missing_ok=True)
-        final = self._fin_target
-        self._fin_target, self._fin_parts, self._fin_list = None, [], None
-        if rc == 0 and final and final.exists() and final.stat().st_size > 0:
-            LOG.info("Saved recording: %s (%.1f MB)", final,
-                     final.stat().st_size / 1e6)
-            return True, final
-        LOG.error("Finalize failed (exit %s)", rc)
-        return True, None
-
-    def wait_finalize(self, timeout: float = 900) -> Path | None:
-        """Block until finalize completes — used on daemon shutdown."""
-        if self._fin_proc is None:
-            return None
-        try:
-            self._fin_proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            LOG.error("Finalize timed out; killing")
-            self._fin_proc.kill()
-        return self.poll_finalize()[1]
+            return FinalizationHandle(None, final, parts, None, source_app, requested,
+                                      has_audio, has_video, started, ended)
 
     def elapsed(self) -> float:
         """Total active recorded seconds, excluding paused time."""
@@ -557,8 +592,19 @@ class Recorder:
             return self._accum
         return self._accum + (time.monotonic() - self._run_start)
 
+    def _reset_active(self) -> None:
+        """Detach all capture-only state before a finalizer can outlive this run."""
+        self._final_path = None
+        self._parts = []
+        self._paused = False
+        self._proc = None
+        self._requested_capture_mode = None
+        self._source_app = None
+        self._capture_started_at = None
+        self._has_video = None
+
     # -- internals ---------------------------------------------------------
-    def _start_segment(self) -> None:
+    def _start_segment(self) -> bool:
         assert self._final_path is not None
         assert self._requested_capture_mode is not None
         part = self._final_path.with_name(
@@ -581,12 +627,18 @@ class Recorder:
                         else CaptureMode.AUDIO_ONLY)
         cmd = build_ffmpeg_cmd(self.cfg, part, dev, capture_mode)
         LOG.debug("capture cmd: %s", " ".join(cmd))
-        self._proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        try:
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            LOG.error("Could not start capture: %s", exc)
+            self._cleanup_pump()
+            return False
         self._parts.append(part)
         self._run_start = time.monotonic()
+        if self._capture_started_at is None:
+            self._capture_started_at = self._clock()
+        return True
 
     @property
     def _wants_pipewire(self) -> bool:
@@ -680,15 +732,18 @@ class Recorder:
             self._fifo = None
 
     def _start_finalize(self, parts: list[Path], dest: Path,
-                        duration: float | None = None) -> None:
+                        duration: float | None = None, source_app: str = "Meeting",
+                        requested: CaptureMode = CaptureMode.AUDIO_ONLY,
+                        has_audio: bool = False, has_video: bool = False,
+                        started: datetime | None = None,
+                        ended: datetime | None = None) -> FinalizationHandle:
         listfile = dest.with_name(f".{dest.stem}.concat.txt")
         listfile.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts),
                             encoding="utf-8")
         # Map only what the segments really contain: if screen capture was
         # never granted, asking for 0:v here would fail the whole finalize and
         # throw away a perfectly good audio recording.
-        capture_mode = (CaptureMode.AUDIO_VIDEO if self._has_video
-                        else CaptureMode.AUDIO_ONLY)
+        capture_mode = CaptureMode.AUDIO_VIDEO if has_video else CaptureMode.AUDIO_ONLY
         if capture_mode is CaptureMode.AUDIO_ONLY:
             LOG.warning("No video was captured; saving audio only")
         cfg = self.cfg
@@ -696,8 +751,13 @@ class Recorder:
                                  capture_mode)
         LOG.info("Finalizing %d segment(s) -> %s", len(parts), dest.name)
         LOG.debug("finalize cmd: %s", " ".join(cmd))
-        self._fin_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self._fin_target = dest
-        self._fin_parts = parts
-        self._fin_list = listfile
+        started = started or self._clock()
+        ended = ended or started
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            LOG.error("Could not start finalize: %s", exc)
+            return FinalizationHandle(None, dest, parts, listfile, source_app, requested,
+                                      has_audio, has_video, started, ended)
+        return FinalizationHandle(proc, dest, parts, listfile, source_app, requested,
+                                  has_audio, has_video, started, ended)

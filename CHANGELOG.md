@@ -7,6 +7,8 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Changed
+- Recording finalization now completes independently for each run, so a new
+  recording can begin while an earlier file is still being finalized.
 - Video source now separately selects fullscreen, the current window, or an
   area, while Capture mode describes the media composition for each recording.
 - Existing `capture_mode` configuration values remain supported and are saved

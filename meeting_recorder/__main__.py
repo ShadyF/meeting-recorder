@@ -95,14 +95,15 @@ def _cmd_record(cfg) -> int:
     loop = GLib.MainLoop()
     result: dict = {}
 
-    def _on_finished(path):
-        result["path"] = path
-        print(f"Saved: {path}" if path else "No file was saved.")
+    def _on_finished(completed):
+        result["completed"] = True
+        result["path"] = completed.path if completed else None
+        print(f"Saved: {completed.path}" if completed else "No file was saved.")
         # Do not quit yet. The "saved" notification's Open Folder button is a
         # callback into this process, so exiting now would leave a button that
         # silently does nothing. Wait for the user to act on (or dismiss) the
         # notification, with a cap so the command cannot hang forever.
-        if path is None or not notifier.has_live_notifications:
+        if completed is None or not notifier.has_live_notifications:
             loop.quit()
             return
         result["waiting"] = True
@@ -125,7 +126,7 @@ def _cmd_record(cfg) -> int:
     def _stop(*_a):
         # A second Ctrl-C, or one during the post-save wait for the
         # notification, means "just leave" — there is nothing left to finalize.
-        if result.get("waiting") or result.get("path"):
+        if result.get("waiting") or result.get("completed"):
             loop.quit()
             return False
         # stop_manual() only *launches* finalize (concat + denoise + loudnorm);

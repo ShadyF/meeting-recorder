@@ -18,9 +18,9 @@ from __future__ import annotations
 import enum
 
 from .config import Config
-from .domain import CaptureMode
+from .domain import CaptureMode, CompletedRecording
 from .notifier import Notifier
-from .recorder import Recorder
+from .recorder import FinalizationHandle, Recorder
 from .utils import LOG, build_output_path, open_folder
 
 
@@ -44,7 +44,8 @@ class Controller:
         self._session = None         # Wayland ScreenCast session, while recording
         self._pending_path = None    # output path awaiting the portal handshake
         self._pending_capture_mode: CaptureMode | None = None
-        self._run_done = False       # end-of-recording reported for this run?
+        self._handles: set[FinalizationHandle] = set()
+        self._reserved_paths: set = set()
         self._manual = False         # started by `record`, not by the detector
         # Called with the saved Path (or None) once a recording is fully
         # finalized. `record` uses it to know when it can exit.
@@ -114,10 +115,10 @@ class Controller:
     def _begin_recording(self) -> None:
         path = build_output_path(self.cfg.output_dir, self._app or "Meeting",
                                  self.cfg.container)
+        path = self._reserve_path(path)
         capture_mode = (CaptureMode.AUDIO_VIDEO if self.cfg.record_screen
                         else CaptureMode.AUDIO_ONLY)
         self.state = State.RECORDING
-        self._run_done = False
         # Show the controls straight away, before any capture starts. On Wayland
         # the portal handshake happens first and can take seconds (or stall on a
         # dialog), and leaving the screen empty in the meantime reads as "Record
@@ -175,8 +176,12 @@ class Controller:
         self._start_capture(path, capture_mode)
 
     def _start_capture(self, path, capture_mode: CaptureMode) -> None:
-        self._run_done = False
-        self.recorder.start(path, capture_mode)
+        if not self.recorder.start(path, self._app or "Meeting", capture_mode):
+            self._reserved_paths.discard(path)
+            self._close_portal()
+            self.state = State.IDLE
+            self._app = None
+            return
         self.state = State.RECORDING
         self._show_widget()  # no-op when _begin_recording already showed it
 
@@ -185,33 +190,21 @@ class Controller:
         if not self.recorder.is_recording:
             # The call ended while the portal dialog was still up.
             self._close_portal()
-            self._run_complete(None)
             return
         # min_recording_seconds exists to drop false-positive meeting detections;
         # a manual `record` was asked for explicitly, so it always saves.
         too_short = (not self._manual and
                      self.recorder.elapsed() - trim_end < self.cfg.min_recording_seconds)
         if too_short:
-            self.recorder.stop(discard=True)
+            handle = self.recorder.stop(discard=True)
             self._close_portal()
             LOG.info("Discarded: call was shorter than min_recording_seconds")
-            self._run_complete(None)
+            self._register_handle(handle)
             return
-        started = self.recorder.stop(trim_end=trim_end)
+        handle = self.recorder.stop(trim_end=trim_end)
         # After stop(): capture is torn down, so the portal stream is free to go.
         self._close_portal()
-        if not started:
-            LOG.warning("Recording stopped but no file was saved")
-            self._run_complete(None)
-            return
-        # Finalize (denoise + normalize + mix) runs in the background so the
-        # daemon stays responsive; poll it and notify when the file is ready.
-        try:
-            from gi.repository import GLib
-            GLib.timeout_add(1000, self._poll_finalize)
-        except Exception:  # pragma: no cover - no GLib: fall back to blocking
-            path = self.recorder.wait_finalize()
-            self._notify_finalized(path)
+        self._register_handle(handle)
 
     def _close_portal(self) -> None:
         """Release the ScreenCast session so the compositor stops the stream."""
@@ -222,43 +215,59 @@ class Controller:
         if session is not None:
             session.close()
 
-    def _poll_finalize(self) -> bool:
-        done, path = self.recorder.poll_finalize()
+    def _register_handle(self, handle: FinalizationHandle | None) -> None:
+        if handle is None:
+            return
+        self._handles.add(handle)
+        try:
+            from gi.repository import GLib
+            GLib.timeout_add(1000, lambda: self._poll_handle(handle))
+        except Exception:
+            self._dispatch_handle(handle, handle.wait())
+
+    def _poll_handle(self, handle: FinalizationHandle) -> bool:
+        done, completed = handle.poll()
         if not done:
-            return True  # keep polling
-        self._notify_finalized(path)
+            return True
+        self._dispatch_handle(handle, completed)
         return False
 
-    def _run_complete(self, path) -> None:
-        """Fire the end-of-recording hook exactly once for this run."""
-        if self._run_done:
+    def _dispatch_handle(self, handle: FinalizationHandle,
+                         completed: CompletedRecording | None) -> None:
+        """Remove first so stale polls cannot duplicate local completion effects."""
+        if handle not in self._handles:
             return
-        self._run_done = True
-        if self.on_finished:
-            self.on_finished(path)
-
-    def _notify_finalized(self, path) -> None:
-        # shutdown() can block on the finalize that _poll_finalize is already
-        # watching, so both can land here for one recording — report once.
-        if self._run_done:
-            return
+        self._handles.remove(handle)
+        self._reserved_paths.discard(handle._target)
         # These stay on screen until dismissed: "saved" is clickable (opening the
         # folder), and a failure needs to be seen.
-        if path is None:
-            self.notifier.info("Recording failed", "Could not finalize the file.",
-                               persistent=True)
-        else:
-            # A named action renders as a button, so the folder opens only when
-            # it is clicked — never on its own, which would put a file manager
-            # in front of whatever the user does after a call.
-            self.notifier.info(
-                "Recording saved", path.name,
-                icon="folder-videos",
-                on_click=lambda p=path: open_folder(p),
-                click_label="📁 Open Folder",
-                persistent=True,
-            )
-        self._run_complete(path)
+        try:
+            if completed is None:
+                self.notifier.info("Recording failed", "Could not finalize the file.",
+                                   persistent=True)
+            else:
+                self.notifier.info(
+                    "Recording saved", completed.path.name,
+                    icon="folder-videos",
+                    on_click=lambda p=completed.path: open_folder(p),
+                    click_label="📁 Open Folder",
+                    persistent=True,
+                )
+        except Exception:
+            LOG.exception("Could not show recording outcome")
+        if self.on_finished:
+            try:
+                self.on_finished(completed)
+            except Exception:
+                LOG.exception("Recording completion callback failed")
+
+    def _reserve_path(self, path):
+        candidate, number = path, 2
+        while candidate in self._reserved_paths:
+            candidate = path.with_name(f"{path.stem}-{number}{path.suffix}")
+            number += 1
+        self._reserved_paths.add(candidate)
+        return candidate
 
     # -- recording controls (tray icon, or floating pill fallback) ---------
     def _show_widget(self) -> None:
@@ -324,9 +333,10 @@ class Controller:
 
     # -- shutdown ----------------------------------------------------------
     def shutdown(self) -> None:
+        if self._pending_path is not None:
+            self._reserved_paths.discard(self._pending_path)
+            self._close_portal()
         if self.recorder.is_recording:
             self._finish_recording()
-        if self.recorder.is_finalizing:
-            # Block on exit so an in-flight recording is never lost.
-            LOG.info("Waiting for finalize to finish before exiting…")
-            self._notify_finalized(self.recorder.wait_finalize())
+        for handle in list(self._handles):
+            self._dispatch_handle(handle, handle.wait())

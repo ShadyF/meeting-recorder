@@ -361,7 +361,7 @@ def test_pause_resume_creates_segments_and_tracks_elapsed():
     os.environ["MEETING_RECORDER_CAPTURE"] = "x11"
     try:
         r = rec.Recorder(load_config())
-        r.start(Path("/tmp/seg.mkv"), CaptureMode.AUDIO_VIDEO)
+        r.start(Path("/tmp/seg.mkv"), "Manual", CaptureMode.AUDIO_VIDEO)
         assert r.is_recording and not r.is_paused
         assert len(r._parts) == 1
         r.pause()
@@ -430,7 +430,7 @@ def test_portal_unavailable_records_audio_only_for_an_audio_video_request():
     os.environ["MEETING_RECORDER_CAPTURE"] = "portal"
     try:
         recorder = rec.Recorder(_cfg(record_screen=True))
-        recorder.start(Path("/tmp/portal-denied.mkv"), CaptureMode.AUDIO_VIDEO)
+        recorder.start(Path("/tmp/portal-denied.mkv"), "Manual", CaptureMode.AUDIO_VIDEO)
     finally:
         rec.subprocess.Popen, rec.resolve_devices, rec.build_ffmpeg_cmd = original
         if previous_backend is None:

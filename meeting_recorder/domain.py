@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from enum import Enum
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 
 class CaptureMode(str, Enum):
@@ -28,3 +31,16 @@ class VideoSource(str, Enum):
             return cls(str(value))
         except ValueError:
             return cls.FULLSCREEN
+
+
+@dataclass(frozen=True)
+class CompletedRecording:
+    """The immutable outcome of one successfully finalized recording."""
+
+    path: Path
+    source_app: str
+    requested_capture_mode: CaptureMode
+    has_audio: bool
+    has_video: bool
+    capture_started_at: datetime
+    capture_ended_at: datetime

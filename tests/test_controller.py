@@ -87,13 +87,14 @@ def test_manual_start_derives_a_per_run_capture_mode_without_changing_config():
     class FakeRecorder:
         is_recording = False
 
-        def start(self, _path, capture_mode):
+        def start(self, _path, _source_app, capture_mode):
             self.capture_mode = capture_mode
             self.is_recording = True
+            return True
 
         def stop(self, **_kwargs):
             self.is_recording = False
-            return False
+            return None
 
         def attach_session(self, _session):
             pass
