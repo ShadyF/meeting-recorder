@@ -249,3 +249,149 @@ def test_shutdown_wait_exception_aborts_reaps_and_cleans_handle() -> None:
         controller.shutdown()
         assert proc.killed == 1 and not part.exists() and not listfile.exists()
         assert not controller._handles
+
+
+def test_overlapping_recorder_runs_dispatch_their_own_completed_recordings() -> None:
+    """A detached finalizer must never borrow metadata from the next run."""
+    import meeting_recorder.recorder as rec
+
+    class Proc:
+        def __init__(self, command, *_args, **_kwargs) -> None:
+            self.command = command
+            self.returncode = None
+            self.stdin = None
+            if command[0] == "capture":
+                Path(command[-1]).write_bytes(b"part")
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, _timeout=None, **_kwargs):
+            return self.returncode
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        times = iter(datetime(2026, 1, 1, hour, tzinfo=timezone.utc)
+                     for hour in (1, 2, 3, 4))
+        finals = {}
+        previous = (rec.subprocess.Popen, rec.resolve_devices, rec.build_ffmpeg_cmd,
+                    rec.build_finalize_cmd, rec.Recorder._wants_pipewire)
+        rec.subprocess.Popen = lambda command, *args, **kwargs: (
+            finals.setdefault(Path(command[-1]), Proc(command, *args, **kwargs))
+            if command[0] == "finalize" else Proc(command, *args, **kwargs))
+        rec.resolve_devices = lambda *_args: None
+        rec.build_ffmpeg_cmd = lambda _cfg, output, _dev, _mode: ["capture", str(output)]
+        rec.build_finalize_cmd = lambda _cfg, _list, dest, *_args: ["finalize", str(dest)]
+        rec.Recorder._wants_pipewire = property(lambda _self: False)
+        try:
+            recorder = Recorder(load_config(), clock=lambda: next(times))
+            first_path, second_path = root / "first.mkv", root / "second.mkv"
+            assert recorder.start(first_path, "A", CaptureMode.AUDIO_ONLY)
+            first = recorder.stop()
+            assert recorder.start(second_path, "B", CaptureMode.AUDIO_VIDEO)
+            second = recorder.stop()
+        finally:
+            (rec.subprocess.Popen, rec.resolve_devices, rec.build_ffmpeg_cmd,
+             rec.build_finalize_cmd, rec.Recorder._wants_pipewire) = previous
+
+        controller = Controller(load_config(), _Notifier(), recorder)
+        completed = []
+        controller.on_finished = completed.append
+        controller._handles.update((first, second))
+        controller._reserved_paths.update((first_path, second_path))
+
+        second_path.write_bytes(b"second")
+        finals[second_path].returncode = 0
+        assert not controller._poll_handle(second)
+        first_path.write_bytes(b"first")
+        finals[first_path].returncode = 0
+        assert not controller._poll_handle(first)
+        assert not controller._poll_handle(first)
+
+        assert [(item.path, item.source_app, item.requested_capture_mode,
+                 item.has_video, item.capture_started_at, item.capture_ended_at)
+                for item in completed] == [
+            (second_path, "B", CaptureMode.AUDIO_VIDEO, True,
+             datetime(2026, 1, 1, 3, tzinfo=timezone.utc),
+             datetime(2026, 1, 1, 4, tzinfo=timezone.utc)),
+            (first_path, "A", CaptureMode.AUDIO_ONLY, False,
+             datetime(2026, 1, 1, 1, tzinfo=timezone.utc),
+             datetime(2026, 1, 1, 2, tzinfo=timezone.utc)),
+        ]
+
+
+def test_portal_denial_finalizes_requested_video_as_audio_only() -> None:
+    import meeting_recorder.recorder as rec
+
+    class Proc:
+        def __init__(self, command, *_args, **_kwargs) -> None:
+            self.command = command
+            self.returncode = None
+            self.stdin = None
+            if command[0] == "capture":
+                Path(command[-1]).write_bytes(b"part")
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, _timeout=None, **_kwargs):
+            return self.returncode
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        finals = {}
+        previous = (rec.subprocess.Popen, rec.resolve_devices, rec.build_ffmpeg_cmd,
+                    rec.build_finalize_cmd, rec.Recorder._wants_pipewire)
+        rec.subprocess.Popen = lambda command, *args, **kwargs: (
+            finals.setdefault(Path(command[-1]), Proc(command, *args, **kwargs))
+            if command[0] == "finalize" else Proc(command, *args, **kwargs))
+        rec.resolve_devices = lambda *_args: rec.CaptureDevices(":0", "1x1", 0, 0, "m", "s")
+        rec.build_ffmpeg_cmd = lambda _cfg, output, _dev, _mode: ["capture", str(output)]
+        rec.build_finalize_cmd = lambda _cfg, _list, dest, *_args: ["finalize", str(dest)]
+        rec.Recorder._wants_pipewire = property(lambda _self: True)
+        try:
+            target = root / "denied.mkv"
+            recorder = Recorder(load_config())
+            assert recorder.start(target, "Portal", CaptureMode.AUDIO_VIDEO)
+            handle = recorder.stop()
+        finally:
+            (rec.subprocess.Popen, rec.resolve_devices, rec.build_ffmpeg_cmd,
+             rec.build_finalize_cmd, rec.Recorder._wants_pipewire) = previous
+
+        target.write_bytes(b"audio")
+        finals[target].returncode = 0
+        completed = handle.poll()[1]
+        assert completed is not None
+        assert completed.requested_capture_mode is CaptureMode.AUDIO_VIDEO
+        assert completed.has_video is False
+
+
+def test_widget_stop_cancels_pending_manual_portal_without_completion() -> None:
+    class Session:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "pending.mkv"
+        recorder = _FailingRecorder()
+        controller = Controller(load_config(), _Notifier(), recorder)
+        widget, session = _Widget(), Session()
+        finished, cancelled = [], []
+        controller._widget = widget
+        controller._session = session
+        controller._pending_path = path
+        controller._reserved_paths.add(path)
+        controller._manual = True
+        controller.state = State.RECORDING
+        controller.on_finished = finished.append
+        controller.on_manual_cancelled = lambda: cancelled.append(True)
+
+        controller._on_widget_stop()
+
+        assert cancelled == [True] and finished == []
+        assert controller.state is State.IDLE and controller._widget is None
+        assert session.closed == 1 and not controller._reserved_paths
+        assert recorder.sessions == [None]
