@@ -115,11 +115,51 @@ def collision_safe_path(preferred: Path | str, source: Path | str | None = None)
         number += 1
 
 
-def _reservation_path(path: Path | str) -> Path:
-    canonical = os.path.realpath(Path(path))
+def _reservation_root() -> Path:
     cache_home = Path(os.path.expanduser(os.environ.get("XDG_CACHE_HOME") or "~/.cache"))
     root = cache_home / "meeting-recorder" / "recording-path-reservations"
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = os.lstat(root)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError("reservation root must be a private directory")
+    os.chmod(root, 0o700)
+    return root
+
+
+@contextmanager
+def _reservation_registry_lock(root: Path | None = None) -> Iterator[None]:
+    """Serialize marker lifecycle operations without holding it during reservations."""
+    root = root or _reservation_root()
+    registry = root / "registry.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(registry, flags, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("reservation registry must not be a symlink") from exc
+        raise
+    try:
+        os.fchmod(descriptor, 0o600)
+    except Exception:
+        os.close(descriptor)
+        raise
+    locked = False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _reservation_path(path: Path | str) -> Path:
+    canonical = os.path.realpath(Path(path))
+    root = _reservation_root()
     key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return root / f"{key}.lock"
 
@@ -130,6 +170,7 @@ class RecordingPathReservation:
 
     path: Path
     _descriptor: int
+    _marker: Path
 
     def release(self) -> None:
         """Release this reservation exactly once; crash closes the flock too."""
@@ -137,9 +178,19 @@ class RecordingPathReservation:
         if descriptor == -1:
             return
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            with _reservation_registry_lock(self._marker.parent):
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+                    descriptor = -1
+                try:
+                    os.unlink(self._marker)
+                except FileNotFoundError:
+                    pass
         finally:
-            os.close(descriptor)
+            if descriptor != -1:
+                os.close(descriptor)
 
     def __enter__(self) -> "RecordingPathReservation":
         return self
@@ -152,17 +203,36 @@ def reserve_recording_path(path: Path | str) -> RecordingPathReservation:
     """Reserve a canonical destination until the returned handle is released."""
     destination = Path(path)
     marker = _reservation_path(destination)
-    descriptor = os.open(marker, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        os.close(descriptor)
-        raise FileExistsError(destination) from exc
-    if os.path.lexists(destination):
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-        raise FileExistsError(destination)
-    return RecordingPathReservation(destination, descriptor)
+    with _reservation_registry_lock(marker.parent):
+        flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            descriptor = os.open(marker, flags, 0o600)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError("reservation marker must not be a symlink") from exc
+            raise
+        try:
+            os.fchmod(descriptor, 0o600)
+        except Exception:
+            os.close(descriptor)
+            raise
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise FileExistsError(destination) from exc
+        except Exception:
+            os.close(descriptor)
+            raise
+        if os.path.lexists(destination):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+            os.unlink(marker)
+            raise FileExistsError(destination)
+        return RecordingPathReservation(destination, descriptor, marker)
 
 
 def release_recording_path(reservation: RecordingPathReservation) -> None:
@@ -174,16 +244,35 @@ def release_recording_path(reservation: RecordingPathReservation) -> None:
 
 def is_live_reserved(path: Path | str) -> bool:
     """Return whether another process currently holds the destination lock."""
-    descriptor = os.open(_reservation_path(path), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
+    marker = _reservation_path(path)
+    with _reservation_registry_lock(marker.parent):
+        if not os.path.lexists(marker):
+            return False
+        info = os.lstat(marker)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ValueError("reservation marker must be a regular file")
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+            descriptor = os.open(marker, flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ValueError("reservation marker must not be a symlink") from exc
+            raise
+        try:
+            os.fchmod(descriptor, 0o600)
+        except Exception:
+            os.close(descriptor)
+            raise
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+        os.unlink(marker)
         return False
-    finally:
-        os.close(descriptor)
 
 
 def _fsync_directory(directory: Path) -> None:

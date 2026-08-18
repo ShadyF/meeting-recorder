@@ -76,8 +76,8 @@ def test_cross_process_reservation_release_and_stale_marker_behavior() -> None:
             reservation.release()
             reservation.release()
             assert not is_live_reserved(path)
-            marker = next(Path(cache).rglob("*.lock"))
-            assert marker.exists(), "released marker is intentionally retained"
+            root = Path(cache) / "meeting-recorder" / "recording-path-reservations"
+            assert list(root.glob("*.lock")) == [root / "registry.lock"]
             replacement = reserve_recording_path(path)
             replacement.release()
         finally:
@@ -149,6 +149,16 @@ def _hold_reservation(path: str, ready, release) -> None:
     reservation.release()
 
 
+def _crash_with_reservation(path: str, ready) -> None:
+    reserve_recording_path(path)
+    ready.set()
+
+
+def _probe_live_reservation(path: str, started, result) -> None:
+    started.set()
+    result.put(is_live_reserved(path))
+
+
 def test_move_regular_file_no_replace_and_rejects_cross_directory() -> None:
     with TemporaryDirectory() as first, TemporaryDirectory() as second:
         source = Path(first) / "recording.mkv"
@@ -190,6 +200,88 @@ def test_reservation_is_visible_across_processes_until_child_release() -> None:
             release.set()
             child.join(2)
             assert child.exitcode == 0 and not is_live_reserved(path)
+        finally:
+            if original is None:
+                os.environ.pop("XDG_CACHE_HOME", None)
+            else:
+                os.environ["XDG_CACHE_HOME"] = original
+
+
+def test_absent_probe_creates_no_destination_marker_and_registry_is_bounded() -> None:
+    with TemporaryDirectory() as directory, TemporaryDirectory() as cache:
+        original = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = cache
+        try:
+            root = Path(cache) / "meeting-recorder" / "recording-path-reservations"
+            for index in range(25):
+                path = Path(directory) / f"probe-{index}.mkv"
+                assert not is_live_reserved(path)
+                assert [item.name for item in root.iterdir()] == ["registry.lock"]
+                reservation = reserve_recording_path(path)
+                assert is_live_reserved(path)
+                reservation.release()
+                assert not is_live_reserved(path)
+            assert [item.name for item in root.iterdir()] == ["registry.lock"]
+            assert stat_mode(root / "registry.lock") == 0o600
+        finally:
+            if original is None:
+                os.environ.pop("XDG_CACHE_HOME", None)
+            else:
+                os.environ["XDG_CACHE_HOME"] = original
+
+
+def test_stale_crash_marker_is_cleaned_and_reusable() -> None:
+    with TemporaryDirectory() as directory, TemporaryDirectory() as cache:
+        original = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = cache
+        try:
+            path = Path(directory) / "crashed.mkv"
+            context = multiprocessing.get_context("fork")
+            ready = context.Event()
+            child = context.Process(target=_crash_with_reservation,
+                                    args=(str(path), ready))
+            child.start()
+            assert ready.wait(2)
+            child.join(2)
+            assert child.exitcode == 0
+            assert not is_live_reserved(path)
+            reservation = reserve_recording_path(path)
+            assert is_live_reserved(path)
+            reservation.release()
+            assert not is_live_reserved(path)
+        finally:
+            if original is None:
+                os.environ.pop("XDG_CACHE_HOME", None)
+            else:
+                os.environ["XDG_CACHE_HOME"] = original
+
+
+def test_probe_release_reacquire_interleaving_keeps_one_marker_identity() -> None:
+    with TemporaryDirectory() as directory, TemporaryDirectory() as cache:
+        original = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = cache
+        try:
+            path = Path(directory) / "interleaved.mkv"
+            first = reserve_recording_path(path)
+            context = multiprocessing.get_context("fork")
+            started, result = context.Event(), context.Queue()
+            probe = context.Process(target=_probe_live_reservation,
+                                    args=(str(path), started, result))
+            probe.start()
+            assert started.wait(2)
+            assert result.get(timeout=2) is True
+            probe.join(2)
+            assert probe.exitcode == 0
+            marker = next(item for item in (Path(cache) / "meeting-recorder" /
+                                            "recording-path-reservations").glob("*.lock")
+                          if item.name != "registry.lock")
+            assert is_live_reserved(path)
+            first.release()
+            assert not marker.exists() and not is_live_reserved(path)
+            second = reserve_recording_path(path)
+            assert is_live_reserved(path)
+            second.release()
+            assert not marker.exists() and not is_live_reserved(path)
         finally:
             if original is None:
                 os.environ.pop("XDG_CACHE_HOME", None)
