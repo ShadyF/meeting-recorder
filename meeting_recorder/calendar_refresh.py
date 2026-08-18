@@ -39,10 +39,16 @@ class CalendarRefresher:
         self._before_commit = before_commit
         self._commit_gate = Lock()
 
-    def request_cancel(self, cancel: Event) -> None:
-        """Order cancellation against a pending snapshot commit."""
-        with self._commit_gate:
-            cancel.set()
+    def request_cancel(self, cancel: Event, timeout: float) -> bool:
+        """Signal cancellation immediately, then wait only briefly for a commit to settle."""
+        cancel.set()
+        acquired = self._commit_gate.acquire(timeout=max(0.0, timeout))
+        if not acquired:
+            return False
+        try:
+            return True
+        finally:
+            self._commit_gate.release()
 
     def refresh(self, calendar_ids: Sequence[str], *, blocking: bool = False,
                 cancel: Event | None = None) -> CalendarRefreshReport:

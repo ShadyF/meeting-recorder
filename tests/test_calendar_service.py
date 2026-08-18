@@ -2,8 +2,10 @@
 
 import threading
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from meeting_recorder.calendar_cache import CalendarCache
 from meeting_recorder.calendar_refresh import CalendarRefresher
@@ -13,7 +15,7 @@ from meeting_recorder.calendar_service import CalendarRefreshService
 class _Refresher:
     def __init__(self): self.calls = []
     def refresh(self, ids, *, blocking, cancel): self.calls.append((ids, blocking, cancel))
-    def request_cancel(self, cancel): cancel.set()
+    def request_cancel(self, cancel, timeout): cancel.set(); return True
 
 
 def test_service_start_is_idempotent_and_bounded_stop_returns():
@@ -48,7 +50,7 @@ def test_service_refreshes_immediately_reloads_selection_and_waits_between_cycle
     class Refresher:
         def __init__(self): self.calls = []
         def refresh(self, ids, *, blocking, cancel): self.calls.append((ids, blocking, cancel))
-        def request_cancel(self, cancel): cancel.set()
+        def request_cancel(self, cancel, timeout): cancel.set(); return True
 
     selections = iter((("first",), ("second",)))
     refresher = Refresher()
@@ -69,7 +71,7 @@ def test_service_stop_propagates_exact_event_and_reports_blocked_worker():
             self.cancel = cancel
             entered.set()
             release.wait()
-        def request_cancel(self, cancel): cancel.set()
+        def request_cancel(self, cancel, timeout): cancel.set(); return True
 
     refresher = BlockingRefresher()
     service = CalendarRefreshService(refresher, lambda: ("one",), interval_seconds=900)
@@ -102,3 +104,46 @@ def test_service_stop_winning_between_fetch_and_commit_prevents_cache_write():
         assert not service.stop(0)
         release.set()
         assert service.stop(1) and cache.load("calendar") is None
+
+
+def test_service_stop_bounds_a_stalled_commit_gate_and_sets_cancellation_immediately():
+    entered, release = threading.Event(), threading.Event()
+
+    class Client:
+        def list_occurrences(self, _calendar_id, _start, _end, *, cancel=None): return ()
+
+    class BlockingCache(CalendarCache):
+        def store(self, snapshot):
+            entered.set()
+            release.wait()
+            return super().store(snapshot)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        cache = BlockingCache(Path(temporary) / "google-calendar")
+        refresher = CalendarRefresher(Client(), cache, now=lambda: datetime(2026, 8, 18, tzinfo=timezone.utc))
+        service = CalendarRefreshService(refresher, lambda: ("calendar",), interval_seconds=900)
+        service.start()
+        assert entered.wait(1)
+        started = time.monotonic()
+        assert not service.stop(0.05)
+        assert time.monotonic() - started < 0.2 and service._stop.is_set()
+        release.set()
+        assert service.stop(1)
+
+
+def test_service_stop_shares_one_timeout_budget_between_gate_and_join():
+    class Refresher:
+        def __init__(self): self.timeout = None
+        def request_cancel(self, cancel, timeout): self.timeout = timeout; cancel.set(); return False
+
+    class Thread:
+        def __init__(self): self.timeout = None
+        def join(self, timeout): self.timeout = timeout
+        def is_alive(self): return True
+
+    refresher, thread = Refresher(), Thread()
+    service = CalendarRefreshService(refresher, lambda: ())
+    service._thread = thread
+    with patch("meeting_recorder.calendar_service.time.monotonic", side_effect=(100.0, 100.0, 100.4)):
+        assert not service.stop(1)
+    assert refresher.timeout == 1.0 and 0.59 < thread.timeout < 0.61

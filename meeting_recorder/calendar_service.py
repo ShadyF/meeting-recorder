@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Callable
 
 from .calendar_refresh import CalendarRefresher
@@ -36,8 +37,11 @@ class CalendarRefreshService:
                 return
 
     def stop(self, timeout: float) -> bool:
-        self._refresher.request_cancel(self._stop)
+        deadline = time.monotonic() + max(0.0, timeout)
+
+        # Spend the shutdown budget once across commit synchronization and thread joining.
+        settled = self._refresher.request_cancel(self._stop, max(0.0, deadline - time.monotonic()))
         if self._thread is None:
-            return True
-        self._thread.join(timeout)
-        return not self._thread.is_alive()
+            return settled
+        self._thread.join(max(0.0, deadline - time.monotonic()))
+        return settled and not self._thread.is_alive()
