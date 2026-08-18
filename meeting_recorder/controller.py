@@ -52,6 +52,7 @@ class Controller:
         # Called with the saved Path (or None) once a recording is fully
         # finalized. `record` uses it to know when it can exit.
         self.on_finished: Callable[[CompletedRecording | None], None] | None = None
+        self.on_manual_cancelled: Callable[[], None] | None = None
 
     # -- called by `record` (no detector involved) --------------------------
     def start_manual(self, app_name: str = "Manual") -> None:
@@ -237,10 +238,21 @@ class Controller:
         except Exception:
             # Blocking here is the non-GLib fallback, but completion still goes
             # through the same exactly-once dispatch path as timer polling.
-            self._dispatch_handle(handle, handle.wait())
+            try:
+                completed = handle.wait()
+            except Exception:
+                LOG.exception("Could not wait for recording finalization")
+                completed = handle.abort()
+            self._dispatch_handle(handle, completed)
 
     def _poll_handle(self, handle: FinalizationHandle) -> bool:
-        done, completed = handle.poll()
+        try:
+            done, completed = handle.poll()
+        except Exception:
+            LOG.exception("Could not poll recording finalization")
+            completed = handle.abort()
+            self._dispatch_handle(handle, completed)
+            return False
         if not done:
             return True
         self._dispatch_handle(handle, completed)
@@ -330,8 +342,12 @@ class Controller:
     def _on_widget_stop(self) -> None:
         if self.state is State.RECORDING:
             LOG.info("User stopped recording from the widget")
-            self._finish_recording()
+            started = self._finish_recording()
             self.state = State.IDLE
+            # A portal request has no recording handle or completion callback;
+            # tell the manual CLI to leave its loop after cancelling it.
+            if self._manual and not started and self.on_manual_cancelled:
+                self.on_manual_cancelled()
 
     def _close_widget(self) -> None:
         if self._timer_source is not None:
@@ -357,5 +373,5 @@ class Controller:
                 completed = handle.wait()
             except Exception:
                 LOG.exception("Could not wait for recording finalization")
-                completed = None
+                completed = handle.abort()
             self._dispatch_handle(handle, completed)

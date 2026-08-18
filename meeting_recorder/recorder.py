@@ -411,7 +411,7 @@ def build_finalize_cmd(cfg: Config, listfile: Path, dest: Path,
 
 
 @dataclass(frozen=True)
-class _FinalizationSnapshot:
+class FinalizationSnapshot:
     """Metadata that must remain bound to its detached finalization run."""
 
     target: Path | None
@@ -427,7 +427,7 @@ class FinalizationHandle:
     """Owns one detached finalization process and its immutable run snapshot."""
 
     def __init__(self, proc: subprocess.Popen[Any] | None,
-                 snapshot: _FinalizationSnapshot, parts: list[Path],
+                 snapshot: FinalizationSnapshot, parts: list[Path],
                  listfile: Path | None) -> None:
         self._proc = proc
         self._snapshot = snapshot
@@ -482,6 +482,25 @@ class FinalizationHandle:
             self._proc.wait()
             return self._finish(False)[1]
         return self._finish(self._proc.returncode == 0)[1]
+
+    def abort(self) -> CompletedRecording | None:
+        """Terminate a broken finalizer and release its per-run temporary files."""
+        if self._complete:
+            return self._result
+
+        proc = self._proc
+        try:
+            if proc is not None:
+                # A polling wrapper can fail even while its child remains alive.
+                # Kill first so cleanup does not leave the encoder running.
+                proc.kill()
+                proc.wait(timeout=5)
+        except Exception:
+            LOG.exception("Could not abort recording finalization")
+        finally:
+            # Cleanup must not depend on a misbehaving process wrapper.
+            self._finish(False)
+        return self._result
 
 
 class Recorder:
@@ -557,6 +576,8 @@ class Recorder:
         self._paused = False
         if not self._start_segment():
             self._paused = True
+            LOG.error("Recording could not resume")
+            return
         LOG.info("Recording resumed")
 
     def stop(self, discard: bool = False, trim_end: float = 0.0) -> FinalizationHandle | None:
@@ -581,8 +602,8 @@ class Recorder:
         requested = self._requested_capture_mode or CaptureMode.AUDIO_ONLY
         has_audio = bool(self.cfg.record_mic or self.cfg.record_system_audio)
         has_video = bool(self._has_video)
-        snapshot = _FinalizationSnapshot(final, source_app, requested, has_audio,
-                                         has_video, started, ended)
+        snapshot = FinalizationSnapshot(final, source_app, requested, has_audio,
+                                        has_video, started, ended)
         self._reset_active()
 
         usable_parts = [p for p in all_parts if p.exists() and p.stat().st_size > 0]
@@ -744,14 +765,14 @@ class Recorder:
             self._fifo.unlink(missing_ok=True)
             self._fifo = None
 
-    def _failed_finalization(self, snapshot: _FinalizationSnapshot,
+    def _failed_finalization(self, snapshot: FinalizationSnapshot,
                              parts: list[Path], listfile: Path | None = None
                              ) -> FinalizationHandle:
         """Return one already-complete failure handle which owns all cleanup."""
         return FinalizationHandle(None, snapshot, parts, listfile)
 
     def _start_finalize(self, input_parts: list[Path], cleanup_parts: list[Path],
-                        snapshot: _FinalizationSnapshot,
+                        snapshot: FinalizationSnapshot,
                         duration: float | None = None) -> FinalizationHandle:
         dest = snapshot.target
         assert dest is not None

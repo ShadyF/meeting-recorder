@@ -123,6 +123,9 @@ def _cmd_record(cfg) -> int:
     # Fires however the recording ends: Ctrl-C, or Stop on the tray/pill.
     controller.on_finished = _on_finished
 
+    # Portal cancellation has no detached finalization handle to complete.
+    controller.on_manual_cancelled = loop.quit
+
     def _stop(*_a):
         # A second Ctrl-C, or one during the post-save wait for the
         # notification, means "just leave" — there is nothing left to finalize.

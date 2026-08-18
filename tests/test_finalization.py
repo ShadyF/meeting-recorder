@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from meeting_recorder.domain import CaptureMode, CompletedRecording
-from meeting_recorder.recorder import FinalizationHandle, _FinalizationSnapshot
+from meeting_recorder.recorder import FinalizationHandle, FinalizationSnapshot
 
 
 class _Proc:
@@ -29,9 +29,9 @@ class _Proc:
 
 
 def _snapshot(path: Path, app: str = "A", mode: CaptureMode = CaptureMode.AUDIO_VIDEO,
-              video: bool = True) -> _FinalizationSnapshot:
+              video: bool = True) -> FinalizationSnapshot:
     now = datetime.now(timezone.utc)
-    return _FinalizationSnapshot(path, app, mode, True, video, now, now)
+    return FinalizationSnapshot(path, app, mode, True, video, now, now)
 
 
 def test_completed_recording_is_frozen_and_validates_timestamps() -> None:

@@ -163,8 +163,89 @@ def test_controller_shutdown_drains_all_handles_after_one_wait_failure() -> None
                 raise RuntimeError("timeout")
             return None
 
+        def abort(self):
+            return None
+
     controller = Controller(load_config(), _Notifier(), _FailingRecorder())
     first, second = Handle(True), Handle(False)
     controller._handles.update((first, second))
     controller.shutdown()
     assert first.waited == second.waited == 1 and not controller._handles
+
+
+def test_poll_exception_aborts_finalizer_cleans_and_dispatches_once() -> None:
+    from meeting_recorder.recorder import FinalizationHandle, FinalizationSnapshot
+
+    class Proc:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.killed = 0
+
+        def poll(self):
+            raise RuntimeError("poll failed")
+
+        def kill(self) -> None:
+            self.killed += 1
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        part, listfile = root / ".part", root / ".list"
+        part.write_bytes(b"part")
+        listfile.write_text("part")
+        now = datetime.now(timezone.utc)
+        proc = Proc()
+        handle = FinalizationHandle(
+            proc, FinalizationSnapshot(root / "result.mkv", "Manual",
+                                       CaptureMode.AUDIO_ONLY, True, False, now, now),
+            [part], listfile)
+        controller = Controller(load_config(), _Notifier(), _FailingRecorder())
+        controller._handles.add(handle)
+        seen = []
+        controller.on_finished = seen.append
+        assert not controller._poll_handle(handle)
+        assert proc.killed == 1 and not part.exists() and not listfile.exists()
+        assert seen == [None] and not controller._handles
+
+
+def test_shutdown_wait_exception_aborts_reaps_and_cleans_handle() -> None:
+    from meeting_recorder.recorder import FinalizationHandle, FinalizationSnapshot
+
+    class Proc:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.killed = 0
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            if self.killed:
+                return -9
+            raise RuntimeError("wait failed")
+
+        def kill(self) -> None:
+            self.killed += 1
+            self.returncode = -9
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        part, listfile = root / ".part", root / ".list"
+        part.write_bytes(b"part")
+        listfile.write_text("part")
+        now = datetime.now(timezone.utc)
+        proc = Proc()
+        handle = FinalizationHandle(
+            proc, FinalizationSnapshot(root / "result.mkv", "Manual",
+                                       CaptureMode.AUDIO_ONLY, True, False, now, now),
+            [part], listfile)
+        controller = Controller(load_config(), _Notifier(), _FailingRecorder())
+        controller._handles.add(handle)
+        controller.shutdown()
+        assert proc.killed == 1 and not part.exists() and not listfile.exists()
+        assert not controller._handles

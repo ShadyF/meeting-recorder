@@ -403,7 +403,7 @@ def test_finalize_drops_video_when_none_was_captured():
     try:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
-        snapshot = rec._FinalizationSnapshot(
+        snapshot = rec.FinalizationSnapshot(
             Path("/tmp/a.mkv"), "Meeting", CaptureMode.AUDIO_ONLY, True, False, now, now)
         r._start_finalize([Path("/tmp/.a.part0.mkv")], [Path("/tmp/.a.part0.mkv")],
                           snapshot)
