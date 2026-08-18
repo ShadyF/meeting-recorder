@@ -241,7 +241,27 @@ def _cmd_settings(_cfg) -> int:
     return run()
 
 
-def main(argv: list[str] | None = None) -> int:
+def _cmd_calendar(cfg, action: str) -> int:
+    """Run the isolated Calendar credential command without starting recording."""
+    from .calendar_oauth import CalendarError, CalendarOAuth
+
+    oauth = CalendarOAuth(cfg)
+    try:
+        if action == "connect":
+            oauth.connect()
+            print("Calendar: connected")
+            return 0
+        result = oauth.status() if action == "status" else oauth.disconnect()
+    except CalendarError as exc:
+        print(f"Calendar: misconfigured ({exc})", file=sys.stderr)
+        return 1
+    detail = f" ({result.detail})" if result.detail else ""
+    print(f"Calendar: {result.state}{detail}")
+    return result.exit_code
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command parser separately so the Calendar surface is testable."""
     # -v/--verbose accepted before OR after the subcommand via a shared parent.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-v", "--verbose", action="store_true")
@@ -264,12 +284,28 @@ def main(argv: list[str] | None = None) -> int:
         ("config", "create/print the user config file"),
     ):
         sub.add_parser(name, parents=[common], help=help_text)
+    calendar = sub.add_parser("calendar", parents=[common],
+                              help="manage Google Calendar credentials")
+    calendar_sub = calendar.add_subparsers(dest="calendar_command", required=True)
+    for name, help_text in (
+        ("connect", "authorize and securely store a Calendar refresh token"),
+        ("status", "validate the stored Calendar credential"),
+        ("disconnect", "revoke best-effort and remove local Calendar credentials"),
+    ):
+        calendar_sub.add_parser(name, parents=[common], help=help_text)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
 
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
     cfg = load_config()
 
     command = args.command or "run"
+    if command == "calendar":
+        return _cmd_calendar(cfg, args.calendar_command)
     handler = {
         "run": _cmd_run,
         "record": _cmd_record,

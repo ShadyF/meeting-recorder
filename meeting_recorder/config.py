@@ -57,6 +57,8 @@ class Config:
     stop_debounce_seconds: float
     poll_interval_seconds: float
     min_recording_seconds: float
+    google_calendar_client_id: str
+    google_calendar_loopback_port: Any
     allowlist: list[AllowEntry] = field(default_factory=list)
 
     @classmethod
@@ -87,6 +89,12 @@ class Config:
             stop_debounce_seconds=float(data["stop_debounce_seconds"]),
             poll_interval_seconds=float(data["poll_interval_seconds"]),
             min_recording_seconds=float(data["min_recording_seconds"]),
+            google_calendar_client_id=str(
+                os.environ.get("MEETING_RECORDER_GOOGLE_CLIENT_ID",
+                               data.get("google_calendar_client_id", ""))),
+            # Calendar commands validate this independently so a malformed
+            # optional setting never prevents normal recording startup.
+            google_calendar_loopback_port=data.get("google_calendar_loopback_port", 0),
             allowlist=allow,
         )
 

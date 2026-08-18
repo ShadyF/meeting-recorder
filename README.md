@@ -138,6 +138,7 @@ meeting-recorder settings   # settings window
 meeting-recorder run        # run the detector in the foreground
 meeting-recorder record     # record right now until Ctrl-C
 meeting-recorder config     # create/print the config file
+meeting-recorder calendar connect|status|disconnect  # manage Calendar credentials
 ```
 
 `start`/`stop`/`restart`/`logs` wrap `systemctl --user`, so you never need to
@@ -153,6 +154,31 @@ journalctl --user -u meeting-recorder -f
 > D-Bus session (notifications, tray icon). A system service runs as root with
 > none of those, so it must run in your session — hence `--user`, or just use the
 > wrapper commands above.
+
+### Optional Google Calendar connection
+
+Calendar support currently manages a secure Google OAuth connection only; it does not fetch,
+match, or synchronize calendar events. Create a **Desktop** OAuth client that you own in Google
+Cloud, enable the Google Calendar API, and put only its bare client ID (ending in
+`.apps.googleusercontent.com`) in `google_calendar_client_id`. Never put a client secret,
+downloaded credential JSON, authorization code, or token in the config.
+
+```bash
+meeting-recorder calendar connect
+meeting-recorder calendar status
+meeting-recorder calendar disconnect
+```
+
+`connect` starts a short-lived listener on `127.0.0.1`, opens your browser, and requests only
+Calendar-list and event read-only access. The refresh token is stored in your desktop's Secret
+Service, not in the config file, environment, recordings, or sidecars. `disconnect` tries to
+revoke it and always removes the local token and Calendar-only cache.
+
+The listener normally uses an OS-selected port. Set `google_calendar_loopback_port` to a fixed
+integer from 1 through 65535 only when a container, sandbox, or firewall requires it; that exact
+port must be reachable by the browser and available before consent opens. A running, unlocked
+Secret Service session is required for connect/status/disconnect; containers without a session
+D-Bus or secret backend report Calendar as misconfigured while recording continues normally.
 
 ## Configuration
 
@@ -178,6 +204,8 @@ The GUI covers everything, but the config file is
 | `start_debounce_seconds` / `stop_debounce_seconds` | How long audio must be present/absent before starting/stopping. Because muting releases the microphone, the stop delay is also the longest mute that won't end the recording — raise it if you mute for long stretches. The wait is trimmed off the saved file. |
 | `poll_interval_seconds` | How often capture streams are checked |
 | `min_recording_seconds` | Discard recordings shorter than this |
+| `google_calendar_client_id` | Optional bare user-owned Google Desktop OAuth client ID; no secret or credential JSON |
+| `google_calendar_loopback_port` | OAuth loopback port: `0` for an OS-selected port (default), or `1`--`65535` |
 | `allowlist` | `{"match": "<substring>", "app": "<Display Name>"}` rules |
 
 To watch another app, add an allowlist entry matching its process name:

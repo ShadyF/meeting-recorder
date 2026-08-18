@@ -61,3 +61,21 @@ def test_saving_config_omits_legacy_capture_mode():
         assert "capture_mode" not in saved
 
     _with_user_config({}, check)
+
+
+def test_google_client_environment_override_is_typed_only_and_not_saved():
+    previous = os.environ.get("MEETING_RECORDER_GOOGLE_CLIENT_ID")
+    os.environ["MEETING_RECORDER_GOOGLE_CLIENT_ID"] = "env.apps.googleusercontent.com"
+    try:
+        def check(path):
+            assert load_config().google_calendar_client_id == "env.apps.googleusercontent.com"
+            assert load_raw_config()["google_calendar_client_id"] == "file.apps.googleusercontent.com"
+            save_user_config(load_raw_config())
+            assert "env.apps.googleusercontent.com" not in path.read_text(encoding="utf-8")
+
+        _with_user_config({"google_calendar_client_id": "file.apps.googleusercontent.com"}, check)
+    finally:
+        if previous is None:
+            os.environ.pop("MEETING_RECORDER_GOOGLE_CLIENT_ID", None)
+        else:
+            os.environ["MEETING_RECORDER_GOOGLE_CLIENT_ID"] = previous

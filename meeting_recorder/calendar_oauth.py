@@ -1,0 +1,333 @@
+"""Bounded, headless Google Calendar OAuth credential management only."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any, Callable
+
+from .calendar_secrets import CalendarSecrets, SecretServiceError
+
+
+AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+REVOCATION_URL = "https://oauth2.googleapis.com/revoke"
+SCOPES = (
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+    "https://www.googleapis.com/auth/calendar.events.readonly",
+)
+_CLIENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.apps\.googleusercontent\.com$")
+_CALLBACK_PATH = "/oauth2/callback"
+
+
+class CalendarError(RuntimeError):
+    """Base class for Calendar credential management failures."""
+
+
+class CalendarConfigurationError(CalendarError):
+    """The local Calendar configuration or credential is unsafe or malformed."""
+
+
+class CalendarUnavailableError(CalendarError):
+    """A transient network problem prevented credential validation."""
+
+
+class CalendarExpiredError(CalendarError):
+    """Google definitively rejected a stored refresh token."""
+
+
+@dataclass(frozen=True)
+class CalendarStatus:
+    state: str
+    detail: str = ""
+    exit_code: int = 0
+
+
+def validate_client_id(client_id: Any) -> str:
+    """Accept only a bare Desktop OAuth client ID, never a secret or JSON blob."""
+    if not isinstance(client_id, str) or not _CLIENT_ID.fullmatch(client_id):
+        raise CalendarConfigurationError("Google Calendar client ID is malformed")
+    return client_id
+
+
+def validate_loopback_port(port: Any) -> int:
+    """Validate the explicit loopback listener port without coercing JSON types."""
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+        raise CalendarConfigurationError("Google Calendar loopback port must be 0 or 1..65535")
+    return port
+
+
+def create_pkce_verifier() -> str:
+    """Create an RFC 7636 verifier in the required 43--128 character range."""
+    return secrets.token_urlsafe(64)[:128]
+
+
+def pkce_challenge(verifier: str) -> str:
+    """Return the unpadded S256 challenge for an OAuth verifier."""
+    return base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+
+
+def build_authorization_url(client_id: str, redirect_uri: str, state: str,
+                            verifier: str) -> str:
+    """Build the installed-app authorization request with the exact least scopes."""
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+        "code_challenge": pkce_challenge(verifier),
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    return f"{AUTHORIZATION_URL}?{urllib.parse.urlencode(params)}"
+
+
+def parse_callback(target: str, expected_state: str) -> str:
+    """Validate a single callback without exposing its query values in errors."""
+    parsed = urllib.parse.urlsplit(target)
+    values = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    if parsed.path != _CALLBACK_PATH:
+        raise CalendarConfigurationError("OAuth callback used an unexpected path")
+    if "error" in values:
+        raise CalendarConfigurationError("Google denied or cancelled authorization")
+    codes = values.get("code", [])
+    states = values.get("state", [])
+    if len(codes) != 1 or len(states) != 1 or not codes[0] or not states[0]:
+        raise CalendarConfigurationError("OAuth callback must contain one code and state")
+    if not hmac.compare_digest(states[0], expected_state):
+        raise CalendarConfigurationError("OAuth callback state did not match")
+    return codes[0]
+
+
+def calendar_cache_path() -> Path:
+    """Return the dedicated Calendar cache subtree, never the recording output."""
+    base = os.environ.get("XDG_CACHE_HOME") or "~/.cache"
+    return Path(os.path.expanduser(base)) / "meeting-recorder" / "google-calendar"
+
+
+def clear_calendar_cache() -> None:
+    """Remove only Calendar's private cache subtree."""
+    shutil.rmtree(calendar_cache_path(), ignore_errors=True)
+
+
+def _post_form(url: str, data: dict[str, str], timeout: float) -> tuple[int, bytes]:
+    """POST form data with the standard library and no OAuth logging."""
+    request = urllib.request.Request(
+        url, data=urllib.parse.urlencode(data).encode("ascii"), method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
+        raise CalendarUnavailableError("Google validation is temporarily unavailable") from exc
+
+
+def _json_response(body: bytes) -> dict[str, Any]:
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CalendarConfigurationError("Google returned a malformed credential response") from exc
+    if not isinstance(data, dict):
+        raise CalendarConfigurationError("Google returned a malformed credential response")
+    return data
+
+
+def _required_scopes(data: dict[str, Any]) -> bool:
+    scopes = data.get("scope")
+    return isinstance(scopes, str) and set(SCOPES).issubset(scopes.split())
+
+
+class CalendarOAuth:
+    """OAuth workflow with injectable I/O for deterministic, network-free tests."""
+
+    def __init__(self, config: Any, *, secret_store: CalendarSecrets | None = None,
+                 post_form: Callable[[str, dict[str, str], float], tuple[int, bytes]] = _post_form,
+                 browser_open: Callable[[str], bool] = webbrowser.open,
+                 server_factory: Callable[..., HTTPServer] = HTTPServer,
+                 callback_timeout: float = 120, max_callback_requests: int = 3) -> None:
+        self.config = config
+        self.secrets = secret_store or CalendarSecrets()
+        self._post_form = post_form
+        self._browser_open = browser_open
+        self._server_factory = server_factory
+        self._callback_timeout = callback_timeout
+        self._max_callback_requests = max_callback_requests
+
+    def _configuration(self, *, require_client: bool = True) -> tuple[str | None, int]:
+        port = validate_loopback_port(self.config.google_calendar_loopback_port)
+        raw_client = self.config.google_calendar_client_id
+        if raw_client == "" and not require_client:
+            return None, port
+        if raw_client == "":
+            return None, port
+        return validate_client_id(raw_client), port
+
+    def _request_token(self, data: dict[str, str]) -> dict[str, Any]:
+        status, body = self._post_form(TOKEN_URL, data, 15)
+        if status >= 500:
+            raise CalendarUnavailableError("Google validation is temporarily unavailable")
+        response = _json_response(body)
+        if status >= 400:
+            error = response.get("error")
+            if error == "invalid_grant":
+                raise CalendarExpiredError("Google rejected the saved refresh token")
+            if error == "invalid_client":
+                raise CalendarConfigurationError("Google rejected the configured client")
+            raise CalendarConfigurationError("Google rejected the credential request")
+        return response
+
+    def _revoke(self, token: str) -> None:
+        """Try revocation without allowing cleanup to depend on the result."""
+        try:
+            self._post_form(REVOCATION_URL, {"token": token}, 10)
+        except Exception:
+            pass
+
+    def _wait_for_callback(self, server: HTTPServer, expected_state: str) -> str:
+        result: dict[str, str] = {}
+
+        class CallbackHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+                try:
+                    result["code"] = parse_callback(self.path, expected_state)
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"Authorization received. You may close this window.")
+                except CalendarConfigurationError as exc:
+                    result["error"] = str(exc)
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Authorization callback rejected.")
+
+            def log_message(self, format: str, *_args: Any) -> None:
+                # BaseHTTPRequestHandler would log callback query strings.
+                return
+
+        # Replace the temporary handler assigned at bind time before accepting.
+        server.RequestHandlerClass = CallbackHandler
+        deadline = time.monotonic() + self._callback_timeout
+        for _ in range(self._max_callback_requests):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            server.timeout = remaining
+            server.handle_request()
+            if "code" in result:
+                return result["code"]
+            if "error" in result:
+                raise CalendarConfigurationError(result["error"])
+        raise CalendarUnavailableError("OAuth callback timed out")
+
+    def connect(self) -> None:
+        """Complete authorization and store only a validated refresh token."""
+        client_id, port = self._configuration()
+        if client_id is None:
+            raise CalendarConfigurationError("Google Calendar client ID is not configured")
+
+        # Binding precedes browser launch so consent never targets a dead listener.
+        try:
+            server = self._server_factory(("127.0.0.1", port), BaseHTTPRequestHandler)
+        except OSError as exc:
+            raise CalendarUnavailableError(
+                "Could not bind the Google OAuth loopback listener") from exc
+        try:
+            actual_port = server.server_address[1]
+            redirect_uri = f"http://127.0.0.1:{actual_port}{_CALLBACK_PATH}"
+            verifier = create_pkce_verifier()
+            state = secrets.token_urlsafe(32)
+            url = build_authorization_url(client_id, redirect_uri, state, verifier)
+            if not self._browser_open(url):
+                raise CalendarUnavailableError("Could not open a browser for Google authorization")
+            code = self._wait_for_callback(server, state)
+        finally:
+            server.server_close()
+
+        response = self._request_token({
+            "code": code,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+            "code_verifier": verifier,
+        })
+        refresh_token = response.get("refresh_token")
+        if not isinstance(refresh_token, str) or not refresh_token or not _required_scopes(response):
+            raise CalendarConfigurationError("Google did not grant a usable Calendar refresh token")
+        try:
+            self.secrets.save(refresh_token)
+        except SecretServiceError:
+            self._revoke(refresh_token)
+            raise CalendarConfigurationError("Secret Service could not securely store the credential")
+
+    def status(self) -> CalendarStatus:
+        """Validate a stored credential without retaining response access tokens."""
+        try:
+            client_id, _port = self._configuration()
+        except CalendarConfigurationError as exc:
+            return CalendarStatus("misconfigured", str(exc), 1)
+        if client_id is None:
+            return CalendarStatus("disconnected")
+        try:
+            refresh_token = self.secrets.load()
+        except SecretServiceError as exc:
+            return CalendarStatus("misconfigured", str(exc), 1)
+        if refresh_token is None:
+            return CalendarStatus("disconnected")
+        try:
+            response = self._request_token({
+                "client_id": client_id,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            })
+            if not isinstance(response.get("access_token"), str) or not response["access_token"]:
+                raise CalendarConfigurationError("Google returned a malformed credential")
+            if not _required_scopes(response):
+                raise CalendarConfigurationError("Google did not grant the required Calendar scopes")
+        except CalendarExpiredError as exc:
+            return CalendarStatus("expired", str(exc), 1)
+        except CalendarUnavailableError:
+            # Keep the token for diagnosis; a transient outage is not revocation.
+            return CalendarStatus("misconfigured", "credential present but validation unavailable", 1)
+        except CalendarConfigurationError as exc:
+            return CalendarStatus("misconfigured", str(exc), 1)
+        return CalendarStatus("connected")
+
+    def disconnect(self) -> CalendarStatus:
+        """Revoke best-effort and always remove local Calendar-only data."""
+        token: str | None = None
+        clear_error: SecretServiceError | None = None
+        try:
+            token = self.secrets.load()
+        except SecretServiceError as exc:
+            clear_error = exc
+        try:
+            if token:
+                self._revoke(token)
+        finally:
+            try:
+                self.secrets.clear()
+            except SecretServiceError as exc:
+                clear_error = exc
+            clear_calendar_cache()
+        if clear_error:
+            return CalendarStatus("misconfigured", str(clear_error), 1)
+        return CalendarStatus("disconnected")

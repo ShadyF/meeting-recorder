@@ -22,6 +22,8 @@
   "stop_debounce_seconds": 3.0,
   "poll_interval_seconds": 1.0,
   "min_recording_seconds": 3.0,
+  "google_calendar_client_id": "",
+  "google_calendar_loopback_port": 0,
   "allowlist": [
     {"match": "zoom", "app": "Zoom"},
     {"match": "teams", "app": "Teams"},
