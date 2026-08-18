@@ -18,6 +18,7 @@ display, PulseAudio session and D-Bus session).
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import subprocess
 import sys
@@ -42,6 +43,12 @@ def _cmd_run(cfg) -> int:
     from .detector import MeetingDetector
     from .notifier import Notifier
     from .recorder import Recorder
+    from .calendar_cache import CalendarCache
+    from .calendar_google import GoogleCalendarClient
+    from .calendar_oauth import CalendarOAuth
+    from .calendar_refresh import CalendarRefresher
+    from .calendar_service import CalendarRefreshService
+    from .config import load_raw_config, validate_google_calendar_ids
 
     notifier = Notifier()
     recorder = Recorder(cfg)
@@ -58,8 +65,21 @@ def _cmd_run(cfg) -> int:
     interval_ms = max(250, int(cfg.poll_interval_seconds * 1000))
     GLib.timeout_add(interval_ms, detector.tick)
 
+    # Keep optional Calendar I/O off the GLib thread and reload selection each cycle.
+    def _selected_calendar_ids():
+        try:
+            return validate_google_calendar_ids(load_raw_config().get("google_calendar_ids", []))
+        except ValueError:
+            return ()
+
+    calendar_service = CalendarRefreshService(
+        CalendarRefresher(GoogleCalendarClient(CalendarOAuth(cfg).access_token), CalendarCache()),
+        _selected_calendar_ids)
+    calendar_service.start()
+
     def _shutdown(*_a):
         LOG.info("Shutting down")
+        calendar_service.stop(1)
         controller.shutdown()
         loop.quit()
         return False
@@ -241,14 +261,46 @@ def _cmd_settings(_cfg) -> int:
     return run()
 
 
-def _cmd_calendar(cfg, action: str) -> int:
+def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = False) -> int:
     """Run the isolated Calendar credential command without starting recording."""
     from .calendar_oauth import (
         CalendarAuthorizationDeniedError, CalendarError, CalendarOAuth,
     )
+    from .calendar_cache import CalendarCache
+    from .calendar_google import CalendarApiError, GoogleCalendarClient
+    from .calendar_refresh import CalendarRefresher
+    from .config import load_raw_config, save_google_calendar_ids, validate_google_calendar_ids
 
     oauth = CalendarOAuth(cfg)
     try:
+        selected = validate_google_calendar_ids(load_raw_config().get("google_calendar_ids", []))
+        if action == "select":
+            if clear:
+                save_google_calendar_ids([])
+                print("Calendar: selection cleared")
+                return 0
+            requested = validate_google_calendar_ids(ids or [])
+            if not requested:
+                raise CalendarError("select requires at least one --id or --clear")
+            available = {item.id for item in GoogleCalendarClient(oauth.access_token).list_calendars()}
+            if any(item not in available for item in requested):
+                raise CalendarError("one or more selected calendars are inaccessible")
+            save_google_calendar_ids(list(requested))
+            print("Calendar: selection saved")
+            return 0
+        if action == "list":
+            for item in GoogleCalendarClient(oauth.access_token).list_calendars():
+                marker = " selected" if item.id in selected else ""
+                print(f"{json.dumps(item.id)} {json.dumps(item.summary)}{marker}")
+            return 0
+        if action == "refresh":
+            if not selected:
+                print("Calendar: refresh complete (no calendars selected)")
+                return 0
+            report = CalendarRefresher(GoogleCalendarClient(oauth.access_token), CalendarCache()).refresh(selected)
+            for result in report.results:
+                print(f"Calendar: {json.dumps(result.calendar_id)} {'ok' if result.success else result.detail}")
+            return 0 if report.success else 1
         if action == "connect":
             oauth.connect()
             print("Calendar: connected")
@@ -257,7 +309,7 @@ def _cmd_calendar(cfg, action: str) -> int:
     except CalendarAuthorizationDeniedError:
         print("Calendar: authorization cancelled or denied", file=sys.stderr)
         return 1
-    except CalendarError as exc:
+    except (CalendarError, CalendarApiError, ValueError) as exc:
         print(f"Calendar: misconfigured ({exc})", file=sys.stderr)
         return 1
     detail = f" ({result.detail})" if result.detail else ""
@@ -298,6 +350,11 @@ def build_parser() -> argparse.ArgumentParser:
         ("disconnect", "revoke best-effort and remove local Calendar credentials"),
     ):
         calendar_sub.add_parser(name, parents=[common], help=help_text)
+    calendar_sub.add_parser("list", parents=[common], help="list accessible calendars")
+    select = calendar_sub.add_parser("select", parents=[common], help="select accessible calendars")
+    select.add_argument("--id", dest="calendar_ids", action="append", default=[])
+    select.add_argument("--clear", action="store_true")
+    calendar_sub.add_parser("refresh", parents=[common], help="refresh selected Calendar caches")
     return parser
 
 
@@ -310,7 +367,8 @@ def main(argv: list[str] | None = None) -> int:
 
     command = args.command or "run"
     if command == "calendar":
-        return _cmd_calendar(cfg, args.calendar_command)
+        return _cmd_calendar(cfg, args.calendar_command,
+                             getattr(args, "calendar_ids", None), getattr(args, "clear", False))
     handler = {
         "run": _cmd_run,
         "record": _cmd_record,

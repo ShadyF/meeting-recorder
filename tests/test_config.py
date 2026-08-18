@@ -6,7 +6,10 @@ import tempfile
 from pathlib import Path
 
 from meeting_recorder.calendar_oauth import CalendarOAuth
-from meeting_recorder.config import load_config, load_raw_config, save_user_config
+from meeting_recorder.config import (
+    load_config, load_raw_config, save_google_calendar_ids, save_user_config,
+    validate_google_calendar_ids,
+)
 from meeting_recorder.domain import VideoSource
 
 
@@ -174,3 +177,13 @@ def test_web_credential_document_is_scrubbed_while_unrelated_installed_value_sur
         assert json.loads(saved)["installed"] == {"layout": "unrelated"}
 
     _with_user_config({"web": downloaded, "installed": {"layout": "unrelated"}}, check)
+
+
+def test_google_calendar_ids_are_opaque_deduped_and_save_only_that_key():
+    assert validate_google_calendar_ids(["a/b", "a/b", "two"]) == ("a/b", "two")
+    def check(path):
+        save_google_calendar_ids(["first", "second"])
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["google_calendar_ids"] == ["first", "second"]
+        assert saved["future_setting"] == "kept"
+    _with_user_config({"future_setting": "kept"}, check)

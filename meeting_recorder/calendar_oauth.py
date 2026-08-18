@@ -388,6 +388,26 @@ class CalendarOAuth:
             return CalendarStatus("misconfigured", str(exc), 1)
         return CalendarStatus("connected")
 
+    def access_token(self) -> str:
+        """Return one transient refresh-grant access token without persisting it."""
+        client_id, _port = self._configuration()
+        if client_id is None:
+            raise CalendarConfigurationError("Google Calendar client ID is not configured")
+        try:
+            refresh_token = self.secrets.load()
+        except SecretServiceError as exc:
+            raise CalendarConfigurationError("Secret Service is unavailable or locked") from exc
+        if refresh_token is None:
+            raise CalendarConfigurationError("Google Calendar is disconnected")
+        response = self._request_token({"client_id": client_id, "refresh_token": refresh_token,
+                                        "grant_type": "refresh_token"})
+        token = response.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise CalendarConfigurationError("Google returned a malformed credential")
+        if "scope" in response and not _required_scopes(response):
+            raise CalendarConfigurationError("Google did not grant the required Calendar scopes")
+        return token
+
     def disconnect(self) -> CalendarStatus:
         """Revoke best-effort and always remove local Calendar-only data."""
         token: str | None = None

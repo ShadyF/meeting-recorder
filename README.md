@@ -167,6 +167,9 @@ downloaded credential JSON, authorization code, or token in the config.
 meeting-recorder calendar connect
 meeting-recorder calendar status
 meeting-recorder calendar disconnect
+meeting-recorder calendar list
+meeting-recorder calendar select --id "calendar-id"
+meeting-recorder calendar refresh
 ```
 
 `connect` starts a short-lived listener on `127.0.0.1`, opens your browser, and requests only
@@ -182,6 +185,11 @@ integer from 1 through 65535 only when a container, sandbox, or firewall require
 port must be reachable by the browser and available before consent opens. A running, unlocked
 Secret Service session is required for connect/status/disconnect; containers without a session
 D-Bus or secret backend report Calendar as misconfigured while recording continues normally.
+
+Select calendars explicitly with `calendar select`; Google Calendar's own selected flag is never
+used. Selected event snapshots are private, bounded to a recent offline window, and accepted for
+at most seven days. Refresh runs in the background every 15 minutes and can also be requested from
+the CLI. Calendar failures never delay or change recording.
 
 ## Configuration
 

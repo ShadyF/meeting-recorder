@@ -209,6 +209,29 @@ def save_user_config(data: dict[str, Any]) -> Path:
     return dest
 
 
+def validate_google_calendar_ids(value: object) -> tuple[str, ...]:
+    """Validate opaque Calendar IDs without interpreting their contents."""
+    if not isinstance(value, list) or len(value) > 50:
+        raise ValueError("google_calendar_ids must be a list of at most 50 IDs")
+    result: list[str] = []
+    seen: set[str] = set()
+    for calendar_id in value:
+        if not isinstance(calendar_id, str) or not calendar_id or len(calendar_id) > 1024:
+            raise ValueError("google_calendar_ids contains an invalid ID")
+        if calendar_id not in seen:
+            seen.add(calendar_id)
+            result.append(calendar_id)
+    return tuple(result)
+
+
+def save_google_calendar_ids(calendar_ids: object) -> Path:
+    """Persist only the validated Calendar selection while preserving user settings."""
+    selected = list(validate_google_calendar_ids(calendar_ids))
+    data = load_raw_config()
+    data["google_calendar_ids"] = selected
+    return save_user_config(data)
+
+
 def save_restore_token(token: str) -> None:
     """Persist the Wayland ScreenCast restore token, if it changed.
 

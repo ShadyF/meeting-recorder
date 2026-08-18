@@ -9,6 +9,8 @@ All notable changes to this project are documented here. Format follows
 ### Added
 - #19 adds bounded Google Calendar Desktop OAuth credential management with
   PKCE, Secret Service refresh-token storage, and `calendar connect|status|disconnect`.
+- #20 adds explicit Calendar selection, bounded private offline snapshots, and
+  background refresh independent from recording.
 
 ### Changed
 - Detected meetings now ask directly whether to record Video, Audio only, or
