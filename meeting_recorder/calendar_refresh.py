@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import Event
 from typing import Callable, Sequence
 
 from .calendar_cache import CalendarCache, CalendarSnapshot, calendar_operation_lock, snapshot_window
@@ -36,7 +37,7 @@ class CalendarRefresher:
         self.client, self.cache, self._now = client, cache, now
 
     def refresh(self, calendar_ids: Sequence[str], *, blocking: bool = False,
-                cancelled: Callable[[], bool] = lambda: False) -> CalendarRefreshReport:
+                cancel: Event | None = None) -> CalendarRefreshReport:
         if not calendar_ids:
             return CalendarRefreshReport(())
         now = self._now()
@@ -47,15 +48,16 @@ class CalendarRefresher:
             results = []
             for calendar_id in calendar_ids:
                 try:
-                    if cancelled():
+                    if cancel is not None and cancel.is_set():
                         raise CalendarRefreshCancelled()
-                    occurrences = self.client.list_occurrences(calendar_id, start, end)
-                    if cancelled():
+                    occurrences = self.client.list_occurrences(calendar_id, start, end, cancel=cancel)
+                    if cancel is not None and cancel.is_set():
                         raise CalendarRefreshCancelled()
                     self.cache.store(CalendarSnapshot(1, calendar_id, now, start, end, occurrences))
                     results.append(CalendarRefreshResult(calendar_id, True))
                 except CalendarRefreshCancelled:
                     results.append(CalendarRefreshResult(calendar_id, False, True, "cancelled"))
+                    break
                 except (CalendarApiError, OSError, ValueError):
                     results.append(CalendarRefreshResult(calendar_id, False, detail="unavailable"))
         return CalendarRefreshReport(tuple(results))

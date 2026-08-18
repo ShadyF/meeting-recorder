@@ -77,7 +77,13 @@ def _cmd_run(cfg) -> int:
         _selected_calendar_ids)
     calendar_service.start()
 
+    shutdown_complete = False
+
     def _shutdown(*_a):
+        nonlocal shutdown_complete
+        if shutdown_complete:
+            return False
+        shutdown_complete = True
         LOG.info("Shutting down")
         calendar_service.stop(1)
         controller.shutdown()
@@ -90,7 +96,10 @@ def _cmd_run(cfg) -> int:
     LOG.info("Smart Meeting Recorder %s running (polling every %.1fs). "
              "Watching for: %s", __version__, cfg.poll_interval_seconds,
              ", ".join(sorted({e.app for e in cfg.allowlist})))
-    loop.run()
+    try:
+        loop.run()
+    finally:
+        _shutdown()
     return 0
 
 
@@ -297,7 +306,8 @@ def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = 
             if not selected:
                 print("Calendar: refresh complete (no calendars selected)")
                 return 0
-            report = CalendarRefresher(GoogleCalendarClient(oauth.access_token), CalendarCache()).refresh(selected)
+            report = CalendarRefresher(GoogleCalendarClient(oauth.access_token), CalendarCache()).refresh(
+                selected, blocking=True)
             for result in report.results:
                 print(f"Calendar: {json.dumps(result.calendar_id)} {'ok' if result.success else result.detail}")
             return 0 if report.success else 1
@@ -309,7 +319,7 @@ def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = 
     except CalendarAuthorizationDeniedError:
         print("Calendar: authorization cancelled or denied", file=sys.stderr)
         return 1
-    except (CalendarError, CalendarApiError, ValueError) as exc:
+    except (CalendarError, CalendarApiError, OSError, ValueError) as exc:
         print(f"Calendar: misconfigured ({exc})", file=sys.stderr)
         return 1
     detail = f" ({result.detail})" if result.detail else ""
@@ -352,8 +362,9 @@ def build_parser() -> argparse.ArgumentParser:
         calendar_sub.add_parser(name, parents=[common], help=help_text)
     calendar_sub.add_parser("list", parents=[common], help="list accessible calendars")
     select = calendar_sub.add_parser("select", parents=[common], help="select accessible calendars")
-    select.add_argument("--id", dest="calendar_ids", action="append", default=[])
-    select.add_argument("--clear", action="store_true")
+    select_group = select.add_mutually_exclusive_group(required=True)
+    select_group.add_argument("--id", dest="calendar_ids", action="append", default=[])
+    select_group.add_argument("--clear", action="store_true")
     calendar_sub.add_parser("refresh", parents=[common], help="refresh selected Calendar caches")
     return parser
 

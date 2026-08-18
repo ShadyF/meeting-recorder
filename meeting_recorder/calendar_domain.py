@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 
 def _nonempty(value: object, name: str) -> str:
@@ -60,6 +60,17 @@ class OccurrenceKey:
         if self.original_start_utc is not None:
             _utc(self.original_start_utc, "original start")
 
+    @classmethod
+    def single(cls, calendar_id: str, event_id: str) -> "OccurrenceKey":
+        """Construct the identity for one non-recurring Calendar event."""
+        return cls(calendar_id, event_id)
+
+    @classmethod
+    def recurring(cls, calendar_id: str, series_id: str,
+                  original_start_utc: datetime) -> "OccurrenceKey":
+        """Construct the identity for one instance of a recurring series."""
+        return cls(calendar_id, series_id, original_start_utc)
+
 
 @dataclass(frozen=True)
 class CalendarOccurrence:
@@ -92,15 +103,11 @@ class CalendarMatch:
     real_overlap: timedelta
     scheduled_start_distance: timedelta
 
-
-def occurrence_key(calendar_id: str, event_id: str, recurring_event_id: str | None = None,
-                   original_start_utc: datetime | None = None) -> OccurrenceKey:
-    if recurring_event_id is None:
-        return OccurrenceKey(calendar_id, event_id)
-    _nonempty(recurring_event_id, "recurring event id")
-    if original_start_utc is None:
-        raise ValueError("recurrence requires original start")
-    return OccurrenceKey(calendar_id, recurring_event_id, original_start_utc)
+    def __post_init__(self) -> None:
+        if not isinstance(self.occurrence, CalendarOccurrence):
+            raise ValueError("match occurrence is invalid")
+        if self.real_overlap < timedelta() or self.scheduled_start_distance < timedelta():
+            raise ValueError("match scores are invalid")
 
 
 def is_event_eligible(*, all_day: bool, status: object, self_response_status: object) -> bool:
@@ -108,14 +115,13 @@ def is_event_eligible(*, all_day: bool, status: object, self_response_status: ob
     return not all_day and status in {"confirmed", "tentative"} and self_response_status != "declined"
 
 
-def normalize_participants(values: Iterable[CalendarParticipant | dict[str, object]]) -> tuple[CalendarParticipant, ...]:
+def normalize_participants(values: Iterable[CalendarParticipant | Mapping[str, object]]) -> tuple[CalendarParticipant, ...]:
     """Normalize explicit people while retaining name-only attendees deterministically."""
-    result: list[CalendarParticipant] = []
-    indexes: dict[str, int] = {}
+    by_identity: dict[str, CalendarParticipant] = {}
     for value in values:
         if isinstance(value, CalendarParticipant):
             email, name = value.email, value.display_name
-        elif isinstance(value, dict):
+        elif isinstance(value, Mapping):
             email = value.get("email")
             name = value.get("displayName", value.get("display_name"))
         else:
@@ -125,14 +131,19 @@ def normalize_participants(values: Iterable[CalendarParticipant | dict[str, obje
         if email is None and name is None:
             continue
         participant = CalendarParticipant(email, name)
-        identity = f"email:{email}" if email else f"name:{name.casefold()}"
-        prior = indexes.get(identity)
-        if prior is None:
-            indexes[identity] = len(result)
-            result.append(participant)
-        elif result[prior].display_name is None and participant.display_name is not None:
-            result[prior] = participant
-    return tuple(result)
+        identity = f"email:{email}" if email else f"name:{str(name).casefold()}"
+        previous = by_identity.get(identity)
+        if previous is None or _participant_order(participant) < _participant_order(previous):
+            by_identity[identity] = participant
+
+    # Sort after dedupe so equivalent attendee order produces one stable cache payload.
+    return tuple(sorted(by_identity.values(), key=_participant_order))
+
+
+def _participant_order(participant: CalendarParticipant) -> tuple[str, str, str]:
+    """Order normalized people without making private display spelling an identity."""
+    return (participant.email or "", (participant.display_name or "").casefold(),
+            participant.display_name or "")
 
 
 def match_occurrence(capture_start: datetime, capture_end: datetime,

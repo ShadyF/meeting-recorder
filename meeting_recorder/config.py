@@ -215,6 +215,7 @@ def save_user_config(data: dict[str, Any]) -> Path:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(temporary, dest)
+        _fsync_directory(dest.parent)
     finally:
         if descriptor != -1:
             os.close(descriptor)
@@ -223,6 +224,18 @@ def save_user_config(data: dict[str, Any]) -> Path:
         except FileNotFoundError:
             pass
     return dest
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort durability for a completed same-directory config rename."""
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
 
 
 def validate_google_calendar_ids(value: object) -> tuple[str, ...]:

@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
 from meeting_recorder.calendar_oauth import CalendarOAuth
@@ -187,3 +188,55 @@ def test_google_calendar_ids_are_opaque_deduped_and_save_only_that_key():
         assert saved["google_calendar_ids"] == ["first", "second"]
         assert saved["future_setting"] == "kept"
     _with_user_config({"future_setting": "kept"}, check)
+
+
+def test_google_calendar_id_validation_enforces_list_count_type_and_length_limits():
+    invalid = (None, "one", ["x"] * 51, [""], [1], ["x" * 1025])
+    for value in invalid:
+        try:
+            validate_google_calendar_ids(value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid ID selection accepted: {value!r}")
+
+
+def test_atomic_config_failures_preserve_complete_previous_selection_and_remove_temp_files():
+    def check(path):
+        original = {"future_setting": "old", "google_calendar_ids": ["prior"]}
+        path.write_text(json.dumps(original), encoding="utf-8")
+        with patch("meeting_recorder.config.os.replace", side_effect=OSError("replace failed")):
+            try:
+                save_user_config({"future_setting": "new", "google_calendar_ids": ["new"]})
+            except OSError:
+                pass
+            else:
+                raise AssertionError("replace failure was hidden")
+        assert json.loads(path.read_text(encoding="utf-8")) == original
+        assert not list(path.parent.glob(".config-*.tmp"))
+
+        with patch("meeting_recorder.config.os.fdopen", side_effect=OSError("write failed")):
+            try:
+                save_user_config({"google_calendar_ids": ["new"]})
+            except OSError:
+                pass
+            else:
+                raise AssertionError("write failure was hidden")
+        assert json.loads(path.read_text(encoding="utf-8")) == original
+        assert not list(path.parent.glob(".config-*.tmp"))
+
+    _with_user_config({}, check)
+
+
+def test_atomic_config_sets_private_mode_and_attempts_directory_fsync():
+    attempted = []
+
+    def check(path):
+        with patch("meeting_recorder.config._fsync_directory", side_effect=attempted.append):
+            save_user_config({"google_calendar_ids": ["one"]})
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert attempted == [path.parent]
+        assert not list(path.parent.glob(".config-*.tmp"))
+
+    import stat
+    _with_user_config({}, check)

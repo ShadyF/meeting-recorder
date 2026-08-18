@@ -354,9 +354,12 @@ class CalendarOAuth:
                 # Remove snapshots issued for a prior credential before committing the replacement.
                 self._cache_clear()
                 self.secrets.save(refresh_token)
-        except (SecretServiceError, OSError):
+        except OSError as exc:
             self._revoke(refresh_token)
-            raise CalendarConfigurationError("Secret Service could not securely store the credential")
+            raise CalendarConfigurationError("Calendar cache could not be cleared") from exc
+        except SecretServiceError as exc:
+            self._revoke(refresh_token)
+            raise CalendarConfigurationError("Secret Service could not securely store the credential") from exc
 
     def status(self) -> CalendarStatus:
         """Validate a stored credential without retaining response access tokens."""

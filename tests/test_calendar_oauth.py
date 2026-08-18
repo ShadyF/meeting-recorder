@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 from unittest.mock import patch
@@ -24,6 +25,9 @@ from meeting_recorder.calendar_oauth import (
     validate_loopback_port,
 )
 from meeting_recorder.calendar_secrets import SecretServiceError
+from meeting_recorder.calendar_cache import CalendarCache
+from meeting_recorder.calendar_google import CalendarApiError, GoogleCalendarClient
+from meeting_recorder.calendar_refresh import CalendarRefresher
 
 
 CLIENT = "12345-example.apps.googleusercontent.com"
@@ -446,3 +450,113 @@ def test_disconnect_reports_cache_cleanup_failure_after_attempting_secret_clear(
     assert result.state == "misconfigured"
     assert result.exit_code == 1
     assert store.cleared and store.token is None
+
+
+def test_reconnect_clears_prior_cache_before_saving_new_refresh_token_under_shared_operation():
+    events = []
+
+    class RecordingSecrets(_Secrets):
+        def save(self, token):
+            events.append(("save", token))
+            super().save(token)
+
+    server = _Server()
+    oauth = CalendarOAuth(_config(), secret_store=RecordingSecrets("old"), post_form=lambda *_: _response(),
+                          browser_open=lambda _url: True, server_factory=lambda *_: server,
+                          cache_clear=lambda: events.append(("cache", None)))
+    oauth._wait_for_callback = lambda _server, _state: "authorization-code"
+    oauth.connect()
+    assert events == [("cache", None), ("save", "new-refresh")]
+
+
+def test_connect_cache_clear_failure_revokes_new_token_without_saving_and_names_the_failure():
+    revoked = []
+    store = _Secrets()
+
+    def post(url, data, _timeout):
+        if "revoke" in url:
+            revoked.append(data)
+            return 200, b""
+        return _response()
+
+    oauth = CalendarOAuth(_config(), secret_store=store, post_form=post,
+                          browser_open=lambda _url: True, server_factory=lambda *_: _Server(),
+                          cache_clear=lambda: (_ for _ in ()).throw(OSError("read-only")))
+    oauth._wait_for_callback = lambda _server, _state: "authorization-code"
+    try:
+        oauth.connect()
+    except CalendarConfigurationError as exc:
+        assert "cache" in str(exc).lower()
+    else:
+        raise AssertionError("cache failure accepted a new credential")
+    assert store.token is None and revoked == [{"token": "new-refresh"}]
+
+
+def test_disconnect_clears_secret_before_cache_so_late_refresh_has_no_token_to_use():
+    events = []
+
+    class OrderedSecrets(_Secrets):
+        def clear(self):
+            events.append("secret")
+            super().clear()
+
+    store = OrderedSecrets("saved-refresh")
+    result = CalendarOAuth(_config(), secret_store=store,
+                           cache_clear=lambda: events.append("cache")).disconnect()
+    assert result.state == "disconnected" and events == ["secret", "cache"] and store.load() is None
+
+
+def test_shared_operation_lock_makes_disconnect_wait_for_an_active_refresh():
+    previous = os.environ.get("XDG_CACHE_HOME")
+    with tempfile.TemporaryDirectory() as temporary:
+        os.environ["XDG_CACHE_HOME"] = temporary
+        entered, release, complete = threading.Event(), threading.Event(), threading.Event()
+        events = []
+
+        class Client:
+            def list_occurrences(self, _calendar_id, _start, _end, *, cancel=None):
+                events.append("refresh")
+                entered.set()
+                release.wait()
+                return ()
+
+        store = _Secrets("saved-refresh")
+        oauth = CalendarOAuth(_config(client=""), secret_store=store,
+                              cache_clear=lambda: events.append("cache"))
+        refresh = threading.Thread(target=lambda: CalendarRefresher(
+            Client(), CalendarCache()).refresh(("calendar",), blocking=True))
+        disconnect = threading.Thread(target=lambda: (oauth.disconnect(), complete.set()))
+        refresh.start()
+        assert entered.wait(1)
+        disconnect.start()
+        assert not complete.is_set()
+        release.set()
+        refresh.join(1)
+        disconnect.join(1)
+        assert complete.is_set() and events == ["refresh", "cache"] and store.load() is None
+    if previous is None:
+        os.environ.pop("XDG_CACHE_HOME", None)
+    else:
+        os.environ["XDG_CACHE_HOME"] = previous
+
+
+def test_late_refresh_after_disconnect_cannot_store_without_a_remaining_token():
+    previous = os.environ.get("XDG_CACHE_HOME")
+    with tempfile.TemporaryDirectory() as temporary:
+        os.environ["XDG_CACHE_HOME"] = temporary
+        store, requests = _Secrets("saved-refresh"), []
+        CalendarOAuth(_config(client=""), secret_store=store, cache_clear=lambda: None).disconnect()
+
+        def access_token():
+            if store.load() is None:
+                raise CalendarApiError("credential missing", transient=False)
+            return "token"
+
+        client = GoogleCalendarClient(access_token, lambda *_args: requests.append(True))
+        cache = CalendarCache()
+        report = CalendarRefresher(client, cache).refresh(("calendar",), blocking=True)
+        assert not report.results[0].success and not requests and cache.load("calendar") is None
+    if previous is None:
+        os.environ.pop("XDG_CACHE_HOME", None)
+    else:
+        os.environ["XDG_CACHE_HOME"] = previous
