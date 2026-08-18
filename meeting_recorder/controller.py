@@ -189,7 +189,10 @@ class Controller:
         self._close_widget()
         if not self.recorder.is_recording:
             # The call ended while the portal dialog was still up.
+            pending_path = self._pending_path
             self._close_portal()
+            if pending_path is not None:
+                self._reserved_paths.discard(pending_path)
             return
         # min_recording_seconds exists to drop false-positive meeting detections;
         # a manual `record` was asked for explicitly, so it always saves.
