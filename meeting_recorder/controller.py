@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import enum
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .config import Config
 from .domain import CaptureMode, CompletedRecording
@@ -153,7 +153,7 @@ class Controller:
                            cursor_mode=(CURSOR_EMBEDDED if self.cfg.show_cursor
                                         else CURSOR_HIDDEN))
 
-    def _on_portal_ready(self, session) -> None:
+    def _on_portal_ready(self, session: Any) -> None:
         if self.state is not State.RECORDING or self._pending_path is None:
             session.close()  # the call ended while the dialog was still up
             return
@@ -185,6 +185,7 @@ class Controller:
             started = False
         if not started:
             self._reserved_paths.discard(path)
+            self._close_widget()
             self._close_portal()
             self.state = State.IDLE
             self._app = None
@@ -234,6 +235,8 @@ class Controller:
             from gi.repository import GLib
             GLib.timeout_add(1000, lambda: self._poll_handle(handle))
         except Exception:
+            # Blocking here is the non-GLib fallback, but completion still goes
+            # through the same exactly-once dispatch path as timer polling.
             self._dispatch_handle(handle, handle.wait())
 
     def _poll_handle(self, handle: FinalizationHandle) -> bool:
@@ -295,7 +298,7 @@ class Controller:
             LOG.debug("could not show recording controls", exc_info=True)
             self._widget = None
 
-    def _build_controls(self):
+    def _build_controls(self) -> Any | None:
         """Prefer the top-bar tray icon; fall back to the floating pill."""
         kwargs = dict(on_pause=self.recorder.pause,
                       on_resume=self.recorder.resume,
@@ -350,4 +353,9 @@ class Controller:
         if self.recorder.is_recording:
             self._finish_recording()
         for handle in list(self._handles):
-            self._dispatch_handle(handle, handle.wait())
+            try:
+                completed = handle.wait()
+            except Exception:
+                LOG.exception("Could not wait for recording finalization")
+                completed = None
+            self._dispatch_handle(handle, completed)

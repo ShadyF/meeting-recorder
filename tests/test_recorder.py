@@ -401,7 +401,12 @@ def test_finalize_drops_video_when_none_was_captured():
     orig_popen = rec.subprocess.Popen
     rec.subprocess.Popen = lambda *a, **k: None
     try:
-        r._start_finalize([Path("/tmp/.a.part0.mkv")], Path("/tmp/a.mkv"))
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        snapshot = rec._FinalizationSnapshot(
+            Path("/tmp/a.mkv"), "Meeting", CaptureMode.AUDIO_ONLY, True, False, now, now)
+        r._start_finalize([Path("/tmp/.a.part0.mkv")], [Path("/tmp/.a.part0.mkv")],
+                          snapshot)
     finally:
         rec.build_finalize_cmd = orig
         rec.subprocess.Popen = orig_popen

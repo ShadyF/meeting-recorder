@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -44,3 +44,11 @@ class CompletedRecording:
     has_video: bool
     capture_started_at: datetime
     capture_ended_at: datetime
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous capture times before they enter the immutable result."""
+        for timestamp in (self.capture_started_at, self.capture_ended_at):
+            if timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
+                raise ValueError("capture timestamps must be timezone-aware UTC")
+        if self.capture_ended_at < self.capture_started_at:
+            raise ValueError("capture end must not precede capture start")
