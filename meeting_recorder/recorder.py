@@ -385,7 +385,7 @@ def build_finalize_cmd(cfg: Config, listfile: Path, dest: Path,
     `duration` caps the output length — used to trim the tail that was recorded
     while the detector waited out its stop debounce.
     """
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-n",
            "-f", "concat", "-safe", "0", "-i", str(listfile)]
     if duration is not None and duration > 0:
         cmd += ["-t", f"{duration:.3f}"]

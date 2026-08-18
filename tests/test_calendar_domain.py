@@ -114,3 +114,25 @@ def test_meeting_snapshot_metadata_validation_and_selector_roundtrip_are_strict(
     _raises_value_error(lambda: MeetingSnapshot(key, "", NOW, NOW + timedelta(hours=1), (), None, None, False))
     _raises_value_error(lambda: MeetingSnapshot(key, None, NOW, NOW, (), None, None, False))
     _raises_value_error(lambda: decode_occurrence_selector("A" * 4097))
+
+
+def test_meeting_snapshot_visibility_requires_privacy_consistent_payloads():
+    key = OccurrenceKey.single("calendar", "event")
+    hidden_values = (
+        ("Secret", (), None, None),
+        (None, ("Alice",), None, None),
+        (None, (), "description", None),
+        (None, (), None, "location"),
+    )
+    for title, participants, description, location in hidden_values:
+        _raises_value_error(lambda title=title, participants=participants,
+                            description=description, location=location:
+                            MeetingSnapshot(key, title, NOW, NOW + timedelta(hours=1),
+                                            participants, description, location, False))
+
+    visible = MeetingSnapshot(key, "  Review  ", NOW, NOW + timedelta(hours=1),
+                              (), None, None, True)
+    assert visible.title == "Review"
+    hidden = MeetingSnapshot(key, None, NOW, NOW + timedelta(hours=1),
+                             (), None, None, False)
+    assert hidden.title is None and not hidden.details_visible

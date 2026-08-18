@@ -10,6 +10,7 @@ import stat
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
@@ -88,6 +89,8 @@ def _sidecar_for(media: Path) -> Path:
 def _available(path: Path, source: Path | None) -> bool:
     if source is not None and path == source:
         return False
+    if is_live_reserved(path):
+        return True
     if os.path.lexists(path):
         return True
     sidecar = _sidecar_for(path)
@@ -102,14 +105,85 @@ def collision_safe_path(preferred: Path | str, source: Path | str | None = None)
     source_path = Path(source) if source is not None else None
     if not _available(candidate, source_path):
         return candidate
-    suffixes = "".join(candidate.suffixes)
-    stem = candidate.name[:-len(suffixes)] if suffixes else candidate.name
+    suffix = candidate.suffix
+    stem = candidate.name[:-len(suffix)] if suffix else candidate.name
     number = 2
     while True:
-        candidate = candidate.with_name(f"{stem}-{number}{suffixes}")
+        candidate = candidate.with_name(f"{stem}-{number}{suffix}")
         if not _available(candidate, source_path):
             return candidate
         number += 1
+
+
+def _reservation_path(path: Path | str) -> Path:
+    canonical = os.path.realpath(Path(path))
+    cache_home = Path(os.path.expanduser(os.environ.get("XDG_CACHE_HOME") or "~/.cache"))
+    root = cache_home / "meeting-recorder" / "recording-path-reservations"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return root / f"{key}.lock"
+
+
+@dataclass
+class RecordingPathReservation:
+    """An advisory cross-process reservation held by an open flock descriptor."""
+
+    path: Path
+    _descriptor: int
+
+    def release(self) -> None:
+        """Release this reservation exactly once; crash closes the flock too."""
+        descriptor, self._descriptor = self._descriptor, -1
+        if descriptor == -1:
+            return
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def __enter__(self) -> "RecordingPathReservation":
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.release()
+
+
+def reserve_recording_path(path: Path | str) -> RecordingPathReservation:
+    """Reserve a canonical destination until the returned handle is released."""
+    destination = Path(path)
+    marker = _reservation_path(destination)
+    descriptor = os.open(marker, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(descriptor)
+        raise FileExistsError(destination) from exc
+    if os.path.lexists(destination):
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        raise FileExistsError(destination)
+    return RecordingPathReservation(destination, descriptor)
+
+
+def release_recording_path(reservation: RecordingPathReservation) -> None:
+    """Canonical idempotent release operation for a recording reservation."""
+    if not isinstance(reservation, RecordingPathReservation):
+        raise TypeError("recording reservation is invalid")
+    reservation.release()
+
+
+def is_live_reserved(path: Path | str) -> bool:
+    """Return whether another process currently holds the destination lock."""
+    descriptor = os.open(_reservation_path(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -123,6 +197,11 @@ def _fsync_directory(directory: Path) -> None:
         if exc.errno in {errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
             return
         raise
+
+
+def fsync_recording_directory(directory: Path | str) -> None:
+    """Durably publish a recording-directory namespace change."""
+    _fsync_directory(Path(directory))
 
 
 def move_regular_file_no_replace(source: Path | str, destination: Path | str) -> Path:
@@ -142,7 +221,10 @@ def move_regular_file_no_replace(source: Path | str, destination: Path | str) ->
     if source_info.st_dev != parent_info.st_dev or parent_info.st_dev != destination_parent_info.st_dev:
         raise OSError(errno.EXDEV, "source and destination are on different devices")
 
-    os.link(source_path, destination_path, follow_symlinks=False)
+    try:
+        os.link(source_path, destination_path, follow_symlinks=False)
+    except OSError as exc:
+        raise MovePrecommitError(source_path, destination_path) from exc
     linked = False
     source_removed = False
     try:
@@ -151,11 +233,11 @@ def move_regular_file_no_replace(source: Path | str, destination: Path | str) ->
                   and destination_info.st_dev == source_info.st_dev
                   and destination_info.st_ino == source_info.st_ino)
         if not linked:
-            raise OSError("linked destination could not be verified")
+            raise MovePrecommitError(source_path, destination_path)
         try:
             os.unlink(source_path)
             source_removed = True
-        except Exception:
+        except Exception as exc:
             # Roll back only a destination still verified to be our hard link.
             try:
                 rollback = os.lstat(destination_path)
@@ -166,8 +248,11 @@ def move_regular_file_no_replace(source: Path | str, destination: Path | str) ->
                     _fsync_directory(source_path.parent)
             except Exception as rollback_error:
                 LOG.error("Could not roll back recording move: %s", type(rollback_error).__name__)
-            raise
-        _fsync_directory(source_path.parent)
+            raise MovePrecommitError(source_path, destination_path) from exc
+        try:
+            _fsync_directory(source_path.parent)
+        except Exception as exc:
+            raise MoveCommittedError(destination_path) from exc
         return destination_path
     except Exception:
         if linked and not source_removed and os.path.lexists(destination_path):
@@ -181,6 +266,23 @@ def move_regular_file_no_replace(source: Path | str, destination: Path | str) ->
                 LOG.error("Could not clean up failed recording move: %s",
                           type(rollback_error).__name__)
         raise
+
+
+class MovePrecommitError(OSError):
+    """A move failed before the source namespace entry was committed away."""
+
+    def __init__(self, source: Path, destination: Path) -> None:
+        super().__init__(errno.EIO, "recording move did not commit")
+        self.source = source
+        self.destination = destination
+
+
+class MoveCommittedError(OSError):
+    """The destination exists and is authoritative despite a post-move failure."""
+
+    def __init__(self, destination: Path) -> None:
+        super().__init__(errno.EIO, "recording move committed but directory sync failed")
+        self.destination = destination
 
 
 @contextmanager

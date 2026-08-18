@@ -122,7 +122,10 @@ def test_sidecar_load_and_replace_refuse_symlink_targets() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         target = sidecar_path(root / "capture.mkv")
-        target.symlink_to(root / "missing")
+        valid_target = root / "valid.meeting.json"
+        write_sidecar(valid_target, _sidecar("valid.mkv"))
+        original = valid_target.read_bytes()
+        target.symlink_to(valid_target)
         for operation in (lambda: load_sidecar(target),
                           lambda: write_sidecar(target, _sidecar())):
             try:
@@ -130,3 +133,27 @@ def test_sidecar_load_and_replace_refuse_symlink_targets() -> None:
                 assert False, "sidecar symlinks must be rejected"
             except (OSError, ValueError):
                 pass
+        assert valid_target.read_bytes() == original
+
+
+def test_sidecar_decode_enforces_private_visibility_invariants() -> None:
+    sidecar = encode_sidecar(_sidecar(meeting=_meeting()))
+    hidden = dict(sidecar)
+    hidden_meeting = dict(hidden["meeting"])
+    hidden_meeting.update({"details_visible": False, "title": "secret"})
+    hidden["meeting"] = hidden_meeting
+    try:
+        decode_sidecar(hidden)
+        assert False, "hidden sidecars must not carry visible title data"
+    except ValueError:
+        pass
+
+    visible = dict(sidecar)
+    visible_meeting = dict(visible["meeting"])
+    visible_meeting.update({"details_visible": True, "title": None})
+    visible["meeting"] = visible_meeting
+    try:
+        decode_sidecar(visible)
+        assert False, "visible sidecars require a title"
+    except ValueError:
+        pass

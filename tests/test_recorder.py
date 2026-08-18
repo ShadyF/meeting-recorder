@@ -269,6 +269,11 @@ def test_finalize_single_mic_track_gets_limiter():
     assert "-map [aout]" in joined
 
 
+def test_finalize_never_allows_ffmpeg_to_overwrite_reserved_target():
+    command = build_finalize_cmd(_cfg(), LIST, OUT, ["mic"])
+    assert "-n" in command and "-y" not in command
+
+
 def test_finalize_normalization_can_be_disabled():
     cmd = build_finalize_cmd(_cfg(record_screen=True, mic_volume=2.0,
                                   system_volume=0.5, normalize_voice=False),

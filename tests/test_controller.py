@@ -208,6 +208,7 @@ def test_controller_enriches_before_releasing_reservation_and_dispatches_replace
     assert notifier.paths == [enriched_path.name]
     assert callback == [replace(original, path=enriched_path)]
     assert original.path == handle.target_path
+    assert not controller._reserved_paths and not controller._reservations
     assert not controller._reserved_paths and not controller._handles
 
 

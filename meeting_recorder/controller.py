@@ -23,6 +23,9 @@ from .config import Config
 from .domain import CaptureMode, CompletedRecording
 from .notifier import Notifier
 from .recorder import FinalizationHandle, Recorder
+from .recording_paths import (RecordingPathReservation, collision_safe_path,
+                               recording_directory_lock, release_recording_path,
+                               reserve_recording_path)
 from .utils import LOG, build_output_path, open_folder
 
 
@@ -49,6 +52,8 @@ class Controller:
         self._pending_capture_mode: CaptureMode | None = None
         self._handles: set[FinalizationHandle] = set()
         self._reserved_paths: set[Path] = set()
+        self._reservations: dict[Path, RecordingPathReservation] = {}
+        self._active_path: Path | None = None
         self._manual = False         # started by `record`, not by the detector
         self.recording_enricher = recording_enricher
         # Called with the saved Path (or None) once a recording is fully
@@ -122,23 +127,33 @@ class Controller:
         path = build_output_path(self.cfg.output_dir, self._app or "Meeting",
                                  self.cfg.container)
         path = self._reserve_path(path)
-        if capture_mode is None:
-            capture_mode = (CaptureMode.AUDIO_VIDEO if self.cfg.record_screen
-                            else CaptureMode.AUDIO_ONLY)
-        self.state = State.RECORDING
-        # Show the controls straight away, before any capture starts. On Wayland
-        # the portal handshake happens first and can take seconds (or stall on a
-        # dialog), and leaving the screen empty in the meantime reads as "Record
-        # did nothing" — the tray icon is the only feedback the user gets.
-        self._show_widget()
-        if self._needs_portal(capture_mode):
-            # Wayland: the compositor must hand us a stream before we can
-            # capture anything, and that handshake is asynchronous.
-            self._pending_path = path
-            self._pending_capture_mode = capture_mode
-            self._open_portal()
-            return
-        self._start_capture(path, capture_mode)
+        self._active_path = path
+        try:
+            if capture_mode is None:
+                capture_mode = (CaptureMode.AUDIO_VIDEO if self.cfg.record_screen
+                                else CaptureMode.AUDIO_ONLY)
+            self.state = State.RECORDING
+            # Show the controls straight away, before any capture starts. On Wayland
+            # the portal handshake happens first and can take seconds (or stall on a
+            # dialog), and leaving the screen empty in the meantime reads as "Record
+            # did nothing" — the tray icon is the only feedback the user gets.
+            self._show_widget()
+            if self._needs_portal(capture_mode):
+                # Wayland: the compositor must hand us a stream before we can
+                # capture anything, and that handshake is asynchronous.
+                self._pending_path = path
+                self._pending_capture_mode = capture_mode
+                self._open_portal()
+                return
+            self._start_capture(path, capture_mode)
+        except Exception:
+            LOG.exception("Recording setup failed")
+            self._release_path(path)
+            self._active_path = None
+            self._close_widget()
+            self._close_portal()
+            self.state = State.IDLE
+            self._app = None
 
     def _needs_portal(self, capture_mode: CaptureMode) -> bool:
         if capture_mode is CaptureMode.AUDIO_ONLY:
@@ -189,7 +204,8 @@ class Controller:
             LOG.exception("Recorder start failed")
             started = False
         if not started:
-            self._reserved_paths.discard(path)
+            self._release_path(path)
+            self._active_path = None
             self._close_widget()
             self._close_portal()
             self.state = State.IDLE
@@ -205,22 +221,45 @@ class Controller:
             pending_path = self._pending_path
             self._close_portal()
             if pending_path is not None:
-                self._reserved_paths.discard(pending_path)
+                self._release_path(pending_path)
+            elif self._active_path is not None:
+                self._release_path(self._active_path)
+            self._active_path = None
             return False
         # min_recording_seconds exists to drop false-positive meeting detections;
         # a manual `record` was asked for explicitly, so it always saves.
         too_short = (not self._manual and
                      self.recorder.elapsed() - trim_end < self.cfg.min_recording_seconds)
         if too_short:
-            handle = self.recorder.stop(discard=True)
+            try:
+                handle = self.recorder.stop(discard=True)
+            except Exception:
+                LOG.exception("Could not discard recording")
+                self._release_path(self._active_path)
+                self._active_path = None
+                self._close_portal()
+                return False
             self._close_portal()
             LOG.info("Discarded: call was shorter than min_recording_seconds")
             self._register_handle(handle)
+            if handle is None and self._active_path is not None:
+                self._release_path(self._active_path)
+                self._active_path = None
             return handle is not None
-        handle = self.recorder.stop(trim_end=trim_end)
+        try:
+            handle = self.recorder.stop(trim_end=trim_end)
+        except Exception:
+            LOG.exception("Could not stop recording")
+            self._release_path(self._active_path)
+            self._active_path = None
+            self._close_portal()
+            return False
         # After stop(): capture is torn down, so the portal stream is free to go.
         self._close_portal()
         self._register_handle(handle)
+        if handle is None and self._active_path is not None:
+            self._release_path(self._active_path)
+        self._active_path = None
         return handle is not None
 
     def _close_portal(self) -> None:
@@ -277,7 +316,7 @@ class Controller:
             except Exception:
                 LOG.exception("Recording enrichment failed; using the original result")
         self._handles.remove(handle)
-        self._reserved_paths.discard(handle.target_path)
+        self._release_path(handle.target_path)
         # These stay on screen until dismissed: "saved" is clickable (opening the
         # folder), and a failure needs to be seen.
         try:
@@ -301,12 +340,29 @@ class Controller:
                 LOG.exception("Recording completion callback failed")
 
     def _reserve_path(self, path: Path) -> Path:
-        candidate, number = path, 2
-        while candidate in self._reserved_paths or candidate.exists():
-            candidate = path.with_name(f"{path.stem}-{number}{path.suffix}")
-            number += 1
-        self._reserved_paths.add(candidate)
-        return candidate
+        with recording_directory_lock(path.parent):
+            candidate = collision_safe_path(path)
+            number = 2
+            while True:
+                while candidate in self._reserved_paths:
+                    candidate = path.with_name(f"{path.stem}-{number}{path.suffix}")
+                    number += 1
+                try:
+                    reservation = reserve_recording_path(candidate)
+                except FileExistsError:
+                    candidate = collision_safe_path(candidate)
+                    continue
+                self._reservations[candidate] = reservation
+                self._reserved_paths.add(candidate)
+                return candidate
+
+    def _release_path(self, path: Path | None) -> None:
+        if path is None:
+            return
+        reservation = self._reservations.pop(path, None)
+        self._reserved_paths.discard(path)
+        if reservation is not None:
+            release_recording_path(reservation)
 
     # -- recording controls (tray icon, or floating pill fallback) ---------
     def _show_widget(self) -> None:
@@ -377,10 +433,13 @@ class Controller:
     # -- shutdown ----------------------------------------------------------
     def shutdown(self) -> None:
         if self._pending_path is not None:
-            self._reserved_paths.discard(self._pending_path)
+            self._release_path(self._pending_path)
             self._close_portal()
         if self.recorder.is_recording:
             self._finish_recording()
+        elif self._active_path is not None:
+            self._release_path(self._active_path)
+            self._active_path = None
         for handle in list(self._handles):
             try:
                 completed = handle.wait()

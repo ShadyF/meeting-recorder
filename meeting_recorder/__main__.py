@@ -308,9 +308,20 @@ def _cmd_calendar_correct(cfg, recording: str, refresh: bool,
                           selector: str | None, clear: bool) -> int:
     from .calendar_domain import decode_occurrence_selector, meeting_snapshot
     from .recording_enrichment import (
+        CorrectionTransactionError,
         RecordingCorrectionService,
         cache_only_occurrence_provider,
     )
+
+    def report_failure(error: CorrectionTransactionError) -> int:
+        print(json.dumps({
+            "error": "calendar_correction_failed",
+            "current_path": str(error.outcome.current_path),
+            "partial": error.outcome.partial,
+            "committed": error.outcome.committed,
+            "error_code": error.outcome.error_code,
+        }, sort_keys=True), file=sys.stderr)
+        return 1
 
     if clear:
         service = RecordingCorrectionService(())
@@ -321,6 +332,8 @@ def _cmd_calendar_correct(cfg, recording: str, refresh: bool,
                 raise OSError("clear did not remove recording metadata")
             print(f"Recording: {'already clear' if before is None else final}")
             return 0
+        except CorrectionTransactionError as exc:
+            return report_failure(exc)
         except (OSError, ValueError):
             print("Calendar correction failed (invalid recording metadata).", file=sys.stderr)
             return 1
@@ -354,6 +367,8 @@ def _cmd_calendar_correct(cfg, recording: str, refresh: bool,
             raise OSError("selection was not committed")
         print(f"Recording: {final}")
         return 0
+    except CorrectionTransactionError as exc:
+        return report_failure(exc)
     except (OSError, ValueError):
         print("Calendar correction failed (invalid recording metadata).", file=sys.stderr)
         return 1

@@ -1,6 +1,7 @@
 """Recording filename, collision, lock, and no-replace move behavior."""
 
 import errno
+import multiprocessing
 import os
 import threading
 from datetime import datetime, timezone
@@ -12,8 +13,9 @@ import meeting_recorder.recording_paths as paths
 from meeting_recorder.calendar_domain import CalendarOccurrence, OccurrenceKey
 from meeting_recorder.meeting_sidecar import sidecar_path
 from meeting_recorder.recording_paths import (
-    collision_safe_path, move_regular_file_no_replace, recording_directory_lock,
-    sanitize_title, truncate_utf8, visible_recording_filename,
+    MoveCommittedError, MovePrecommitError, collision_safe_path,
+    is_live_reserved, move_regular_file_no_replace, recording_directory_lock,
+    reserve_recording_path, sanitize_title, truncate_utf8, visible_recording_filename,
 )
 
 
@@ -48,6 +50,41 @@ def test_collision_suffix_checks_media_sidecar_and_broken_symlink() -> None:
         broken = preferred.with_name(preferred.name[:-4] + "-3.mkv")
         broken.symlink_to(root / "missing")
         assert collision_safe_path(preferred).name.endswith("-4.mkv")
+
+
+def test_collision_suffix_is_before_only_the_actual_media_extension() -> None:
+    with TemporaryDirectory() as directory:
+        preferred = Path(directory) / "2026-01-01_00-00-00_Planning.v2.mkv"
+        preferred.write_bytes(b"existing")
+        assert collision_safe_path(preferred).name == (
+            "2026-01-01_00-00-00_Planning.v2-2.mkv")
+
+
+def test_cross_process_reservation_release_and_stale_marker_behavior() -> None:
+    with TemporaryDirectory() as directory, TemporaryDirectory() as cache:
+        original = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = cache
+        path = Path(directory) / "future.mkv"
+        try:
+            reservation = reserve_recording_path(path)
+            assert is_live_reserved(path)
+            try:
+                reserve_recording_path(path)
+                assert False, "a live reservation must be exclusive"
+            except FileExistsError:
+                pass
+            reservation.release()
+            reservation.release()
+            assert not is_live_reserved(path)
+            marker = next(Path(cache).rglob("*.lock"))
+            assert marker.exists(), "released marker is intentionally retained"
+            replacement = reserve_recording_path(path)
+            replacement.release()
+        finally:
+            if original is None:
+                os.environ.pop("XDG_CACHE_HOME", None)
+            else:
+                os.environ["XDG_CACHE_HOME"] = original
 
 
 def test_recording_directory_lock_is_private_and_releases_fd() -> None:
@@ -105,6 +142,13 @@ def stat_mode(path: Path) -> int:
     return os.stat(path).st_mode & 0o777
 
 
+def _hold_reservation(path: str, ready, release) -> None:
+    reservation = reserve_recording_path(path)
+    ready.set()
+    release.wait(2)
+    reservation.release()
+
+
 def test_move_regular_file_no_replace_and_rejects_cross_directory() -> None:
     with TemporaryDirectory() as first, TemporaryDirectory() as second:
         source = Path(first) / "recording.mkv"
@@ -131,6 +175,28 @@ def test_move_regular_file_no_replace_and_rejects_cross_directory() -> None:
         assert source.exists()
 
 
+def test_reservation_is_visible_across_processes_until_child_release() -> None:
+    with TemporaryDirectory() as directory, TemporaryDirectory() as cache:
+        original = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = cache
+        try:
+            path = Path(directory) / "child-reserved.mkv"
+            context = multiprocessing.get_context("fork")
+            ready, release = context.Event(), context.Event()
+            child = context.Process(target=_hold_reservation,
+                                    args=(str(path), ready, release))
+            child.start()
+            assert ready.wait(2) and is_live_reserved(path)
+            release.set()
+            child.join(2)
+            assert child.exitcode == 0 and not is_live_reserved(path)
+        finally:
+            if original is None:
+                os.environ.pop("XDG_CACHE_HOME", None)
+            else:
+                os.environ["XDG_CACHE_HOME"] = original
+
+
 def test_move_rolls_back_verified_hardlink_when_source_unlink_fails() -> None:
     with TemporaryDirectory() as directory:
         root = Path(directory)
@@ -155,3 +221,35 @@ def test_move_rolls_back_verified_hardlink_when_source_unlink_fails() -> None:
         finally:
             paths.os.unlink = original_unlink
         assert source.exists() and not destination.exists()
+
+
+def test_move_errors_identify_precommit_and_committed_namespace_states() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        source, destination = root / "source.mkv", root / "destination.mkv"
+        source.write_bytes(b"authoritative")
+        original_sync = paths._fsync_directory
+        paths._fsync_directory = lambda _path: (_ for _ in ()).throw(OSError("sync"))
+        try:
+            try:
+                move_regular_file_no_replace(source, destination)
+                assert False, "post-move sync failure must be typed"
+            except MoveCommittedError as error:
+                assert error.destination == destination
+        finally:
+            paths._fsync_directory = original_sync
+        assert destination.read_bytes() == b"authoritative" and not source.exists()
+
+        source.write_bytes(b"again")
+        original_unlink = paths.os.unlink
+        paths.os.unlink = lambda path, *args, **kwargs: (
+            (_ for _ in ()).throw(OSError("unlink")) if Path(path) == source
+            else original_unlink(path, *args, **kwargs))
+        try:
+            try:
+                move_regular_file_no_replace(source, root / "other.mkv")
+                assert False, "source unlink failure must be typed"
+            except MovePrecommitError as error:
+                assert error.source == source
+        finally:
+            paths.os.unlink = original_unlink

@@ -20,7 +20,10 @@ from .domain import CompletedRecording
 from .meeting_sidecar import MeetingSidecar, load_sidecar, remove_sidecar, sidecar_path, write_sidecar
 from .recording_paths import (
     collision_safe_path,
+    fsync_recording_directory,
     move_regular_file_no_replace,
+    MoveCommittedError,
+    MovePrecommitError,
     recording_directory_lock,
     visible_recording_path,
 )
@@ -168,6 +171,13 @@ class RecordingEnricher:
             intent = _sidecar_for(destination, fallback, snapshot,
                                   completed.capture_started_at, completed.capture_ended_at)
             source_metadata = sidecar_path(source)
+            original_metadata = None
+            if os.path.lexists(source_metadata):
+                try:
+                    original_metadata = load_sidecar(source_metadata)
+                except (OSError, ValueError) as exc:
+                    _safe_enrichment_error(exc)
+                    return completed
             try:
                 # Publish intent beside the authoritative media before changing its name.
                 write_sidecar(source_metadata, intent)
@@ -178,10 +188,26 @@ class RecordingEnricher:
                 return _replace_completed(completed, source, snapshot)
             try:
                 move_regular_file_no_replace(source, destination)
+            except MoveCommittedError as exc:
+                _safe_enrichment_error(exc)
+                return _replace_completed(completed, exc.destination, snapshot)
+            except MovePrecommitError as exc:
+                _safe_enrichment_error(exc)
+                try:
+                    if original_metadata is None:
+                        remove_sidecar(source_metadata)
+                    else:
+                        write_sidecar(source_metadata, original_metadata)
+                except Exception as repair_error:
+                    _safe_enrichment_error(repair_error)
+                return _replace_completed(completed, source, snapshot)
             except Exception as exc:
                 _safe_enrichment_error(exc)
                 try:
-                    write_sidecar(source_metadata, replace(intent, recording_filename=source.name))
+                    if original_metadata is None:
+                        remove_sidecar(source_metadata)
+                    else:
+                        write_sidecar(source_metadata, original_metadata)
                 except Exception as repair_error:
                     _safe_enrichment_error(repair_error)
                 return _replace_completed(completed, source, snapshot)
@@ -192,6 +218,26 @@ class RecordingEnricher:
                 _safe_enrichment_error(exc)
                 return _replace_completed(completed, destination, snapshot)
             return _replace_completed(completed, destination, snapshot)
+
+
+@dataclass(frozen=True)
+class CorrectionOutcome:
+    """Sanitized state returned with every failed correction transaction."""
+
+    operation: str
+    current_path: Path
+    success: bool
+    committed: bool
+    partial: bool
+    error_code: str
+
+
+class CorrectionTransactionError(ValueError):
+    """A correction failed and carries the only safe path/result to report."""
+
+    def __init__(self, outcome: CorrectionOutcome) -> None:
+        super().__init__(outcome.error_code)
+        self.outcome = outcome
 
 
 @dataclass(frozen=True)
@@ -218,7 +264,52 @@ class RecordingCorrectionService:
         self.occurrence_provider = occurrence_provider
         self.to_local = to_local or _to_local_default
 
-    def _discover_unlocked(self, media: Path) -> tuple[Path, MeetingSidecar] | None:
+    def _recover_duplicate_unlocked(
+            self, source: Path, sidecar_file: Path, sidecar: MeetingSidecar,
+            intended: Path) -> tuple[Path, Path, MeetingSidecar]:
+        """Finish a link-before-unlink crash only when both names share one inode."""
+        source_exists = os.path.lexists(source)
+        intended_exists = os.path.lexists(intended)
+        if source_exists:
+            _ensure_regular_media(source)
+        if intended_exists:
+            _ensure_regular_media(intended)
+        if source_exists and intended_exists:
+            source_info = os.stat(source, follow_symlinks=False)
+            intended_info = os.stat(intended, follow_symlinks=False)
+            if (source_info.st_dev, source_info.st_ino) != (intended_info.st_dev, intended_info.st_ino):
+                raise ValueError("duplicate recording names refer to different media")
+            os.unlink(source)
+            try:
+                fsync_recording_directory(source.parent)
+            except Exception as exc:
+                raise CorrectionTransactionError(CorrectionOutcome(
+                    "recover", intended, False, True, True, "media-directory-sync-failed")) from exc
+        elif source_exists:
+            # The destination was not published; the intent remains recoverable.
+            return source, sidecar_file, sidecar
+        elif not intended_exists:
+            raise FileNotFoundError(intended)
+
+        destination_sidecar = sidecar_path(intended)
+        if sidecar_file != destination_sidecar:
+            try:
+                if os.path.lexists(destination_sidecar):
+                    existing = load_sidecar(destination_sidecar)
+                    if existing.recording_filename != intended.name:
+                        raise ValueError("destination sidecar does not describe intended media")
+                    remove_sidecar(sidecar_file)
+                else:
+                    move_regular_file_no_replace(sidecar_file, destination_sidecar)
+            except Exception as exc:
+                raise CorrectionTransactionError(CorrectionOutcome(
+                    "recover", intended, False, True, True, "sidecar-relocation-failed")) from exc
+        recovered = load_sidecar(destination_sidecar)
+        if recovered.recording_filename != intended.name:
+            raise ValueError("recovered sidecar does not describe intended media")
+        return intended, destination_sidecar, recovered
+
+    def _discover_unlocked(self, media: Path) -> tuple[Path, Path, MeetingSidecar] | None:
         _ensure_regular_media(media)
         direct = sidecar_path(media)
         if os.path.lexists(direct):
@@ -226,7 +317,10 @@ class RecordingCorrectionService:
             if (sidecar.recording_filename != media.name
                     and sidecar.original_fallback_filename != media.name):
                 raise ValueError("direct sidecar does not describe this media")
-            return direct, sidecar
+            if sidecar.recording_filename != media.name:
+                return self._recover_duplicate_unlocked(
+                    media, direct, sidecar, media.with_name(sidecar.recording_filename))
+            return media, direct, sidecar
         candidates: list[tuple[Path, MeetingSidecar]] = []
         for candidate in sorted(media.parent.glob(f"*{'.meeting.json'}"), key=lambda item: item.name):
             try:
@@ -240,13 +334,19 @@ class RecordingCorrectionService:
                 candidates.append((candidate, sidecar))
         if len(candidates) > 1:
             raise ValueError("multiple sidecars describe this media")
-        return candidates[0] if candidates else None
+        if not candidates:
+            return None
+        candidate, sidecar = candidates[0]
+        old_name = candidate.name[:-len(".meeting.json")]
+        old_media = media.with_name(old_name)
+        return self._recover_duplicate_unlocked(media if old_media == media else old_media,
+                                                 candidate, sidecar, media)
 
     def discover(self, media: Path | str) -> MeetingSidecar | None:
         media_path = Path(media)
         with recording_directory_lock(media_path.parent):
             found = self._discover_unlocked(media_path)
-            return found[1] if found else None
+            return found[2] if found else None
 
     def _occurrences(self, supplied: Iterable[CalendarOccurrence] | None) -> tuple[CalendarOccurrence, ...]:
         return tuple(supplied) if supplied is not None else _provider_occurrences(self.occurrence_provider)
@@ -259,7 +359,7 @@ class RecordingCorrectionService:
             found = self._discover_unlocked(media_path)
             if found is None:
                 return ()
-            _, sidecar = found
+            _, _, sidecar = found
             capture_start, capture_end = sidecar.capture_started_at, sidecar.capture_ended_at
             current_key = sidecar.meeting.occurrence_key if sidecar.meeting else None
             nearby = []
@@ -292,32 +392,22 @@ class RecordingCorrectionService:
             found = self._discover_unlocked(media_path)
             if found is None:
                 return media_path
-            sidecar_file, sidecar = found
+            media_path, sidecar_file, sidecar = found
             try:
                 fallback = collision_safe_path(
                     media_path.with_name(sidecar.original_fallback_filename), media_path)
             except Exception as exc:
-                _safe_enrichment_error(exc)
-                return media_path
+                raise self._failure("clear", media_path, False, False,
+                                    "collision-selection-failed", exc) from exc
             intent = replace(sidecar, recording_filename=fallback.name, meeting=None)
-            moved = False
             try:
-                write_sidecar(sidecar_file, intent)
-                if fallback != media_path:
-                    move_regular_file_no_replace(media_path, fallback)
-                    moved = True
-                    remove_sidecar(sidecar_file)
-                else:
-                    remove_sidecar(sidecar_file)
-                return fallback
+                self._commit_clear(media_path, sidecar_file, sidecar, fallback, intent)
+            except CorrectionTransactionError:
+                raise
             except Exception as exc:
-                _safe_enrichment_error(exc)
-                if not moved:
-                    try:
-                        write_sidecar(sidecar_file, replace(intent, recording_filename=media_path.name))
-                    except Exception as repair_error:
-                        _safe_enrichment_error(repair_error)
-                return fallback if moved else media_path
+                raise self._failure("clear", media_path, False, False,
+                                    "precommit-failed", exc) from exc
+            return fallback
 
     def _change(self, media: Path | str, key: OccurrenceKey,
                 supplied: Iterable[CalendarOccurrence] | None) -> Path:
@@ -326,7 +416,7 @@ class RecordingCorrectionService:
             found = self._discover_unlocked(media_path)
             if found is None:
                 raise ValueError("recording sidecar is missing")
-            sidecar_file, sidecar = found
+            media_path, sidecar_file, sidecar = found
             matches = [item for item in self._occurrences(supplied) if item.key == key]
             if len(matches) != 1:
                 raise ValueError("selected occurrence is not in the supplied cache")
@@ -340,23 +430,106 @@ class RecordingCorrectionService:
                     destination = collision_safe_path(
                         media_path.with_name(sidecar.original_fallback_filename), media_path)
             except Exception as exc:
-                _safe_enrichment_error(exc)
-                return media_path
+                raise self._failure("select", media_path, False, False,
+                                    "collision-selection-failed", exc) from exc
             intent = replace(sidecar, recording_filename=destination.name,
                              meeting=_meeting_snapshot(occurrence))
-            moved = False
             try:
-                write_sidecar(sidecar_file, intent)
-                if destination != media_path:
-                    move_regular_file_no_replace(media_path, destination)
-                    moved = True
-                    _write_moved_sidecar(sidecar_file, sidecar_path(destination), intent)
-                return destination
+                self._commit_select(media_path, sidecar_file, sidecar, destination, intent)
+            except CorrectionTransactionError:
+                raise
             except Exception as exc:
-                _safe_enrichment_error(exc)
-                if not moved:
+                raise self._failure("select", media_path, False, False,
+                                    "precommit-failed", exc) from exc
+            return destination
+
+    @staticmethod
+    def _failure(operation: str, current_path: Path, committed: bool,
+                 partial: bool, error_code: str, cause: Exception) -> CorrectionTransactionError:
+        _safe_enrichment_error(cause)
+        return CorrectionTransactionError(CorrectionOutcome(
+            operation, current_path, False, committed, partial, error_code))
+
+    @staticmethod
+    def _restore_exact(sidecar_file: Path, original: MeetingSidecar) -> None:
+        write_sidecar(sidecar_file, original)
+
+    def _verify_select(self, source: Path, destination: Path,
+                       destination_sidecar: Path, intent: MeetingSidecar) -> None:
+        _ensure_regular_media(destination)
+        if source != destination and os.path.lexists(source):
+            raise ValueError("source media still exists after selection")
+        actual = load_sidecar(destination_sidecar)
+        if actual != intent:
+            raise ValueError("selection sidecar was not committed")
+
+    def _commit_select(self, source: Path, sidecar_file: Path,
+                       original: MeetingSidecar, destination: Path,
+                       intent: MeetingSidecar) -> None:
+        moved = False
+        try:
+            write_sidecar(sidecar_file, intent)
+            if destination != source:
+                move_regular_file_no_replace(source, destination)
+                moved = True
+                try:
+                    _write_moved_sidecar(sidecar_file, sidecar_path(destination), intent)
+                except Exception as exc:
+                    raise self._failure("select", destination, True, True,
+                                        "sidecar-relocation-failed", exc) from exc
+            self._verify_select(source, destination, sidecar_path(destination), intent)
+        except MoveCommittedError as exc:
+            raise self._failure("select", destination, True, True,
+                                "media-directory-sync-failed", exc) from exc
+        except CorrectionTransactionError:
+            raise
+        except Exception as exc:
+            if moved:
+                raise self._failure("select", destination, True, True,
+                                    "postcommit-failed", exc) from exc
+            try:
+                self._restore_exact(sidecar_file, original)
+            except Exception as repair_error:
+                _safe_enrichment_error(repair_error)
+            raise self._failure("select", source, False, False,
+                                "precommit-failed", exc) from exc
+
+    def _commit_clear(self, source: Path, sidecar_file: Path,
+                      original: MeetingSidecar, destination: Path,
+                      intent: MeetingSidecar) -> None:
+        moved = False
+        try:
+            write_sidecar(sidecar_file, intent)
+            if destination != source:
+                move_regular_file_no_replace(source, destination)
+                moved = True
+            try:
+                remove_sidecar(sidecar_file)
+            except Exception as exc:
+                if destination == source:
                     try:
-                        write_sidecar(sidecar_file, replace(intent, recording_filename=media_path.name))
+                        self._restore_exact(sidecar_file, original)
                     except Exception as repair_error:
                         _safe_enrichment_error(repair_error)
-                return destination if moved else media_path
+                    raise self._failure("clear", source, False, False,
+                                        "sidecar-removal-failed", exc) from exc
+                raise self._failure("clear", destination, True, True,
+                                    "sidecar-removal-failed", exc) from exc
+            _ensure_regular_media(destination)
+            if os.path.lexists(sidecar_path(destination)):
+                raise ValueError("clear sidecar still exists")
+        except MoveCommittedError as exc:
+            raise self._failure("clear", destination, True, True,
+                                "media-directory-sync-failed", exc) from exc
+        except CorrectionTransactionError:
+            raise
+        except Exception as exc:
+            if not moved:
+                try:
+                    self._restore_exact(sidecar_file, original)
+                except Exception as repair_error:
+                    _safe_enrichment_error(repair_error)
+                raise self._failure("clear", source, False, False,
+                                    "precommit-failed", exc) from exc
+            raise self._failure("clear", destination, True, True,
+                                "postcommit-failed", exc) from exc

@@ -11,7 +11,9 @@ from meeting_recorder.calendar_domain import (
 )
 from meeting_recorder.domain import CaptureMode, CompletedRecording
 from meeting_recorder.meeting_sidecar import MeetingSidecar, load_sidecar, sidecar_path, write_sidecar
-from meeting_recorder.recording_enrichment import RecordingCorrectionService, RecordingEnricher
+from meeting_recorder.recording_enrichment import (
+    CorrectionTransactionError, RecordingCorrectionService, RecordingEnricher,
+)
 
 
 NOW = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
@@ -221,3 +223,178 @@ def test_correction_clear_collision_keeps_media_authoritative() -> None:
         result = RecordingCorrectionService().clear(source)
         assert result.name == "original-2.mkv" and result.read_bytes() == b"recording"
         assert (root / "original.mkv").read_bytes() == b"other"
+
+
+def test_active_controller_reservation_forces_clear_collision_and_preserves_late_file() -> None:
+    from meeting_recorder.config import load_config
+    from meeting_recorder.controller import Controller
+    from meeting_recorder.recording_paths import move_regular_file_no_replace
+
+    class Notifier:
+        pass
+
+    with TemporaryDirectory() as directory, TemporaryDirectory() as cache:
+        import os
+        original_cache = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = cache
+        try:
+            root = Path(directory)
+            fallback = root / "fallback.mkv"
+            controller = Controller(load_config(), Notifier(), object())
+            reserved = controller._reserve_path(fallback)
+            source = root / "renamed.mkv"
+            _write_capture(source, fallback=fallback.name)
+            selected = RecordingCorrectionService().clear(source)
+            assert selected.name == "fallback-2.mkv"
+            assert selected.read_bytes() == b"recording"
+
+            # The finalizer can still publish its reserved target while correction
+            # has moved the cleared media to the reservation-safe collision name.
+            fallback.write_bytes(b"finalized")
+            assert fallback.read_bytes() == b"finalized"
+            assert selected.read_bytes() == b"recording"
+
+            # A foreign writer bypassing the reservation cannot replace the active target.
+            late_source = root / "late.mkv"
+            late_source.write_bytes(b"finalized")
+            late_target = root / "late-target.mkv"
+            late_target.write_bytes(b"foreign")
+            try:
+                move_regular_file_no_replace(late_source, late_target)
+                assert False, "a late foreign target must never be overwritten"
+            except FileExistsError:
+                pass
+            assert fallback.read_bytes() == b"finalized"
+            assert late_target.read_bytes() == b"foreign"
+            assert late_source.read_bytes() == b"finalized"
+        finally:
+            controller._release_path(reserved)
+            if original_cache is None:
+                os.environ.pop("XDG_CACHE_HOME", None)
+            else:
+                os.environ["XDG_CACHE_HOME"] = original_cache
+
+
+def test_correction_select_and_clear_restore_the_exact_sidecar_on_move_failure() -> None:
+    original_move = enrichment_module.move_regular_file_no_replace
+    try:
+        def fail_move(*_args, **_kwargs):
+            raise OSError("move failed")
+
+        enrichment_module.move_regular_file_no_replace = fail_move
+        for operation in ("visible", "hidden", "clear"):
+            with TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "capture.mkv"
+                original = MeetingSidecar(source.name, "fallback.mkv", NOW,
+                                          NOW + timedelta(minutes=30),
+                                          meeting_snapshot(_occurrence("original", "Original")))
+                source.write_bytes(b"recording")
+                write_sidecar(sidecar_path(source), original)
+                service = RecordingCorrectionService()
+                try:
+                    if operation == "visible":
+                        service.select(source, _occurrence("visible", "Visible").key,
+                                       [_occurrence("visible", "Visible")])
+                    elif operation == "hidden":
+                        hidden = _occurrence("hidden", None, visible=False)
+                        service.select(source, hidden.key, [hidden])
+                    else:
+                        service.clear(source)
+                    assert False, "failed correction must not report success"
+                except CorrectionTransactionError as error:
+                    assert error.outcome.current_path == source
+                assert source.exists()
+                assert load_sidecar(sidecar_path(source)) == original
+    finally:
+        enrichment_module.move_regular_file_no_replace = original_move
+
+
+def test_correction_postcommit_failures_expose_the_actual_media_path() -> None:
+    original_relocate = enrichment_module._write_moved_sidecar
+    try:
+        enrichment_module._write_moved_sidecar = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(OSError("relocation failed")))
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "capture.mkv"
+            _write_capture(source, fallback="fallback.mkv")
+            visible = _occurrence("visible", "Visible")
+            try:
+                RecordingCorrectionService([visible], lambda value: value).select(
+                    source, visible.key, [visible])
+                assert False, "post-move sidecar failure must not report success"
+            except CorrectionTransactionError as error:
+                assert error.outcome.partial and error.outcome.committed
+                assert error.outcome.current_path.exists()
+    finally:
+        enrichment_module._write_moved_sidecar = original_relocate
+
+
+def test_correction_clear_sidecar_removal_failure_keeps_moved_media_authoritative() -> None:
+    original_remove = enrichment_module.remove_sidecar
+    try:
+        enrichment_module.remove_sidecar = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(OSError("removal failed")))
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "renamed.mkv"
+            _write_capture(source, fallback="fallback.mkv")
+            try:
+                RecordingCorrectionService().clear(source)
+                assert False, "sidecar removal failure must not report success"
+            except CorrectionTransactionError as error:
+                assert error.outcome.partial and error.outcome.committed
+                assert error.outcome.current_path.exists()
+            assert not source.exists()
+    finally:
+        enrichment_module.remove_sidecar = original_remove
+
+
+def test_correction_clear_pre_move_sidecar_failure_restores_exact_sidecar() -> None:
+    original_remove = enrichment_module.remove_sidecar
+    try:
+        enrichment_module.remove_sidecar = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(OSError("removal failed")))
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "capture.mkv"
+            original = MeetingSidecar(source.name, source.name, NOW,
+                                      NOW + timedelta(minutes=30),
+                                      meeting_snapshot(_occurrence("original", "Original")))
+            source.write_bytes(b"recording")
+            write_sidecar(sidecar_path(source), original)
+            try:
+                RecordingCorrectionService().clear(source)
+                assert False, "pre-move sidecar failure must not report success"
+            except CorrectionTransactionError as error:
+                assert not error.outcome.committed and not error.outcome.partial
+            assert source.exists() and load_sidecar(sidecar_path(source)) == original
+    finally:
+        enrichment_module.remove_sidecar = original_remove
+
+
+def test_correction_recovers_same_inode_duplicates_from_both_names_and_refuses_foreign_inode() -> None:
+    for passed_name in ("old.mkv", "new.mkv"):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            old, new = root / "old.mkv", root / "new.mkv"
+            old.write_bytes(b"recording")
+            new.hardlink_to(old)
+            write_sidecar(sidecar_path(old), MeetingSidecar(
+                new.name, old.name, NOW, NOW + timedelta(minutes=1), None))
+            found = RecordingCorrectionService().discover(root / passed_name)
+            assert found is not None and found.recording_filename == new.name
+            assert new.exists() and not old.exists()
+            assert load_sidecar(sidecar_path(new)).recording_filename == new.name
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        old, new = root / "old.mkv", root / "new.mkv"
+        old.write_bytes(b"old")
+        new.write_bytes(b"foreign")
+        write_sidecar(sidecar_path(old), MeetingSidecar(
+            new.name, old.name, NOW, NOW + timedelta(minutes=1), None))
+        try:
+            RecordingCorrectionService().discover(old)
+            assert False, "different inodes must never be merged"
+        except ValueError:
+            pass
+        assert old.exists() and new.read_bytes() == b"foreign"

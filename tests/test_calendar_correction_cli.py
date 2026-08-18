@@ -144,3 +144,29 @@ def test_correction_cli_rejects_missing_or_stale_selection_without_mutating_medi
                 assert _cmd_calendar_correct(None, str(recording), False, "bad-selector", True) == 0
         finally:
             enrichment_module.cache_only_occurrence_provider = original_provider
+
+
+def test_correction_cli_reports_partial_path_and_nonzero_on_sidecar_failure():
+    import meeting_recorder.recording_enrichment as enrichment_module
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        recording = _recording(root)
+        visible = _occurrence("visible", "Visible")
+        original_provider = enrichment_module.cache_only_occurrence_provider
+        original_relocate = enrichment_module._write_moved_sidecar
+        enrichment_module.cache_only_occurrence_provider = lambda: (lambda: (visible,))
+        enrichment_module._write_moved_sidecar = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(OSError("raw path must not be printed")))
+        try:
+            selector = RecordingCorrectionService((visible,)).list_nearby(recording)[0].selector
+            output = io.StringIO()
+            with redirect_stdout(output), redirect_stderr(output):
+                assert _cmd_calendar_correct(None, str(recording), False, selector, False) == 1
+            report = json.loads(output.getvalue().splitlines()[-1])
+            assert report["error"] == "calendar_correction_failed"
+            assert report["partial"] and report["current_path"].endswith(".mkv")
+            assert "raw path" not in output.getvalue()
+        finally:
+            enrichment_module.cache_only_occurrence_provider = original_provider
+            enrichment_module._write_moved_sidecar = original_relocate

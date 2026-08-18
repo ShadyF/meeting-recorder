@@ -142,8 +142,16 @@ class MeetingSnapshot:
         _utc(self.scheduled_end_utc, "meeting end")
         if self.scheduled_end_utc <= self.scheduled_start_utc:
             raise ValueError("meeting interval is invalid")
-        if self.title is not None:
-            _nonempty(self.title, "meeting title")
+        if not isinstance(self.details_visible, bool):
+            raise ValueError("meeting visibility is invalid")
+        if not self.details_visible:
+            if (self.title is not None or self.participant_labels != ()
+                    or self.description is not None or self.location is not None):
+                raise ValueError("hidden meeting details must be empty")
+        else:
+            if not isinstance(self.title, str) or not self.title.strip():
+                raise ValueError("visible meeting title must be non-empty")
+            object.__setattr__(self, "title", self.title.strip())
         if self.description is not None:
             _nonempty(self.description, "meeting description")
         if self.location is not None:
@@ -151,8 +159,6 @@ class MeetingSnapshot:
         if not isinstance(self.participant_labels, tuple) or any(
                 not isinstance(label, str) or not label for label in self.participant_labels):
             raise ValueError("meeting participant labels are invalid")
-        if not isinstance(self.details_visible, bool):
-            raise ValueError("meeting visibility is invalid")
 
 
 def is_event_eligible(*, all_day: bool, status: object, self_response_status: object) -> bool:
