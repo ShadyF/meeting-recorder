@@ -413,7 +413,8 @@ def build_finalize_cmd(cfg: Config, listfile: Path, dest: Path,
 class FinalizationHandle:
     """Owns one detached finalization process and its immutable run snapshot."""
 
-    def __init__(self, proc, target: Path | None, parts: list[Path], listfile: Path | None,
+    def __init__(self, proc: subprocess.Popen | None, target: Path | None,
+                 parts: list[Path], listfile: Path | None,
                  source_app: str, requested_mode: CaptureMode, has_audio: bool,
                  has_video: bool, started_at: datetime, ended_at: datetime):
         self._proc = proc
@@ -433,6 +434,11 @@ class FinalizationHandle:
             self._listfile.unlink(missing_ok=True)
         self._parts = []
         self._listfile = None
+
+    @property
+    def target_path(self) -> Path | None:
+        """The reserved final path for this one detached finalization."""
+        return self._target
 
     def _finish(self, success: bool) -> tuple[bool, CompletedRecording | None]:
         if not self._complete:
@@ -511,18 +517,17 @@ class Recorder:
         if self.is_recording:
             LOG.warning("start() ignored: already recording")
             return False
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._final_path = output_path
-        self._parts = []
-        self._accum = 0.0
-        self._paused = False
-        self._requested_capture_mode = capture_mode
-        self._source_app = source_app
-        self._capture_started_at = None
-        self._has_video = None   # decided by the first segment, see _start_segment
-        LOG.info("Recording -> %s", output_path)
-        if self._start_segment():
-            return True
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            self._final_path, self._parts, self._accum = output_path, [], 0.0
+            self._paused, self._requested_capture_mode = False, capture_mode
+            self._source_app, self._capture_started_at, self._has_video = source_app, None, None
+            LOG.info("Recording -> %s", output_path)
+            if self._start_segment():
+                return True
+        except (OSError, subprocess.SubprocessError) as exc:
+            LOG.error("Could not start capture: %s", exc)
+        self._cleanup_pump()
         self._reset_active()
         return False
 
@@ -551,12 +556,15 @@ class Recorder:
         """
         if not self.is_recording:
             return None
+        # Snapshot wall-clock capture end before process teardown can block, then
+        # detach the run so finalization cannot race a newly started recording.
+        stopped_at = self._clock()
         if not self._paused:
             self._accum += time.monotonic() - self._run_start
         self._stop_proc()
         final, parts = self._final_path, self._parts
         started = self._capture_started_at or self._clock()
-        ended = max(started, self._clock() - timedelta(seconds=trim_end))
+        ended = max(started, stopped_at - timedelta(seconds=trim_end))
         source_app = self._source_app or "Meeting"
         requested = self._requested_capture_mode or CaptureMode.AUDIO_ONLY
         has_audio = bool(self.cfg.record_mic or self.cfg.record_system_audio)

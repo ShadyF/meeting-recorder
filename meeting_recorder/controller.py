@@ -16,6 +16,8 @@ a button has to be clicked, so the file manager never appears unbidden.
 from __future__ import annotations
 
 import enum
+from pathlib import Path
+from typing import Callable
 
 from .config import Config
 from .domain import CaptureMode, CompletedRecording
@@ -45,11 +47,11 @@ class Controller:
         self._pending_path = None    # output path awaiting the portal handshake
         self._pending_capture_mode: CaptureMode | None = None
         self._handles: set[FinalizationHandle] = set()
-        self._reserved_paths: set = set()
+        self._reserved_paths: set[Path] = set()
         self._manual = False         # started by `record`, not by the detector
         # Called with the saved Path (or None) once a recording is fully
         # finalized. `record` uses it to know when it can exit.
-        self.on_finished = None
+        self.on_finished: Callable[[CompletedRecording | None], None] | None = None
 
     # -- called by `record` (no detector involved) --------------------------
     def start_manual(self, app_name: str = "Manual") -> None:
@@ -67,12 +69,12 @@ class Controller:
         self._manual = True
         self._begin_recording()
 
-    def stop_manual(self) -> None:
+    def stop_manual(self) -> bool:
         """Stop a manual recording; `on_finished` fires when the file is ready."""
-        if self.state is State.RECORDING:
-            self._finish_recording()
+        started = self._finish_recording() if self.state is State.RECORDING else False
         self.state = State.IDLE
         self._app = None
+        return started
 
     # -- called by the detector --------------------------------------------
     def on_meeting_start(self, app_name: str) -> None:
@@ -175,8 +177,13 @@ class Controller:
         assert capture_mode is not None
         self._start_capture(path, capture_mode)
 
-    def _start_capture(self, path, capture_mode: CaptureMode) -> None:
-        if not self.recorder.start(path, self._app or "Meeting", capture_mode):
+    def _start_capture(self, path: Path, capture_mode: CaptureMode) -> None:
+        try:
+            started = self.recorder.start(path, self._app or "Meeting", capture_mode)
+        except Exception:
+            LOG.exception("Recorder start failed")
+            started = False
+        if not started:
             self._reserved_paths.discard(path)
             self._close_portal()
             self.state = State.IDLE
@@ -185,7 +192,7 @@ class Controller:
         self.state = State.RECORDING
         self._show_widget()  # no-op when _begin_recording already showed it
 
-    def _finish_recording(self, trim_end: float = 0.0) -> None:
+    def _finish_recording(self, trim_end: float = 0.0) -> bool:
         self._close_widget()
         if not self.recorder.is_recording:
             # The call ended while the portal dialog was still up.
@@ -193,7 +200,7 @@ class Controller:
             self._close_portal()
             if pending_path is not None:
                 self._reserved_paths.discard(pending_path)
-            return
+            return False
         # min_recording_seconds exists to drop false-positive meeting detections;
         # a manual `record` was asked for explicitly, so it always saves.
         too_short = (not self._manual and
@@ -203,11 +210,12 @@ class Controller:
             self._close_portal()
             LOG.info("Discarded: call was shorter than min_recording_seconds")
             self._register_handle(handle)
-            return
+            return handle is not None
         handle = self.recorder.stop(trim_end=trim_end)
         # After stop(): capture is torn down, so the portal stream is free to go.
         self._close_portal()
         self._register_handle(handle)
+        return handle is not None
 
     def _close_portal(self) -> None:
         """Release the ScreenCast session so the compositor stops the stream."""
@@ -241,7 +249,7 @@ class Controller:
         if handle not in self._handles:
             return
         self._handles.remove(handle)
-        self._reserved_paths.discard(handle._target)
+        self._reserved_paths.discard(handle.target_path)
         # These stay on screen until dismissed: "saved" is clickable (opening the
         # folder), and a failure needs to be seen.
         try:
@@ -264,9 +272,9 @@ class Controller:
             except Exception:
                 LOG.exception("Recording completion callback failed")
 
-    def _reserve_path(self, path):
+    def _reserve_path(self, path: Path) -> Path:
         candidate, number = path, 2
-        while candidate in self._reserved_paths:
+        while candidate in self._reserved_paths or candidate.exists():
             candidate = path.with_name(f"{path.stem}-{number}{path.suffix}")
             number += 1
         self._reserved_paths.add(candidate)

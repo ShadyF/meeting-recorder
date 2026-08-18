@@ -134,7 +134,8 @@ def _cmd_record(cfg) -> int:
         # otherwise exiting here would kill the finalize child and leave
         # orphaned .partN segments with no output.
         print("\nStopping — finalizing (denoise + loudness normalize)…")
-        controller.stop_manual()
+        if not controller.stop_manual():
+            loop.quit()
         return False
 
     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, _stop)
