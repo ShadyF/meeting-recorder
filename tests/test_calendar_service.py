@@ -5,7 +5,7 @@ from meeting_recorder.calendar_service import CalendarRefreshService
 
 class _Refresher:
     def __init__(self): self.calls = []
-    def refresh(self, ids, *, blocking): self.calls.append((ids, blocking))
+    def refresh(self, ids, *, blocking, cancelled): self.calls.append((ids, blocking))
 
 
 def test_service_start_is_idempotent_and_bounded_stop_returns():

@@ -112,6 +112,7 @@ class CalendarCache:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)
+            _fsync_directory(self.root)
         finally:
             if descriptor != -1:
                 os.close(descriptor)
@@ -156,6 +157,18 @@ def _decode(data: object) -> CalendarSnapshot:
                             _parse(data.get("window_start_utc")), _parse(data.get("window_end_utc")), tuple(occurrences))
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Make a completed same-directory rename durable when the filesystem supports it."""
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
+
+
 @contextmanager
 def calendar_operation_lock(*, blocking: bool, root: Path | str | None = None) -> Iterator[bool]:
     base = Path(root) if root is not None else _root()
@@ -168,6 +181,9 @@ def calendar_operation_lock(*, blocking: bool, root: Path | str | None = None) -
         os.close(descriptor)
         yield False
         return
+    except OSError:
+        os.close(descriptor)
+        raise
     try:
         yield True
     finally:

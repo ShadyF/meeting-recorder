@@ -29,7 +29,7 @@ class CalendarRefreshService:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                self._refresher.refresh(self._selected_ids(), blocking=False)
+                self._refresher.refresh(self._selected_ids(), blocking=False, cancelled=self._stop.is_set)
             except Exception:
                 LOG.warning("Calendar background refresh failed", exc_info=True)
             if self._stop.wait(self._interval):

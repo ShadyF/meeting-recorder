@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -201,11 +202,26 @@ def load_raw_config() -> dict[str, Any]:
 
 
 def save_user_config(data: dict[str, Any]) -> Path:
-    """Write the given config dict to the user config path (pretty JSON)."""
+    """Atomically write the given config dict without exposing a partial JSON file."""
     dest = _user_config_path()
     dest.parent.mkdir(parents=True, exist_ok=True)
     canonical_data = _normalize_user_overrides(data)
-    dest.write_text(json.dumps(canonical_data, indent=2) + "\n", encoding="utf-8")
+    descriptor, temporary = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=dest.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+            descriptor = -1
+            fh.write(json.dumps(canonical_data, indent=2) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, dest)
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
     return dest
 
 

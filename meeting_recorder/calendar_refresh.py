@@ -35,7 +35,8 @@ class CalendarRefresher:
                  now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         self.client, self.cache, self._now = client, cache, now
 
-    def refresh(self, calendar_ids: Sequence[str], *, blocking: bool = False) -> CalendarRefreshReport:
+    def refresh(self, calendar_ids: Sequence[str], *, blocking: bool = False,
+                cancelled: Callable[[], bool] = lambda: False) -> CalendarRefreshReport:
         if not calendar_ids:
             return CalendarRefreshReport(())
         now = self._now()
@@ -46,11 +47,15 @@ class CalendarRefresher:
             results = []
             for calendar_id in calendar_ids:
                 try:
+                    if cancelled():
+                        raise CalendarRefreshCancelled()
                     occurrences = self.client.list_occurrences(calendar_id, start, end)
+                    if cancelled():
+                        raise CalendarRefreshCancelled()
                     self.cache.store(CalendarSnapshot(1, calendar_id, now, start, end, occurrences))
                     results.append(CalendarRefreshResult(calendar_id, True))
                 except CalendarRefreshCancelled:
                     results.append(CalendarRefreshResult(calendar_id, False, True, "cancelled"))
-                except CalendarApiError:
+                except (CalendarApiError, OSError, ValueError):
                     results.append(CalendarRefreshResult(calendar_id, False, detail="unavailable"))
         return CalendarRefreshReport(tuple(results))

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .calendar_secrets import CalendarSecrets, SecretServiceError
+from .calendar_cache import CalendarCache, calendar_operation_lock
 
 
 AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -347,8 +348,13 @@ class CalendarOAuth:
         if not isinstance(refresh_token, str) or not refresh_token or not _required_scopes(response):
             raise CalendarConfigurationError("Google did not grant a usable Calendar refresh token")
         try:
-            self.secrets.save(refresh_token)
-        except SecretServiceError:
+            with calendar_operation_lock(blocking=True, root=CalendarCache().root) as acquired:
+                if not acquired:
+                    raise SecretServiceError("Calendar operation lock is unavailable")
+                # Remove snapshots issued for a prior credential before committing the replacement.
+                self._cache_clear()
+                self.secrets.save(refresh_token)
+        except (SecretServiceError, OSError):
             self._revoke(refresh_token)
             raise CalendarConfigurationError("Secret Service could not securely store the credential")
 
@@ -412,22 +418,25 @@ class CalendarOAuth:
         """Revoke best-effort and always remove local Calendar-only data."""
         token: str | None = None
         cleanup_errors: list[str] = []
-        try:
-            token = self.secrets.load()
-        except SecretServiceError as exc:
-            cleanup_errors.append(str(exc))
-        try:
-            if token:
-                self._revoke(token)
-        finally:
+        with calendar_operation_lock(blocking=True, root=CalendarCache().root) as acquired:
+            if not acquired:
+                return CalendarStatus("misconfigured", "Calendar operation lock is unavailable", 1)
             try:
-                self.secrets.clear()
+                token = self.secrets.load()
             except SecretServiceError as exc:
                 cleanup_errors.append(str(exc))
             try:
-                self._cache_clear()
-            except OSError:
-                cleanup_errors.append("Calendar cache could not be removed")
+                if token:
+                    self._revoke(token)
+            finally:
+                try:
+                    self.secrets.clear()
+                except SecretServiceError as exc:
+                    cleanup_errors.append(str(exc))
+                try:
+                    self._cache_clear()
+                except OSError:
+                    cleanup_errors.append("Calendar cache could not be removed")
         if cleanup_errors:
             return CalendarStatus("misconfigured", "; ".join(cleanup_errors), 1)
         return CalendarStatus("disconnected")
