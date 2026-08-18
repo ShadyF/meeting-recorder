@@ -2,11 +2,11 @@
 
 States: IDLE -> PROMPTING -> RECORDING -> IDLE.
 - Meeting detected  : prompt the user (or auto-record if configured).
-- User clicks Record: start the recorder.
+- User chooses Video or Audio only: start the requested capture mode.
 - Meeting ends      : stop + save, notify, return to IDLE.
 An ignored session is remembered so we don't re-prompt for the same call.
 
-Only two notifications are shown, deliberately: the Record/Ignore prompt, and
+Only two notifications are shown, deliberately: the capture-mode prompt, and
 the "saved" result at the end (plus a failure notice, which would otherwise
 lose a recording silently). Progress and status are the tray icon's job —
 anything more is noise during a call. "Saved" carries an Open Folder button:
@@ -84,12 +84,13 @@ class Controller:
         self._app = app_name
         self._ignored_session = False
         if self.cfg.auto_record:
-            self._begin_recording()
+            self._begin_recording(CaptureMode.AUDIO_ONLY)
             return
         self.state = State.PROMPTING
-        self.notifier.prompt_record(
+        self.notifier.prompt_capture_mode(
             app_name, self.cfg.prompt_timeout_seconds,
-            on_record=self._on_user_record,
+            on_video=lambda: self._on_user_capture_mode(CaptureMode.AUDIO_VIDEO),
+            on_audio_only=lambda: self._on_user_capture_mode(CaptureMode.AUDIO_ONLY),
             on_ignore=self._on_user_ignore,
         )
 
@@ -104,9 +105,9 @@ class Controller:
         self._app = None
 
     # -- notification callbacks --------------------------------------------
-    def _on_user_record(self) -> None:
+    def _on_user_capture_mode(self, capture_mode: CaptureMode) -> None:
         if self.state is State.PROMPTING:
-            self._begin_recording()
+            self._begin_recording(capture_mode)
 
     def _on_user_ignore(self) -> None:
         if self.state is State.PROMPTING:
@@ -115,12 +116,13 @@ class Controller:
             self.state = State.IDLE
 
     # -- recording helpers -------------------------------------------------
-    def _begin_recording(self) -> None:
+    def _begin_recording(self, capture_mode: CaptureMode | None = None) -> None:
         path = build_output_path(self.cfg.output_dir, self._app or "Meeting",
                                  self.cfg.container)
         path = self._reserve_path(path)
-        capture_mode = (CaptureMode.AUDIO_VIDEO if self.cfg.record_screen
-                        else CaptureMode.AUDIO_ONLY)
+        if capture_mode is None:
+            capture_mode = (CaptureMode.AUDIO_VIDEO if self.cfg.record_screen
+                            else CaptureMode.AUDIO_ONLY)
         self.state = State.RECORDING
         # Show the controls straight away, before any capture starts. On Wayland
         # the portal handshake happens first and can take seconds (or stall on a

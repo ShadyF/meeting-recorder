@@ -104,38 +104,56 @@ class Notifier:
         except Exception:  # pragma: no cover - never let a click kill the daemon
             LOG.exception("notification click handler failed")
 
-    # -- prompt with Record / Ignore ---------------------------------------
-    def prompt_record(self, app_name: str, timeout_seconds: int,
-                      on_record: Callable[[], None],
-                      on_ignore: Callable[[], None]) -> None:
-        """Show 'Meeting detected. Start recording?' with two action buttons."""
+    # -- meeting capture prompt --------------------------------------------
+    def prompt_capture_mode(self, app_name: str, timeout_seconds: int,
+                            on_video: Callable[[], None],
+                            on_audio_only: Callable[[], None],
+                            on_ignore: Callable[[], None]) -> None:
+        """Ask for a capture mode, treating every dismissal as Ignore."""
         summary = "Meeting detected"
-        body = f"{app_name} call in progress. Start recording?"
-        if not self._ready:
-            # Without action support, default to *not* recording (privacy-first).
-            self._fallback(summary, body + " (enable the tray/GUI for one-click record)")
-            on_ignore()
+        body = f"A {app_name} call is in progress. Choose what to capture."
+
+        # A passive notification cannot collect consent, so never start a run.
+        if not self._ready or not self._supports_actions():
+            self._fallback(summary, body)
+            self._invoke(on_ignore)
             return
 
         note = Notify.Notification.new(summary, body, "camera-video")
-        note.set_urgency(Notify.Urgency.CRITICAL)  # keep it on screen until answered
+        note.set_urgency(Notify.Urgency.CRITICAL)
         note.set_timeout(timeout_seconds * 1000)
+        handled = False
 
-        def _record(_n, _action):
-            on_record()
+        # Actions can be followed by a close signal; consume only the first event.
+        def _dispatch(callback: Callable[[], None]) -> None:
+            nonlocal handled
+            if handled:
+                return
+            handled = True
+            if self._active is note:
+                self._active = None
+            self._invoke(callback)
 
-        def _ignore(_n, _action):
-            on_ignore()
-
-        note.add_action("record", "Record", _record)
-        note.add_action("ignore", "Ignore", _ignore)
-        note.connect("closed", lambda _n: None)
+        note.add_action("video", "Video", lambda _n, _a: _dispatch(on_video))
+        note.add_action("audio-only", "Audio only",
+                        lambda _n, _a: _dispatch(on_audio_only))
+        note.add_action("ignore", "Ignore", lambda _n, _a: _dispatch(on_ignore))
+        note.connect("closed", lambda _n: _dispatch(on_ignore))
         self._active = note
         try:
             note.show()
         except Exception:  # pragma: no cover
+            self._active = None
             self._fallback(summary, body)
-            on_ignore()
+            _dispatch(on_ignore)
+
+    @staticmethod
+    def _supports_actions() -> bool:
+        """Return whether the active notification server exposes action buttons."""
+        try:
+            return "actions" in Notify.get_server_caps()
+        except Exception:  # pragma: no cover - server capability query failed
+            return False
 
     def close_active(self) -> None:
         if self._active is not None:

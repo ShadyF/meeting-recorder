@@ -161,3 +161,108 @@ def test_manual_video_source_selects_the_matching_portal_source_type():
             sys.modules[module_name] = previous_module
 
     assert captured["source_types"] == SOURCE_WINDOW
+
+
+def test_detected_prompt_starts_the_directly_selected_capture_mode():
+    class FakeRecorder:
+        is_recording = False
+
+        def start(self, _path, _source_app, capture_mode):
+            self.capture_mode = capture_mode
+            self.is_recording = True
+            return True
+
+        def attach_session(self, _session):
+            pass
+
+    class FakeNotifier:
+        def prompt_capture_mode(self, _app_name, _timeout, **callbacks):
+            self.callbacks = callbacks
+
+    cfg = load_config()
+    cfg.auto_record = False
+    notifier = FakeNotifier()
+    recorder = FakeRecorder()
+    controller = Controller(cfg, notifier, recorder)
+    controller._show_widget = lambda: None
+
+    controller.on_meeting_start("Zoom")
+    notifier.callbacks["on_audio_only"]()
+
+    assert recorder.capture_mode is CaptureMode.AUDIO_ONLY
+
+
+def test_auto_record_skips_the_prompt_and_starts_audio_only():
+    class FakeRecorder:
+        is_recording = False
+
+        def start(self, _path, _source_app, capture_mode):
+            self.capture_mode = capture_mode
+            self.is_recording = True
+            return True
+
+        def attach_session(self, _session):
+            pass
+
+    class FakeNotifier:
+        def prompt_capture_mode(self, *_args, **_kwargs):
+            raise AssertionError("auto-record must not show a prompt")
+
+    cfg = load_config()
+    cfg.auto_record = True
+    cfg.record_screen = True
+    recorder = FakeRecorder()
+    controller = Controller(cfg, FakeNotifier(), recorder)
+    controller._show_widget = lambda: None
+
+    controller.on_meeting_start("Zoom")
+
+    assert recorder.capture_mode is CaptureMode.AUDIO_ONLY
+
+
+def test_requested_video_mode_survives_portal_failure():
+    class FakeRecorder:
+        is_recording = False
+
+        def start(self, _path, _source_app, capture_mode):
+            self.capture_mode = capture_mode
+            self.is_recording = True
+            return True
+
+        def attach_session(self, _session):
+            pass
+
+    class FakeNotifier:
+        def prompt_capture_mode(self, _app_name, _timeout, **callbacks):
+            self.callbacks = callbacks
+
+    class FakeSession:
+        def open(self, _source_types, _token, _ready, on_error, **_kwargs):
+            on_error("permission denied")
+
+    fake_module = types.ModuleType("meeting_recorder.screencast")
+    fake_module.CURSOR_EMBEDDED = 2
+    fake_module.CURSOR_HIDDEN = 1
+    fake_module.ScreenCastSession = FakeSession
+    fake_module.source_types_for = lambda _source: 1
+    fake_module.use_portal_capture = lambda: True
+    module_name = "meeting_recorder.screencast"
+    previous_module = sys.modules.get(module_name)
+    sys.modules[module_name] = fake_module
+
+    try:
+        cfg = load_config()
+        cfg.auto_record = False
+        notifier = FakeNotifier()
+        recorder = FakeRecorder()
+        controller = Controller(cfg, notifier, recorder)
+        controller._show_widget = lambda: None
+        controller.on_meeting_start("Zoom")
+        notifier.callbacks["on_video"]()
+    finally:
+        if previous_module is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
+
+    assert recorder.capture_mode is CaptureMode.AUDIO_VIDEO
