@@ -44,6 +44,10 @@ class CalendarConfigurationError(CalendarError):
     """The local Calendar configuration or credential is unsafe or malformed."""
 
 
+class CalendarAuthorizationDeniedError(CalendarError):
+    """The user explicitly denied or cancelled an otherwise valid OAuth callback."""
+
+
 class CalendarUnavailableError(CalendarError):
     """A transient network problem prevented credential validation."""
 
@@ -108,14 +112,19 @@ def parse_callback(target: str, expected_state: str) -> str:
     values = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
     if parsed.path != _CALLBACK_PATH:
         raise CalendarConfigurationError("OAuth callback used an unexpected path")
-    if "error" in values:
-        raise CalendarConfigurationError("Google denied or cancelled authorization")
-    codes = values.get("code", [])
     states = values.get("state", [])
-    if len(codes) != 1 or len(states) != 1 or not codes[0] or not states[0]:
-        raise CalendarConfigurationError("OAuth callback must contain one code and state")
+    if len(states) != 1 or not states[0]:
+        raise CalendarConfigurationError("OAuth callback must contain one state")
     if not hmac.compare_digest(states[0], expected_state):
         raise CalendarConfigurationError("OAuth callback state did not match")
+    errors = values.get("error", [])
+    codes = values.get("code", [])
+    if errors:
+        if len(errors) == 1 and errors[0] and not codes:
+            raise CalendarAuthorizationDeniedError("Google authorization was denied or cancelled")
+        raise CalendarConfigurationError("OAuth callback error is malformed")
+    if len(codes) != 1 or not codes[0]:
+        raise CalendarConfigurationError("OAuth callback must contain one code")
     return codes[0]
 
 
@@ -239,6 +248,11 @@ class CalendarOAuth:
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(b"Authorization received. You may close this window.")
+                except CalendarAuthorizationDeniedError:
+                    result["denied"] = "true"
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"Authorization was cancelled.")
                 except CalendarConfigurationError:
                     self.send_response(400)
                     self.end_headers()
@@ -248,30 +262,55 @@ class CalendarOAuth:
                 # BaseHTTPRequestHandler would log callback query strings.
                 return
 
-        # Replace the temporary handler assigned at bind time before accepting.
-        server.RequestHandlerClass = CallbackHandler
-        deadline = time.monotonic() + self._callback_timeout
-
-        # Bound each accepted socket so a partial local request cannot hold the
-        # single-threaded listener past the overall authorization deadline.
+        # Restore inherited attributes by deleting temporary instance overrides.
+        original_handler = getattr(server, "RequestHandlerClass", None)
+        original_timeout = getattr(server, "timeout", None)
+        instance_attributes = vars(server)
+        had_handler = "RequestHandlerClass" in instance_attributes
+        had_timeout = "timeout" in instance_attributes
+        had_get_request = "get_request" in instance_attributes
         original_get_request = getattr(server, "get_request", None)
-        if original_get_request is not None:
-            def get_request_with_timeout():
-                request, address = original_get_request()
-                remaining = max(0.001, deadline - time.monotonic())
-                request.settimeout(min(_CONNECTION_TIMEOUT_SECONDS, remaining))
-                return request, address
+        deadline = time.monotonic() + self._callback_timeout
+        try:
+            # Replace the temporary handler assigned at bind time before accepting.
+            server.RequestHandlerClass = CallbackHandler
 
-            server.get_request = get_request_with_timeout
-        for _ in range(self._max_callback_requests):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            server.timeout = remaining
-            server.handle_request()
-            if "code" in result:
-                return result["code"]
-        raise CalendarUnavailableError("OAuth callback timed out")
+            # Bound each accepted socket so a partial local request cannot hold the
+            # single-threaded listener past the overall authorization deadline.
+            if original_get_request is not None:
+                def get_request_with_timeout():
+                    request, address = original_get_request()
+                    remaining = max(0.001, deadline - time.monotonic())
+                    request.settimeout(min(_CONNECTION_TIMEOUT_SECONDS, remaining))
+                    return request, address
+
+                server.get_request = get_request_with_timeout
+            for _ in range(self._max_callback_requests):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                server.timeout = remaining
+                server.handle_request()
+                if "denied" in result:
+                    raise CalendarAuthorizationDeniedError(
+                        "Google authorization was denied or cancelled")
+                if "code" in result:
+                    return result["code"]
+            raise CalendarUnavailableError("OAuth callback timed out")
+        finally:
+            # Do not retain closures over the bound server method after the listener closes.
+            if had_handler:
+                server.RequestHandlerClass = original_handler
+            else:
+                delattr(server, "RequestHandlerClass")
+            if had_timeout:
+                server.timeout = original_timeout
+            else:
+                delattr(server, "timeout")
+            if had_get_request:
+                server.get_request = original_get_request
+            elif original_get_request is not None:
+                delattr(server, "get_request")
 
     def connect(self) -> None:
         """Complete authorization and store only a validated refresh token."""

@@ -19,6 +19,15 @@ from .utils import LOG, expand_path
 # installed system package.
 _DEFAULTS_FILE = Path(__file__).resolve().parent / "default_config.json"
 _FORBIDDEN_CALENDAR_KEYS = frozenset({
+    "access_token",
+    "authorization_code",
+    "client_secret",
+    "credential",
+    "credential_file",
+    "credential_json",
+    "credentials",
+    "credentials_file",
+    "credentials_json",
     "google_calendar_client_secret",
     "google_calendar_credential_json",
     "google_calendar_credentials_json",
@@ -30,6 +39,10 @@ _FORBIDDEN_CALENDAR_KEYS = frozenset({
     "google_calendar_token",
     "google_calendar_authorization_code",
     "google_calendar_auth_code",
+    "refresh_token",
+})
+_GOOGLE_CLIENT_DOCUMENT_KEYS = frozenset({
+    "client_id", "client_secret", "auth_uri", "token_uri", "redirect_uris",
 })
 
 
@@ -133,7 +146,11 @@ def _normalize_user_overrides(user: dict[str, Any]) -> dict[str, Any]:
         normalized["video_source"] = legacy_source
     # Credential material belongs exclusively in Secret Service, never JSON.
     for key in tuple(normalized):
-        if key in _FORBIDDEN_CALENDAR_KEYS or (
+        value = normalized[key]
+        is_google_document = (
+            key in {"installed", "web"} and isinstance(value, dict) and
+            _GOOGLE_CLIENT_DOCUMENT_KEYS.issubset(value))
+        if key in _FORBIDDEN_CALENDAR_KEYS or is_google_document or (
                 key.startswith("google_calendar_") and
                 any(term in key for term in ("secret", "credential", "_token", "_code"))):
             normalized.pop(key)

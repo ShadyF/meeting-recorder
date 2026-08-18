@@ -106,11 +106,16 @@ def test_empty_google_client_environment_override_stays_calendar_only_invalid_st
 
 def test_calendar_credential_shaped_keys_are_not_retained_but_unknown_keys_are():
     forbidden = {
+        "access_token": "access",
+        "authorization_code": "code",
+        "client_secret": "secret",
+        "credential_json": "{}",
         "google_calendar_client_secret": "secret",
         "google_calendar_credential_json": "{}",
         "google_calendar_refresh_token": "refresh",
         "google_calendar_access_token": "access",
         "google_calendar_authorization_code": "code",
+        "refresh_token": "refresh",
     }
 
     def check(path):
@@ -123,3 +128,49 @@ def test_calendar_credential_shaped_keys_are_not_retained_but_unknown_keys_are()
         assert saved["future_setting"] == "kept"
 
     _with_user_config({**forbidden, "future_setting": "kept"}, check)
+
+
+def test_downloaded_google_credential_document_is_scrubbed_without_losing_unknown_data():
+    downloaded = {
+        "client_id": "12345-example.apps.googleusercontent.com",
+        "project_id": "owned-project",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_secret": "desktop-secret",
+        "redirect_uris": ["http://localhost"],
+    }
+
+    def check(path):
+        raw = load_raw_config()
+        assert "installed" not in raw
+        assert raw["future_setting"] == "kept"
+        assert raw["web"] == {"layout": "unrelated"}
+        save_user_config(raw)
+        saved = path.read_text(encoding="utf-8")
+        assert "installed" not in saved and "desktop-secret" not in saved
+        assert json.loads(saved)["web"] == {"layout": "unrelated"}
+
+    _with_user_config({"installed": downloaded, "web": {"layout": "unrelated"},
+                       "future_setting": "kept"}, check)
+
+
+def test_web_credential_document_is_scrubbed_while_unrelated_installed_value_survives():
+    downloaded = {
+        "client_id": "12345-example.apps.googleusercontent.com",
+        "client_secret": "web-secret",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["http://localhost"],
+    }
+
+    def check(path):
+        raw = load_raw_config()
+        assert "web" not in raw
+        assert raw["installed"] == {"layout": "unrelated"}
+        save_user_config(raw)
+        saved = path.read_text(encoding="utf-8")
+        assert "web-secret" not in saved
+        assert json.loads(saved)["installed"] == {"layout": "unrelated"}
+
+    _with_user_config({"web": downloaded, "installed": {"layout": "unrelated"}}, check)

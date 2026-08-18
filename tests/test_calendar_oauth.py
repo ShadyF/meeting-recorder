@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from meeting_recorder.calendar_oauth import (
     CalendarOAuth,
+    CalendarAuthorizationDeniedError,
     CalendarConfigurationError,
     CalendarExpiredError,
     CalendarStatus,
@@ -51,6 +52,9 @@ class _Secrets:
 
 
 class _Server:
+    RequestHandlerClass = object
+    timeout = None
+
     def __init__(self, port=43123):
         self.server_address = ("127.0.0.1", port)
         self.closed = False
@@ -133,7 +137,9 @@ def test_pkce_authorization_parameters_and_exact_scopes():
 def test_callback_rejects_wrong_path_errors_duplicate_and_bad_state():
     rejected = (
         "/wrong?code=x&state=expected",
-        "/oauth2/callback?error=access_denied&state=expected",
+        "/oauth2/callback?error=access_denied",
+        "/oauth2/callback?error=access_denied&error=duplicate&state=expected",
+        "/oauth2/callback?error=access_denied&state=other",
         "/oauth2/callback?code=x&code=y&state=expected",
         "/oauth2/callback?code=x&state=other",
     )
@@ -149,12 +155,61 @@ def test_callback_rejects_wrong_path_errors_duplicate_and_bad_state():
 
 def test_callback_handler_continues_after_invalid_request_then_accepts_valid_callback():
     server = _CallbackServer((
-        "/wrong?code=discarded&state=expected",
+        "/oauth2/callback?error=access_denied",
+        "/oauth2/callback?error=access_denied&error=duplicate&state=expected",
+        "/oauth2/callback?error=access_denied&state=wrong",
         "/oauth2/callback?code=accepted&state=expected",
     ))
-    oauth = CalendarOAuth(_config(), secret_store=_Secrets(), max_callback_requests=2)
+    oauth = CalendarOAuth(_config(), secret_store=_Secrets(), max_callback_requests=4)
     assert oauth._wait_for_callback(server, "expected") == "accepted"
-    assert server.responses == [400, 200]
+    assert server.responses == [400, 400, 400, 200]
+
+
+def test_connect_stops_on_valid_denial_without_http_or_secret_writes():
+    server = _CallbackServer(())
+    requests = []
+    store = _Secrets()
+
+    def browser(url):
+        state = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["state"][0]
+        server.paths = iter([f"/oauth2/callback?error=access_denied&state={state}"])
+        return True
+
+    oauth = CalendarOAuth(_config(), secret_store=store,
+                         post_form=lambda *_args: requests.append(True),
+                         browser_open=browser, server_factory=lambda *_args: server)
+    try:
+        oauth.connect()
+    except CalendarAuthorizationDeniedError:
+        pass
+    else:
+        raise AssertionError("valid authorization denial was not reported")
+    assert not requests and store.token is None and not store.cleared
+
+
+def test_callback_restores_server_attributes_after_success_and_failure():
+    successful = _CallbackServer(("/oauth2/callback?code=accepted&state=expected",))
+    successful.timeout = "original"
+    original_handler = successful.RequestHandlerClass
+    oauth = CalendarOAuth(_config(), secret_store=_Secrets())
+    assert oauth._wait_for_callback(successful, "expected") == "accepted"
+    assert successful.RequestHandlerClass is original_handler
+    assert successful.timeout == "original"
+
+    failed = _PartialServer()
+    failed.timeout = "original"
+    original_handler = failed.RequestHandlerClass
+    original_get_request = failed.get_request.__func__
+    try:
+        oauth._wait_for_callback(failed, "expected")
+    except CalendarUnavailableError:
+        pass
+    else:
+        raise AssertionError("partial callback request was accepted")
+    assert failed.RequestHandlerClass is original_handler
+    assert failed.timeout == "original"
+    assert "get_request" not in vars(failed)
+    assert failed.get_request.__func__ is original_get_request
 
 
 def test_callback_sets_a_bounded_timeout_for_partial_connections():

@@ -243,7 +243,9 @@ def _cmd_settings(_cfg) -> int:
 
 def _cmd_calendar(cfg, action: str) -> int:
     """Run the isolated Calendar credential command without starting recording."""
-    from .calendar_oauth import CalendarError, CalendarOAuth
+    from .calendar_oauth import (
+        CalendarAuthorizationDeniedError, CalendarError, CalendarOAuth,
+    )
 
     oauth = CalendarOAuth(cfg)
     try:
@@ -252,6 +254,9 @@ def _cmd_calendar(cfg, action: str) -> int:
             print("Calendar: connected")
             return 0
         result = oauth.status() if action == "status" else oauth.disconnect()
+    except CalendarAuthorizationDeniedError:
+        print("Calendar: authorization cancelled or denied", file=sys.stderr)
+        return 1
     except CalendarError as exc:
         print(f"Calendar: misconfigured ({exc})", file=sys.stderr)
         return 1
