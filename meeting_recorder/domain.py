@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .calendar_domain import MeetingSnapshot
+
 
 class CaptureMode(str, Enum):
     """The media composition requested for one recording run."""
@@ -44,6 +46,7 @@ class CompletedRecording:
     has_video: bool
     capture_started_at: datetime
     capture_ended_at: datetime
+    meeting: MeetingSnapshot | None = None
 
     def __post_init__(self) -> None:
         """Reject ambiguous capture times before they enter the immutable result."""
@@ -52,3 +55,5 @@ class CompletedRecording:
                 raise ValueError("capture timestamps must be timezone-aware UTC")
         if self.capture_ended_at < self.capture_started_at:
             raise ValueError("capture end must not precede capture start")
+        if self.meeting is not None and not isinstance(self.meeting, MeetingSnapshot):
+            raise ValueError("meeting snapshot is invalid")

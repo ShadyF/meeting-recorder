@@ -175,7 +175,7 @@ def test_run_starts_recorder_when_calendar_configuration_is_bad_and_shuts_down_o
         def __init__(self, _cfg): events.append("recorder")
 
     class Controller:
-        def __init__(self, *_args): events.append("controller")
+        def __init__(self, *_args, **_kwargs): events.append("controller")
         def on_meeting_start(self): pass
         def on_meeting_stop(self): pass
         def shutdown(self): events.append("shutdown")
@@ -224,7 +224,7 @@ def test_run_tolerates_calendar_setup_and_cleanup_failures_on_normal_loop_exit()
         def unix_signal_add(*_args): return 1
 
     class Controller:
-        def __init__(self, *_args): pass
+        def __init__(self, *_args, **_kwargs): pass
         def on_meeting_start(self): pass
         def on_meeting_stop(self): pass
         def shutdown(self): events.append("shutdown")
@@ -284,7 +284,7 @@ def test_run_attempts_controller_cleanup_once_after_calendar_stop_timeout_or_exc
             def unix_signal_add(*_args): return 1
 
         class Controller:
-            def __init__(self, *_args): pass
+            def __init__(self, *_args, **_kwargs): pass
             def on_meeting_start(self): pass
             def on_meeting_stop(self): pass
             def shutdown(self): events.append("shutdown")

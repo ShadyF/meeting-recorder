@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from threading import Event, Lock
 from typing import Callable, Sequence
 
-from .calendar_cache import CalendarCache, CalendarSnapshot, calendar_operation_lock, snapshot_window
+from .calendar_cache import CACHE_VERSION, CalendarCache, CalendarSnapshot, calendar_operation_lock, snapshot_window
 from .calendar_google import CalendarApiError, CalendarRefreshCancelled, GoogleCalendarClient
 
 
@@ -73,7 +73,7 @@ class CalendarRefresher:
                     with self._commit_gate:
                         if cancel is not None and cancel.is_set():
                             raise CalendarRefreshCancelled()
-                        self.cache.store(CalendarSnapshot(1, calendar_id, now, start, end, occurrences))
+                        self.cache.store(CalendarSnapshot(CACHE_VERSION, calendar_id, now, start, end, occurrences))
                     results.append(CalendarRefreshResult(calendar_id, True))
                 except CalendarRefreshCancelled:
                     results.append(CalendarRefreshResult(calendar_id, False, True, "cancelled"))

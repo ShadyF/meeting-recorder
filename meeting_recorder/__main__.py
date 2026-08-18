@@ -22,6 +22,7 @@ import json
 import signal
 import subprocess
 import sys
+from pathlib import Path
 
 from . import __version__
 from .config import load_config, write_default_user_config
@@ -49,10 +50,12 @@ def _cmd_run(cfg) -> int:
     from .calendar_refresh import CalendarRefresher
     from .calendar_service import CalendarRefreshService
     from .config import load_raw_config, validate_google_calendar_ids
+    from .recording_enrichment import RecordingEnricher, cache_only_occurrence_provider
 
     notifier = Notifier()
     recorder = Recorder(cfg)
-    controller = Controller(cfg, notifier, recorder)
+    enricher = RecordingEnricher(cache_only_occurrence_provider()).enrich
+    controller = Controller(cfg, notifier, recorder, recording_enricher=enricher)
     detector = MeetingDetector(
         allowlist=cfg.allowlist,
         start_debounce=cfg.start_debounce_seconds,
@@ -124,10 +127,12 @@ def _cmd_record(cfg) -> int:
     from .controller import Controller, State
     from .notifier import Notifier
     from .recorder import Recorder
+    from .recording_enrichment import RecordingEnricher, cache_only_occurrence_provider
 
     notifier = Notifier()
     recorder = Recorder(cfg)
-    controller = Controller(cfg, notifier, recorder)
+    enricher = RecordingEnricher(cache_only_occurrence_provider()).enrich
+    controller = Controller(cfg, notifier, recorder, recording_enricher=enricher)
     loop = GLib.MainLoop()
     result: dict = {}
 
@@ -277,8 +282,90 @@ def _cmd_settings(_cfg) -> int:
     return run()
 
 
-def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = False) -> int:
+def _correction_refresh(cfg) -> None:
+    """Perform only an explicit blocking refresh; correction remains cache-only otherwise."""
+    from .calendar_cache import CalendarCache
+    from .calendar_google import GoogleCalendarClient
+    from .calendar_oauth import CalendarOAuth
+    from .calendar_refresh import CalendarRefresher
+    from .config import load_raw_config, validate_google_calendar_ids
+
+    try:
+        selected = validate_google_calendar_ids(load_raw_config().get("google_calendar_ids", []))
+        if not selected:
+            return
+        report = CalendarRefresher(
+            GoogleCalendarClient(CalendarOAuth(cfg).access_token), CalendarCache()).refresh(
+                selected, blocking=True)
+        if not report.success:
+            print("Calendar correction: refresh failed; using cached data.", file=sys.stderr)
+    except Exception as exc:
+        print(f"Calendar correction: refresh unavailable ({type(exc).__name__}); using cached data.",
+              file=sys.stderr)
+
+
+def _cmd_calendar_correct(cfg, recording: str, refresh: bool,
+                          selector: str | None, clear: bool) -> int:
+    from .calendar_domain import decode_occurrence_selector, meeting_snapshot
+    from .recording_enrichment import (
+        RecordingCorrectionService,
+        cache_only_occurrence_provider,
+    )
+
+    if clear:
+        service = RecordingCorrectionService(())
+        try:
+            before = service.discover(Path(recording))
+            final = service.clear(Path(recording))
+            if service.discover(final) is not None:
+                raise OSError("clear did not remove recording metadata")
+            print(f"Recording: {'already clear' if before is None else final}")
+            return 0
+        except (OSError, ValueError):
+            print("Calendar correction failed (invalid recording metadata).", file=sys.stderr)
+            return 1
+    if refresh:
+        _correction_refresh(cfg)
+    provider = cache_only_occurrence_provider()
+    occurrences = tuple(provider())
+    service = RecordingCorrectionService(occurrences)
+    try:
+        if selector is None:
+            if service.discover(Path(recording)) is None:
+                raise ValueError("recording sidecar is missing")
+            rows = service.list_nearby(Path(recording), occurrences)
+            for row in rows:
+                snapshot = meeting_snapshot(row.occurrence)
+                title = snapshot.title if snapshot.details_visible else "<private>"
+                local = row.occurrence.start_utc.astimezone()
+                print(json.dumps({
+                    "selector": row.selector,
+                    "current": row.is_current,
+                    "title": title,
+                    "scheduled_utc": row.occurrence.start_utc.isoformat().replace("+00:00", "Z"),
+                    "scheduled_local": local.isoformat(),
+                }, ensure_ascii=False, sort_keys=True))
+            return 0
+        selected_key = decode_occurrence_selector(selector)
+        final = service.select(Path(recording), selected_key, occurrences)
+        metadata = service.discover(final)
+        if (metadata is None or metadata.meeting is None
+                or metadata.meeting.occurrence_key != selected_key):
+            raise OSError("selection was not committed")
+        print(f"Recording: {final}")
+        return 0
+    except (OSError, ValueError):
+        print("Calendar correction failed (invalid recording metadata).", file=sys.stderr)
+        return 1
+
+
+def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = False,
+                  recording: str | None = None, refresh: bool = False,
+                  selector: str | None = None) -> int:
     """Run the isolated Calendar credential command without starting recording."""
+    if action == "correct":
+        assert recording is not None
+        return _cmd_calendar_correct(cfg, recording, refresh, selector, clear)
     from .calendar_oauth import (
         CalendarAuthorizationDeniedError, CalendarError, CalendarOAuth,
     )
@@ -374,6 +461,14 @@ def build_parser() -> argparse.ArgumentParser:
     select_group.add_argument("--id", dest="calendar_ids", action="append", default=[])
     select_group.add_argument("--clear", action="store_true")
     calendar_sub.add_parser("refresh", parents=[common], help="refresh selected Calendar caches")
+    correct = calendar_sub.add_parser("correct", parents=[common],
+                                      help="correct one recording from cached Calendar data")
+    correct.add_argument("recording")
+    correct.add_argument("--refresh", action="store_true",
+                         help="refresh Calendar caches before reading them")
+    correct_group = correct.add_mutually_exclusive_group()
+    correct_group.add_argument("--select", dest="selector")
+    correct_group.add_argument("--clear", action="store_true")
     return parser
 
 
@@ -382,10 +477,21 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
-    cfg = load_config()
+    if (args.command == "calendar" and args.calendar_command == "correct"):
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = None
+    else:
+        cfg = load_config()
 
     command = args.command or "run"
     if command == "calendar":
+        if args.calendar_command == "correct" and args.clear and args.refresh:
+            parser.error("calendar correct --clear cannot be combined with --refresh")
+        if args.calendar_command == "correct":
+            return _cmd_calendar_correct(cfg, args.recording, args.refresh,
+                                         args.selector, args.clear)
         return _cmd_calendar(cfg, args.calendar_command,
                              getattr(args, "calendar_ids", None), getattr(args, "clear", False))
     handler = {

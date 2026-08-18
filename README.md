@@ -157,8 +157,8 @@ journalctl --user -u meeting-recorder -f
 
 ### Optional Google Calendar connection
 
-Calendar support currently manages a secure Google OAuth connection only; it does not fetch,
-match, or synchronize calendar events. Create a **Desktop** OAuth client that you own in Google
+Calendar support uses private, bounded offline snapshots to enrich completed
+recordings without delaying capture. Create a **Desktop** OAuth client that you own in Google
 Cloud, enable the Google Calendar API, and put only its bare client ID (ending in
 `.apps.googleusercontent.com`) in `google_calendar_client_id`. Never put a client secret,
 downloaded credential JSON, authorization code, or token in the config.
@@ -170,6 +170,7 @@ meeting-recorder calendar disconnect
 meeting-recorder calendar list
 meeting-recorder calendar select --id "calendar-id"
 meeting-recorder calendar refresh
+meeting-recorder calendar correct path/to/recording.mkv
 ```
 
 `connect` starts a short-lived listener on `127.0.0.1`, opens your browser, and requests only
@@ -190,6 +191,36 @@ Select calendars explicitly with `calendar select`; Google Calendar's own select
 used. Selected event snapshots are private, bounded to a recent offline window, and accepted for
 at most seven days. Refresh runs in the background every 15 minutes and can also be requested from
 the CLI. Calendar failures never delay or change recording.
+
+### Recording meeting metadata
+
+When a recording finishes, the daemon performs a synchronous, cache-only Calendar
+match. A matched recording is renamed to
+`YYYY-MM-DD_HH-MM-SS_Title.mkv` using the event's local scheduled time; collisions
+receive `-2`, `-3`, and so on. Hidden meetings and unmatched recordings retain
+their fallback filename. Every recording has an adjacent
+`<media filename>.meeting.json` sidecar (schema version 1) containing the capture
+interval, fallback name, stable occurrence selector, and the current visible
+meeting snapshot. Sidecars are written atomically and are not required for the
+media file to remain usable.
+
+Use the correction command to inspect or change one recording from the fresh
+offline cache:
+
+```bash
+meeting-recorder calendar correct path/to/recording.mkv
+meeting-recorder calendar correct path/to/recording.mkv --refresh
+meeting-recorder calendar correct path/to/recording.mkv --select SELECTOR
+meeting-recorder calendar correct path/to/recording.mkv --clear
+```
+
+The default command lists nearby cached occurrences. `--refresh` explicitly
+performs a blocking Calendar refresh first, then falls back to usable cached data
+if refresh fails. `--select` changes the match and visible filename; `--clear`
+restores the collision-safe fallback name and removes the sidecar. Correction
+never stores credentials, prints private meeting details, or mutates old files
+because a later Calendar refresh changes its cache. Metadata, rename, and sidecar
+failures leave the authoritative media in place.
 
 ## Configuration
 

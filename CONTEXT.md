@@ -9,7 +9,9 @@ A finalized local media file produced by a completed capture.
 _Avoid_: Capture file, output file
 
 **Completed Recording**:
-An immutable description of a successfully finalized Recording and its optional Meeting metadata snapshot.
+An immutable description of a successfully finalized Recording and its optional
+Meeting metadata snapshot. Enrichment returns a replacement value; it never
+mutates the finalized result or media after dispatch.
 _Avoid_: Recording result, completion event
 
 **Meeting metadata**:
@@ -21,8 +23,17 @@ The deterministic association between one Recording interval and one Google Cale
 _Avoid_: Event guess, calendar lookup
 
 **Meeting sidecar**:
-A versioned file adjacent to a Recording that stores its current Calendar match and Meeting metadata.
+A versioned `<media filename>.meeting.json` file adjacent to a Recording. Schema
+version 1 stores the capture interval, original fallback filename, stable
+occurrence selector, and current Meeting metadata. It is written atomically;
+the Recording remains authoritative if sidecar or rename work fails.
 _Avoid_: Metadata file, recording JSON
+
+**Recording correction**:
+An explicit cache-only operation under `meeting-recorder calendar correct` that
+lists nearby fresh occurrences, selects one exact stable selector, or clears a
+sidecar. It never performs a network refresh unless `--refresh` is requested and
+never changes old recordings automatically after a later cache refresh.
 
 **Capture mode**:
 The selected media composition for a recording: audio-only or audio-video.

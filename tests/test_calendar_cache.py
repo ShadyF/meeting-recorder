@@ -70,6 +70,26 @@ def test_cache_treats_corrupt_versions_and_embedded_calendar_mismatches_as_misse
             assert cache.load("calendar") is None
 
 
+def test_cache_decodes_v1_without_new_metadata_and_roundtrips_v2_fields():
+    with tempfile.TemporaryDirectory() as temporary:
+        cache = CalendarCache(Path(temporary) / "google-calendar")
+        cache.root.mkdir(parents=True)
+        target = cache.path_for("calendar")
+        start, end = snapshot_window(NOW)
+        v1 = {"version": 1, "calendar_id": "calendar", "fetched_at_utc": NOW.isoformat().replace("+00:00", "Z"),
+              "window_start_utc": start.isoformat().replace("+00:00", "Z"),
+              "window_end_utc": end.isoformat().replace("+00:00", "Z"), "occurrences": []}
+        target.write_text(json.dumps(v1), encoding="utf-8")
+        loaded = cache.load("calendar")
+        assert loaded is not None and loaded.version == CACHE_VERSION
+        occurrence = CalendarOccurrence(OccurrenceKey.single("calendar", "event"), NOW,
+                                        NOW + timedelta(hours=1), "Visible", (), None,
+                                        "description", "location", True)
+        snapshot = CalendarSnapshot(CACHE_VERSION, "calendar", NOW, start, end, (occurrence,))
+        cache.store(snapshot)
+        assert cache.load("calendar").occurrences[0] == occurrence
+
+
 def test_cache_atomic_replace_failure_preserves_old_snapshot_removes_temp_and_fsyncs_directory():
     with tempfile.TemporaryDirectory() as temporary:
         cache = CalendarCache(Path(temporary) / "google-calendar")

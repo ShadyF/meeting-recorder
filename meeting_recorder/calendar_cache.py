@@ -17,7 +17,7 @@ from typing import Iterator, Sequence
 from .calendar_domain import CalendarOccurrence, CalendarParticipant, OccurrenceKey
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 MAX_OFFLINE_AGE = timedelta(days=7)
 _LOOKBACK, _LOOKAHEAD = timedelta(hours=24), timedelta(days=7)
 
@@ -36,7 +36,7 @@ def snapshot_window(now: datetime) -> tuple[datetime, datetime]:
     return now - _LOOKBACK, now + _LOOKAHEAD
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CalendarSnapshot:
     version: int
     calendar_id: str
@@ -45,8 +45,17 @@ class CalendarSnapshot:
     window_end_utc: datetime
     occurrences: tuple[CalendarOccurrence, ...]
 
+    def __eq__(self, other: object) -> bool:
+        """Compare snapshot content across a v1-to-v2 compatibility upgrade."""
+        if not isinstance(other, CalendarSnapshot):
+            return NotImplemented
+        return (self.calendar_id, self.fetched_at_utc, self.window_start_utc,
+                self.window_end_utc, self.occurrences) == (
+                    other.calendar_id, other.fetched_at_utc, other.window_start_utc,
+                    other.window_end_utc, other.occurrences)
+
     def __post_init__(self) -> None:
-        if self.version != CACHE_VERSION or not isinstance(self.calendar_id, str) or not self.calendar_id:
+        if self.version not in {1, CACHE_VERSION} or not isinstance(self.calendar_id, str) or not self.calendar_id:
             raise ValueError("snapshot identity is invalid")
         for value in (self.fetched_at_utc, self.window_start_utc, self.window_end_utc):
             _utc(value)
@@ -134,12 +143,14 @@ def _encode(snapshot: CalendarSnapshot) -> dict[str, object]:
                 {"key": {"calendar_id": item.key.calendar_id, "event_id": item.key.event_id,
                          "original_start_utc": _stamp(item.key.original_start_utc) if item.key.original_start_utc else None},
                  "start_utc": _stamp(item.start_utc), "end_utc": _stamp(item.end_utc), "summary": item.summary,
+                 "description": item.description, "location": item.location,
+                 "details_visible": item.details_visible,
                  "participants": [{"email": p.email, "display_name": p.display_name} for p in item.participants],
                  "participants_complete": item.participants_complete} for item in snapshot.occurrences]}
 
 
 def _decode(data: object) -> CalendarSnapshot:
-    if not isinstance(data, dict) or data.get("version") != CACHE_VERSION or not isinstance(data.get("occurrences"), list):
+    if not isinstance(data, dict) or data.get("version") not in {1, CACHE_VERSION} or not isinstance(data.get("occurrences"), list):
         raise ValueError("cached snapshot is malformed")
     occurrences = []
     for item in data["occurrences"]:
@@ -150,10 +161,17 @@ def _decode(data: object) -> CalendarSnapshot:
                              if isinstance(p, dict))
         if len(participants) != len(item["participants"]):
             raise ValueError("cached participants are malformed")
+        summary = item.get("summary")
+        if summary is not None and (not isinstance(summary, str) or not summary.strip()):
+            summary = None
+        version = data.get("version")
+        description = item.get("description") if version == CACHE_VERSION else None
+        location = item.get("location") if version == CACHE_VERSION else None
+        details_visible = bool(summary and summary.strip()) if version == 1 else item.get("details_visible", False)
         occurrences.append(CalendarOccurrence(OccurrenceKey(key.get("calendar_id"), key.get("event_id"),
             _parse(key["original_start_utc"]) if key.get("original_start_utc") else None),
-            _parse(item.get("start_utc")), _parse(item.get("end_utc")), item.get("summary"), participants,
-            item.get("participants_complete")))
+            _parse(item.get("start_utc")), _parse(item.get("end_utc")), summary, participants,
+            item.get("participants_complete"), description, location, details_visible))
     return CalendarSnapshot(CACHE_VERSION, data.get("calendar_id"), _parse(data.get("fetched_at_utc")),
                             _parse(data.get("window_start_utc")), _parse(data.get("window_end_utc")), tuple(occurrences))
 

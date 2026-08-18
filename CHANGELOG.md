@@ -11,6 +11,8 @@ All notable changes to this project are documented here. Format follows
   PKCE, Secret Service refresh-token storage, and `calendar connect|status|disconnect`.
 - #20 adds explicit Calendar selection, bounded private offline snapshots, and
   background refresh independent from recording.
+- #21 adds cache-only recording enrichment, versioned `.meeting.json` sidecars,
+  collision-safe Calendar naming, and `calendar correct` for offline corrections.
 
 ### Changed
 - Detected meetings now ask directly whether to record Video, Audio only, or
@@ -22,6 +24,10 @@ All notable changes to this project are documented here. Format follows
   area, while Capture mode describes the media composition for each recording.
 - Existing `capture_mode` configuration values remain supported and are saved
   as the canonical `video_source` key.
+- Completed recordings keep their media authoritative while enrichment runs. A
+  matched visible meeting uses the scheduled local time and title for its name;
+  hidden or unmatched recordings retain the fallback name. Later Calendar
+  refreshes do not retroactively rename or rewrite earlier recordings.
 
 ## [0.3.5] — 2026-07-19
 

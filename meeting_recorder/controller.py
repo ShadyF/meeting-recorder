@@ -33,7 +33,8 @@ class State(enum.Enum):
 
 
 class Controller:
-    def __init__(self, cfg: Config, notifier: Notifier, recorder: Recorder):
+    def __init__(self, cfg: Config, notifier: Notifier, recorder: Recorder,
+                 recording_enricher: Callable[[CompletedRecording], CompletedRecording] | None = None):
         self.cfg = cfg
         self.notifier = notifier
         self.recorder = recorder
@@ -49,6 +50,7 @@ class Controller:
         self._handles: set[FinalizationHandle] = set()
         self._reserved_paths: set[Path] = set()
         self._manual = False         # started by `record`, not by the detector
+        self.recording_enricher = recording_enricher
         # Called with the saved Path (or None) once a recording is fully
         # finalized. `record` uses it to know when it can exit.
         self.on_finished: Callable[[CompletedRecording | None], None] | None = None
@@ -265,6 +267,15 @@ class Controller:
         """Remove first so stale polls cannot duplicate local completion effects."""
         if handle not in self._handles:
             return
+        if completed is not None and self.recording_enricher is not None:
+            try:
+                enriched = self.recording_enricher(completed)
+                if (not isinstance(enriched, CompletedRecording)
+                        or not isinstance(enriched.path, Path)):
+                    raise TypeError("recording enricher returned an invalid result")
+                completed = enriched
+            except Exception:
+                LOG.exception("Recording enrichment failed; using the original result")
         self._handles.remove(handle)
         self._reserved_paths.discard(handle.target_path)
         # These stay on screen until dismissed: "saved" is clickable (opening the

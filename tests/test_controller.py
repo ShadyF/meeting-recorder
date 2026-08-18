@@ -9,10 +9,14 @@ silently disappeared — a standalone RecordingTray test still passed.
 import inspect
 import sys
 import types
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
 
 from meeting_recorder.config import load_config
 from meeting_recorder.controller import Controller
 from meeting_recorder.domain import CaptureMode, VideoSource
+from meeting_recorder.domain import CompletedRecording
 
 
 def test_build_controls_calls_the_tray_with_arguments_it_accepts():
@@ -161,6 +165,81 @@ def test_manual_video_source_selects_the_matching_portal_source_type():
             sys.modules[module_name] = previous_module
 
     assert captured["source_types"] == SOURCE_WINDOW
+
+
+def test_controller_enriches_before_releasing_reservation_and_dispatches_replacement():
+    class Handle:
+        target_path = Path("fallback.mkv")
+
+        def __init__(self, completed):
+            self.completed = completed
+
+        def poll(self):
+            return True, self.completed
+
+    class Notifier:
+        def __init__(self):
+            self.paths = []
+
+        def info(self, _title, body, **_kwargs):
+            self.paths.append(body)
+
+    original = CompletedRecording(
+        Path("fallback.mkv"), "Manual", CaptureMode.AUDIO_ONLY, True, False,
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc))
+    enriched_path = Path("visible.mkv")
+    notifier = Notifier()
+    observed = []
+
+    def enrich(completed):
+        observed.append(handle.target_path in controller._reserved_paths)
+        return replace(completed, path=enriched_path)
+
+    controller = Controller(load_config(), notifier, object(), recording_enricher=enrich)
+    handle = Handle(original)
+    controller._handles.add(handle)
+    controller._reserved_paths.add(handle.target_path)
+    callback = []
+    controller.on_finished = callback.append
+
+    assert not controller._poll_handle(handle)
+    assert observed == [True]
+    assert notifier.paths == [enriched_path.name]
+    assert callback == [replace(original, path=enriched_path)]
+    assert original.path == handle.target_path
+    assert not controller._reserved_paths and not controller._handles
+
+
+def test_controller_enrichment_exception_or_invalid_result_uses_original_and_dispatches_once():
+    class Handle:
+        target_path = Path("fallback.mkv")
+
+        def poll(self):
+            return True, completed
+
+    class Notifier:
+        def info(self, _title, body, **_kwargs):
+            self.body = body
+
+    completed = CompletedRecording(
+        Path("fallback.mkv"), "Manual", CaptureMode.AUDIO_ONLY, True, False,
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc))
+    for bad_enricher in (lambda _value: (_ for _ in ()).throw(RuntimeError("cache")),
+                         lambda _value: "not a recording"):
+        notifier = Notifier()
+        controller = Controller(load_config(), notifier, object(),
+                                recording_enricher=bad_enricher)
+        handle = Handle()
+        controller._handles.add(handle)
+        controller._reserved_paths.add(handle.target_path)
+        callback = []
+        controller.on_finished = callback.append
+        assert not controller._poll_handle(handle)
+        assert notifier.body == completed.path.name
+        assert callback == [completed]
+        assert not controller._handles and not controller._reserved_paths
 
 
 def test_detected_prompt_starts_the_directly_selected_capture_mode():

@@ -3,8 +3,9 @@
 from datetime import datetime, timedelta, timezone
 
 from meeting_recorder.calendar_domain import (
-    CalendarMatch, CalendarOccurrence, CalendarParticipant, OccurrenceKey,
-    is_event_eligible, match_occurrence, normalize_participants,
+    CalendarMatch, CalendarOccurrence, CalendarParticipant, MeetingSnapshot, OccurrenceKey,
+    decode_occurrence_selector, encode_occurrence_selector, is_event_eligible,
+    match_occurrence, meeting_snapshot, normalize_participants,
 )
 
 
@@ -85,3 +86,31 @@ def test_matching_handles_grace_ties_and_duplicate_event_rows():
     duplicate = _event("left", NOW - timedelta(minutes=4), NOW)
     selected = match_occurrence(NOW, NOW + timedelta(minutes=1), [left, duplicate])
     assert selected is not None and selected.occurrence.key == left.key
+
+
+def test_meeting_snapshot_projects_visible_and_hidden_details():
+    key = OccurrenceKey.single("calendar", "event")
+    visible = CalendarOccurrence(key, NOW, NOW + timedelta(hours=1), "Visible",
+                                 (CalendarParticipant("a@example.test", "Ada"),), True,
+                                 " Description ", " Room ", True)
+    snapshot = meeting_snapshot(visible)
+    assert snapshot.title == "Visible"
+    assert snapshot.participant_labels == ("Ada",)
+    assert snapshot.description == " Description "
+    assert snapshot.location == " Room "
+    hidden = meeting_snapshot(CalendarOccurrence(key, NOW, NOW + timedelta(hours=1), "Private",
+                                                  (CalendarParticipant("a@example.test", "Ada"),),
+                                                  True, "secret", "room", False))
+    assert hidden.title is None and hidden.participant_labels == ()
+    assert hidden.description is None and hidden.location is None and not hidden.details_visible
+
+
+def test_meeting_snapshot_metadata_validation_and_selector_roundtrip_are_strict():
+    key = OccurrenceKey.recurring("calendar/id", "series", NOW)
+    selector = encode_occurrence_selector(key)
+    assert decode_occurrence_selector(selector) == key
+    for malformed in ("", "!", selector + "x", "e30"):
+        _raises_value_error(lambda malformed=malformed: decode_occurrence_selector(malformed))
+    _raises_value_error(lambda: MeetingSnapshot(key, "", NOW, NOW + timedelta(hours=1), (), None, None, False))
+    _raises_value_error(lambda: MeetingSnapshot(key, None, NOW, NOW, (), None, None, False))
+    _raises_value_error(lambda: decode_occurrence_selector("A" * 4097))

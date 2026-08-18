@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import base64
+import json
+import re
 from typing import Iterable, Mapping, Sequence
 
 
@@ -80,6 +83,9 @@ class CalendarOccurrence:
     summary: str | None = None
     participants: tuple[CalendarParticipant, ...] = ()
     participants_complete: bool | None = None
+    description: str | None = None
+    location: str | None = None
+    details_visible: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, OccurrenceKey):
@@ -95,6 +101,12 @@ class CalendarOccurrence:
             raise ValueError("occurrence participants are invalid")
         if self.participants_complete is not None and not isinstance(self.participants_complete, bool):
             raise ValueError("participant completeness is invalid")
+        for value, name in ((self.description, "occurrence description"),
+                            (self.location, "occurrence location")):
+            if value is not None:
+                _nonempty(value, name)
+        if not isinstance(self.details_visible, bool):
+            raise ValueError("occurrence visibility is invalid")
 
 
 @dataclass(frozen=True)
@@ -108,6 +120,39 @@ class CalendarMatch:
             raise ValueError("match occurrence is invalid")
         if self.real_overlap < timedelta() or self.scheduled_start_distance < timedelta():
             raise ValueError("match scores are invalid")
+
+
+@dataclass(frozen=True)
+class MeetingSnapshot:
+    """The safe, recording-facing subset of one Calendar occurrence."""
+
+    occurrence_key: OccurrenceKey
+    title: str | None
+    scheduled_start_utc: datetime
+    scheduled_end_utc: datetime
+    participant_labels: tuple[str, ...]
+    description: str | None
+    location: str | None
+    details_visible: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.occurrence_key, OccurrenceKey):
+            raise ValueError("meeting snapshot key is invalid")
+        _utc(self.scheduled_start_utc, "meeting start")
+        _utc(self.scheduled_end_utc, "meeting end")
+        if self.scheduled_end_utc <= self.scheduled_start_utc:
+            raise ValueError("meeting interval is invalid")
+        if self.title is not None:
+            _nonempty(self.title, "meeting title")
+        if self.description is not None:
+            _nonempty(self.description, "meeting description")
+        if self.location is not None:
+            _nonempty(self.location, "meeting location")
+        if not isinstance(self.participant_labels, tuple) or any(
+                not isinstance(label, str) or not label for label in self.participant_labels):
+            raise ValueError("meeting participant labels are invalid")
+        if not isinstance(self.details_visible, bool):
+            raise ValueError("meeting visibility is invalid")
 
 
 def is_event_eligible(*, all_day: bool, status: object, self_response_status: object) -> bool:
@@ -133,7 +178,10 @@ def normalize_participants(values: Iterable[CalendarParticipant | Mapping[str, o
         participant = CalendarParticipant(email, name)
         identity = f"email:{email}" if email else f"name:{str(name).casefold()}"
         previous = by_identity.get(identity)
-        if previous is None or _participant_order(participant) < _participant_order(previous):
+        # Keep the first usable explicit name; source ordering must not affect cache output.
+        if previous is None or (previous.display_name is None and participant.display_name is not None) or (
+                previous.display_name is not None and participant.display_name is not None and
+                _participant_order(participant) < _participant_order(previous)):
             by_identity[identity] = participant
 
     # Sort after dedupe so equivalent attendee order produces one stable cache payload.
@@ -174,3 +222,82 @@ def match_occurrence(capture_start: datetime, capture_end: datetime,
 
 def _score(match: CalendarMatch) -> tuple[timedelta, timedelta]:
     return (-match.real_overlap, match.scheduled_start_distance)
+
+
+def normalized_participant_labels(occurrence: CalendarOccurrence) -> tuple[str, ...]:
+    """Expose stable labels without inventing identity for sparse attendees."""
+    labels: dict[str, str] = {}
+    for participant in occurrence.participants:
+        label = (participant.display_name.strip() if participant.display_name
+                 else participant.email.casefold() if participant.email else "")
+        if label:
+            labels.setdefault(label.casefold(), label)
+    return tuple(sorted(labels.values(), key=str.casefold))
+
+
+def meeting_snapshot(occurrence: CalendarOccurrence) -> MeetingSnapshot:
+    """Project visible Calendar details while retaining identity and schedule privately."""
+    visible = occurrence.details_visible and bool(occurrence.summary and occurrence.summary.strip())
+    if not visible:
+        return MeetingSnapshot(occurrence.key, None, occurrence.start_utc, occurrence.end_utc,
+                               (), None, None, False)
+    return MeetingSnapshot(
+        occurrence.key, occurrence.summary.strip() if occurrence.summary else None,
+        occurrence.start_utc, occurrence.end_utc, normalized_participant_labels(occurrence),
+        occurrence.description, occurrence.location, True)
+
+
+_SELECTOR_VERSION = 1
+_SELECTOR_MAX_BYTES = 4096
+_SELECTOR_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def encode_occurrence_selector(key: OccurrenceKey) -> str:
+    """Encode a complete occurrence key as strict canonical URL-safe JSON."""
+    if not isinstance(key, OccurrenceKey):
+        raise ValueError("occurrence selector key is invalid")
+    payload = {"event_id": key.event_id, "calendar_id": key.calendar_id,
+               "original_start_utc": _timestamp(key.original_start_utc)}
+    raw = json.dumps({"v": _SELECTOR_VERSION, **payload}, sort_keys=True,
+                     separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    if len(encoded) > _SELECTOR_MAX_BYTES:
+        raise ValueError("occurrence selector is too large")
+    return encoded
+
+
+def decode_occurrence_selector(value: object) -> OccurrenceKey:
+    """Decode only canonical, bounded selectors with an unambiguous key shape."""
+    if not isinstance(value, str) or not value or len(value) > _SELECTOR_MAX_BYTES or not _SELECTOR_KEY_RE.fullmatch(value):
+        raise ValueError("occurrence selector is malformed")
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        raw = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("occurrence selector is malformed") from exc
+    if not isinstance(data, dict) or set(data) != {"v", "calendar_id", "event_id", "original_start_utc"}:
+        raise ValueError("occurrence selector is malformed")
+    if data["v"] != _SELECTOR_VERSION or not all(isinstance(data[key], str) for key in ("calendar_id", "event_id")):
+        raise ValueError("occurrence selector is malformed")
+    original = _parse_timestamp(data["original_start_utc"])
+    key = OccurrenceKey(data["calendar_id"], data["event_id"], original)
+    if encode_occurrence_selector(key) != value:
+        raise ValueError("occurrence selector is not canonical")
+    return key
+
+
+def _timestamp(value: datetime | None) -> str | None:
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z") if value else None
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError("selector timestamp is malformed")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError("selector timestamp is malformed") from exc
+    return _utc(parsed, "selector timestamp")

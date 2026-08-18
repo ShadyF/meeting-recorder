@@ -123,8 +123,13 @@ def normalize_event(calendar_id: str, raw: object) -> CalendarOccurrence | None:
 
     raw_summary = raw.get("summary")
     summary = raw_summary.strip() if isinstance(raw_summary, str) and raw_summary.strip() else None
+    raw_description = raw.get("description")
+    description = raw_description.strip() if isinstance(raw_description, str) and raw_description.strip() else None
+    raw_location = raw.get("location")
+    location = raw_location.strip() if isinstance(raw_location, str) and raw_location.strip() else None
     complete = False if raw.get("attendeesOmitted") is True else (True if isinstance(attendees, list) else None)
-    return CalendarOccurrence(key, start, end, summary, normalize_participants(people), complete)
+    return CalendarOccurrence(key, start, end, summary, normalize_participants(people), complete,
+                              description, location, summary is not None)
 
 
 def _read_json(response: Any, status: int) -> Any:

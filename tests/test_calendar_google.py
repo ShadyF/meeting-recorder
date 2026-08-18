@@ -231,3 +231,18 @@ def test_normalize_event_preserves_recurrence_identity_and_event_acceptance_rule
                       {"attendees": [{"self": True, "responseStatus": "declined"}]}):
         assert google.normalize_event("calendar", _event("excluded", **overrides)) is None
     assert google.normalize_event("calendar", _event("tentative", status="tentative")) is not None
+
+
+def test_normalize_event_exposes_trimmed_visible_metadata_and_suppresses_hidden_metadata():
+    visible = google.normalize_event("calendar", _event(
+        "visible", summary="  Project sync  ", description="  first line\nsecond line  ",
+        location="  Room 1  ", attendees=[{"displayName": " Ada   Lovelace "}]))
+    assert visible is not None and visible.details_visible
+    assert visible.summary == "Project sync"
+    assert visible.description == "first line\nsecond line"
+    assert visible.location == "Room 1"
+    hidden = google.normalize_event("calendar", _event(
+        "hidden", summary=" ", description="secret", location="private"))
+    assert hidden is not None and not hidden.details_visible
+    assert hidden.summary is None and hidden.description == "secret" and hidden.location == "private"
+    # The projection, rather than the API normalizer, suppresses hidden details.
