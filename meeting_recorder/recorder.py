@@ -438,12 +438,19 @@ class FinalizationHandle:
             self._cleanup()
 
     def _cleanup(self) -> None:
-        for part in self._parts:
-            part.unlink(missing_ok=True)
+        # Relinquish ownership before filesystem operations so failed deletion
+        # cannot keep this completed handle alive or make cleanup retryable.
+        paths = [*self._parts]
         if self._listfile:
-            self._listfile.unlink(missing_ok=True)
+            paths.append(self._listfile)
         self._parts = []
         self._listfile = None
+
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                LOG.warning("Could not remove finalization temporary file %s: %s", path, exc)
 
     @property
     def target_path(self) -> Path | None:
@@ -459,9 +466,11 @@ class FinalizationHandle:
                     target, snapshot.source_app, snapshot.requested_mode,
                     snapshot.has_audio, snapshot.has_video, snapshot.started_at,
                     snapshot.ended_at)
-            self._cleanup()
+            # Mark complete before cleanup so an unlink failure cannot leave the
+            # process or its controller reservation stranded in an active state.
             self._complete = True
             self._proc = None
+            self._cleanup()
         return True, self._result
 
     def poll(self) -> tuple[bool, CompletedRecording | None]:

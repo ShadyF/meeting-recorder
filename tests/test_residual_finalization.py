@@ -212,6 +212,53 @@ def test_poll_exception_aborts_finalizer_cleans_and_dispatches_once() -> None:
         assert seen == [None] and not controller._handles
 
 
+def test_poll_recovery_dispatches_when_temp_cleanup_unlink_fails() -> None:
+    from meeting_recorder.recorder import FinalizationHandle, FinalizationSnapshot
+
+    class Proc:
+        returncode = None
+
+        def poll(self):
+            raise RuntimeError("poll failed")
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, timeout=None):
+            return -9
+
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        part, listfile, target = root / ".part", root / ".list", root / "result.mkv"
+        part.write_bytes(b"part")
+        listfile.write_text("part")
+        now = datetime.now(timezone.utc)
+        handle = FinalizationHandle(
+            Proc(), FinalizationSnapshot(target, "Manual", CaptureMode.AUDIO_ONLY,
+                                         True, False, now, now), [part], listfile)
+        controller = Controller(load_config(), _Notifier(), _FailingRecorder())
+        controller._handles.add(handle)
+        controller._reserved_paths.add(target)
+        seen = []
+        controller.on_finished = seen.append
+        original_unlink = Path.unlink
+
+        def fail_temp_unlink(path, *args, **kwargs):
+            if path in (part, listfile):
+                raise OSError("simulated unlink failure")
+            return original_unlink(path, *args, **kwargs)
+
+        try:
+            Path.unlink = fail_temp_unlink
+            assert not controller._poll_handle(handle)
+        finally:
+            Path.unlink = original_unlink
+
+        assert handle.poll() == (True, None)
+        assert seen == [None] and handle not in controller._handles
+        assert target not in controller._reserved_paths
+
+
 def test_shutdown_wait_exception_aborts_reaps_and_cleans_handle() -> None:
     from meeting_recorder.recorder import FinalizationHandle, FinalizationSnapshot
 
