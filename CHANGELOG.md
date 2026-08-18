@@ -6,6 +6,10 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- #19 adds bounded Google Calendar Desktop OAuth credential management with
+  PKCE, Secret Service refresh-token storage, and `calendar connect|status|disconnect`.
+
 ### Changed
 - Detected meetings now ask directly whether to record Video, Audio only, or
   Ignore. Closing or leaving the prompt unanswered never starts a recording,

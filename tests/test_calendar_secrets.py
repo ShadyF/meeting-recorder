@@ -34,10 +34,12 @@ class _Secret:
     def password_store_sync(self, schema, attributes, collection, label, token, cancellable):
         self.calls.append(("save", schema, attributes, collection, label, token, cancellable))
         self.token = token
+        return True
 
     def password_clear_sync(self, schema, attributes, cancellable):
         self.calls.append(("clear", schema, attributes, cancellable))
         self.token = None
+        return True
 
 
 def test_secret_service_uses_one_schema_account_and_raw_token_only():
@@ -65,3 +67,26 @@ def test_secret_service_errors_have_no_plaintext_fallback():
         pass
     else:
         raise AssertionError("Secret Service failure must not store a fallback")
+
+
+def test_secret_service_rejects_false_store_and_clear_results():
+    class FalseResultSecret(_Secret):
+        def password_store_sync(self, schema, attributes, collection, label, token, cancellable):
+            return False
+
+        def password_clear_sync(self, schema, attributes, cancellable):
+            return False
+
+    store = CalendarSecrets(FalseResultSecret())
+    try:
+        store.save("refresh-token")
+    except SecretServiceError:
+        pass
+    else:
+        raise AssertionError("false secure-storage result was accepted")
+    try:
+        store.clear()
+    except SecretServiceError:
+        pass
+    else:
+        raise AssertionError("false secret-clear result was accepted")

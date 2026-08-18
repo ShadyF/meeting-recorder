@@ -78,20 +78,24 @@ class CalendarSecrets:
         if not isinstance(refresh_token, str) or not refresh_token:
             raise SecretServiceError("Refusing an empty refresh token")
         try:
-            self._api().password_store_sync(
+            stored = self._api().password_store_sync(
                 self._get_schema(), self._attributes(),
                 self._api().COLLECTION_DEFAULT, _LABEL, refresh_token, None)
         except SecretServiceError:
             raise
         except Exception as exc:
             raise SecretServiceError("Secret Service could not store the credential") from exc
+        if stored is False:
+            raise SecretServiceError("Secret Service could not store the credential")
 
     def clear(self) -> None:
         """Delete this application's token without affecting other secrets."""
         try:
-            self._api().password_clear_sync(
+            cleared = self._api().password_clear_sync(
                 self._get_schema(), self._attributes(), None)
         except SecretServiceError:
             raise
         except Exception as exc:
             raise SecretServiceError("Secret Service could not clear the credential") from exc
+        if cleared is False:
+            raise SecretServiceError("Secret Service could not clear the credential")

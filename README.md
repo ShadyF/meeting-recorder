@@ -172,7 +172,10 @@ meeting-recorder calendar disconnect
 `connect` starts a short-lived listener on `127.0.0.1`, opens your browser, and requests only
 Calendar-list and event read-only access. The refresh token is stored in your desktop's Secret
 Service, not in the config file, environment, recordings, or sidecars. `disconnect` tries to
-revoke it and always removes the local token and Calendar-only cache.
+revoke it and always attempts to remove the local token and Calendar-only cache. It reports a
+nonzero cleanup failure if either local removal cannot be confirmed. During a temporary Google or
+network outage, `calendar status` reports `connected` with `credential present; validation
+unavailable` and a nonzero exit status; it retains the credential rather than treating it as expired.
 
 The listener normally uses an OS-selected port. Set `google_calendar_loopback_port` to a fixed
 integer from 1 through 65535 only when a container, sandbox, or firewall requires it; that exact

@@ -2,13 +2,19 @@
 
 import os
 import tempfile
+import urllib.error
 import urllib.parse
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from meeting_recorder.calendar_oauth import (
     CalendarOAuth,
+    CalendarConfigurationError,
+    CalendarExpiredError,
     CalendarStatus,
+    CalendarUnavailableError,
     SCOPES,
+    _post_form,
     build_authorization_url,
     create_pkce_verifier,
     parse_callback,
@@ -53,6 +59,50 @@ class _Server:
         self.closed = True
 
 
+class _CallbackServer(_Server):
+    """Drive the installed handler directly without a socket or browser."""
+
+    def __init__(self, paths):
+        super().__init__()
+        self.paths = iter(paths)
+        self.responses = []
+
+    def handle_request(self):
+        handler = object.__new__(self.RequestHandlerClass)
+        handler.path = next(self.paths)
+        handler.send_response = self.responses.append
+        handler.end_headers = lambda: None
+        handler.wfile = _Writer()
+        handler.do_GET()
+
+
+class _Writer:
+    def write(self, _value):
+        return None
+
+
+class _PartialRequest:
+    def __init__(self):
+        self.timeout = None
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+
+class _PartialServer(_Server):
+    """Simulate an accepted connection that never completes its request line."""
+
+    def __init__(self):
+        super().__init__()
+        self.request = _PartialRequest()
+
+    def get_request(self):
+        return self.request, ("127.0.0.1", 1)
+
+    def handle_request(self):
+        self.get_request()
+
+
 def _config(client=CLIENT, port=0):
     return SimpleNamespace(google_calendar_client_id=client,
                            google_calendar_loopback_port=port)
@@ -90,11 +140,34 @@ def test_callback_rejects_wrong_path_errors_duplicate_and_bad_state():
     for callback in rejected:
         try:
             parse_callback(callback, "expected")
-        except Exception:
+        except CalendarConfigurationError:
             pass
         else:
             raise AssertionError("unsafe callback was accepted")
     assert parse_callback("/oauth2/callback?code=x&state=expected", "expected") == "x"
+
+
+def test_callback_handler_continues_after_invalid_request_then_accepts_valid_callback():
+    server = _CallbackServer((
+        "/wrong?code=discarded&state=expected",
+        "/oauth2/callback?code=accepted&state=expected",
+    ))
+    oauth = CalendarOAuth(_config(), secret_store=_Secrets(), max_callback_requests=2)
+    assert oauth._wait_for_callback(server, "expected") == "accepted"
+    assert server.responses == [400, 200]
+
+
+def test_callback_sets_a_bounded_timeout_for_partial_connections():
+    server = _PartialServer()
+    oauth = CalendarOAuth(_config(), secret_store=_Secrets(), callback_timeout=30,
+                         max_callback_requests=1)
+    try:
+        oauth._wait_for_callback(server, "expected")
+    except CalendarUnavailableError:
+        pass
+    else:
+        raise AssertionError("partial callback request was accepted")
+    assert 0 < server.request.timeout <= 10
 
 
 def test_connect_binds_before_browser_and_sends_no_client_secret():
@@ -137,7 +210,7 @@ def test_fixed_port_failure_happens_before_browser_launch():
                          server_factory=unavailable)
     try:
         oauth.connect()
-    except Exception:
+    except CalendarUnavailableError:
         pass
     else:
         raise AssertionError("fixed port bind failure was accepted")
@@ -158,7 +231,7 @@ def test_connect_requires_refresh_token_and_scopes_and_revokes_on_storage_failur
     oauth._wait_for_callback = lambda _server, _state: "authorization-code"
     try:
         oauth.connect()
-    except Exception:
+    except CalendarConfigurationError:
         pass
     else:
         raise AssertionError("unsecured token storage was accepted")
@@ -173,7 +246,7 @@ def test_connect_requires_refresh_token_and_scopes_and_revokes_on_storage_failur
         attempt._wait_for_callback = lambda _server, _state: "authorization-code"
         try:
             attempt.connect()
-        except Exception:
+        except CalendarConfigurationError:
             pass
         else:
             raise AssertionError("incomplete OAuth grant was accepted")
@@ -191,7 +264,7 @@ def test_status_maps_expiry_transient_and_scope_deficiency_without_clearing_toke
         return 503, b"not json"
 
     transient = CalendarOAuth(_config(), secret_store=token, post_form=unavailable).status()
-    assert transient == CalendarStatus("misconfigured", "credential present but validation unavailable", 1)
+    assert transient == CalendarStatus("connected", "credential present; validation unavailable", 1)
     assert token.token == "saved-refresh"
     deficient = CalendarOAuth(_config(), secret_store=token,
                               post_form=lambda *_: _response(scope=SCOPES[0])).status()
@@ -200,7 +273,7 @@ def test_status_maps_expiry_transient_and_scope_deficiency_without_clearing_toke
 
 def test_status_disconnected_and_validation_rules_make_no_google_call():
     calls = []
-    status = CalendarOAuth(_config(client=""), secret_store=_Secrets("token"),
+    status = CalendarOAuth(_config(client=""), secret_store=_Secrets(),
                            post_form=lambda *_: calls.append(True)).status()
     assert status.state == "disconnected" and not calls
     assert CalendarOAuth(_config(port=True), secret_store=_Secrets(),
@@ -209,17 +282,79 @@ def test_status_disconnected_and_validation_rules_make_no_google_call():
                     "{\"client_id\":\"x\"}", "x/apps.googleusercontent.com"):
         try:
             validate_client_id(invalid)
-        except Exception:
+        except CalendarConfigurationError:
             pass
         else:
             raise AssertionError("unsafe client ID was accepted")
     for invalid in (True, 1.5, -1, 65536):
         try:
             validate_loopback_port(invalid)
-        except Exception:
+        except CalendarConfigurationError:
             pass
         else:
             raise AssertionError("unsafe port was accepted")
+
+
+def test_status_preserves_connected_state_for_transient_failures_and_missing_scope():
+    token = _Secrets("saved-refresh")
+    transient_cases = (
+        lambda *_args: (408, b"not json"),
+        lambda *_args: (429, b"not json"),
+        lambda *_args: (502, b"not json"),
+        lambda *_args: (_ for _ in ()).throw(CalendarUnavailableError("offline")),
+    )
+    for post in transient_cases:
+        result = CalendarOAuth(_config(), secret_store=token, post_form=post).status()
+        assert result == CalendarStatus("connected", "credential present; validation unavailable", 1)
+        assert token.token == "saved-refresh"
+
+    missing_scope = CalendarOAuth(
+        _config(), secret_store=token,
+        post_form=lambda *_args: (200, b'{"access_token":"short-lived"}')).status()
+    assert missing_scope == CalendarStatus("connected")
+
+
+def test_status_keeps_hidden_credential_misconfigured_without_google_call():
+    calls = []
+    result = CalendarOAuth(_config(client=""), secret_store=_Secrets("saved-refresh"),
+                           post_form=lambda *_args: calls.append(True)).status()
+    assert result == CalendarStatus(
+        "misconfigured", "credential present but client ID is not configured", 1)
+    assert not calls
+
+
+def test_status_treats_an_explicit_empty_environment_sentinel_as_misconfigured():
+    result = CalendarOAuth(_config(client=None), secret_store=_Secrets()).status()
+    assert result.state == "misconfigured"
+
+
+def test_request_token_classifies_invalid_grant_and_rate_limit_403():
+    oauth = CalendarOAuth(_config(), secret_store=_Secrets())
+    oauth._post_form = lambda *_args: (400, b'{"error":"invalid_grant"}')
+    try:
+        oauth._request_token({})
+    except CalendarExpiredError:
+        pass
+    else:
+        raise AssertionError("invalid_grant did not expire the credential")
+    oauth._post_form = lambda *_args: (403, b'{"error":"rate_limit_exceeded"}')
+    try:
+        oauth._request_token({})
+    except CalendarUnavailableError:
+        pass
+    else:
+        raise AssertionError("rate-limited request was not transient")
+
+
+def test_url_network_failure_is_transient_without_an_http_request():
+    with patch("meeting_recorder.calendar_oauth.urllib.request.urlopen",
+               side_effect=urllib.error.URLError("offline")):
+        try:
+            _post_form("https://example.invalid", {}, 1)
+        except CalendarUnavailableError:
+            pass
+        else:
+            raise AssertionError("network failure was not transient")
 
 
 def test_disconnect_clears_local_token_and_calendar_cache_when_revoke_fails():
@@ -243,3 +378,16 @@ def test_disconnect_clears_local_token_and_calendar_cache_when_revoke_fails():
         os.environ.pop("XDG_CACHE_HOME", None)
     else:
         os.environ["XDG_CACHE_HOME"] = previous
+
+
+def test_disconnect_reports_cache_cleanup_failure_after_attempting_secret_clear():
+    store = _Secrets("saved-refresh")
+
+    def cache_fails():
+        raise OSError("read-only")
+
+    result = CalendarOAuth(_config(), secret_store=store,
+                           cache_clear=cache_fails).disconnect()
+    assert result.state == "misconfigured"
+    assert result.exit_code == 1
+    assert store.cleared and store.token is None

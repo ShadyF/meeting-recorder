@@ -18,6 +18,19 @@ from .utils import LOG, expand_path
 # Ships inside the package so it resolves the same from a source checkout and an
 # installed system package.
 _DEFAULTS_FILE = Path(__file__).resolve().parent / "default_config.json"
+_FORBIDDEN_CALENDAR_KEYS = frozenset({
+    "google_calendar_client_secret",
+    "google_calendar_credential_json",
+    "google_calendar_credentials_json",
+    "google_calendar_credential_file",
+    "google_calendar_credentials_file",
+    "google_calendar_client_credentials",
+    "google_calendar_refresh_token",
+    "google_calendar_access_token",
+    "google_calendar_token",
+    "google_calendar_authorization_code",
+    "google_calendar_auth_code",
+})
 
 
 def _user_config_path() -> Path:
@@ -57,7 +70,7 @@ class Config:
     stop_debounce_seconds: float
     poll_interval_seconds: float
     min_recording_seconds: float
-    google_calendar_client_id: str
+    google_calendar_client_id: str | None
     google_calendar_loopback_port: Any
     allowlist: list[AllowEntry] = field(default_factory=list)
 
@@ -65,6 +78,10 @@ class Config:
     def from_dict(cls, data: dict[str, Any]) -> "Config":
         allow = [AllowEntry(match=str(e["match"]).lower(), app=str(e["app"]))
                  for e in data.get("allowlist", [])]
+        # Preserve an explicitly empty override as invalid Calendar-only state.
+        env_client = (os.environ["MEETING_RECORDER_GOOGLE_CLIENT_ID"] or None
+                      if "MEETING_RECORDER_GOOGLE_CLIENT_ID" in os.environ else
+                      data.get("google_calendar_client_id", ""))
         return cls(
             output_dir=expand_path(data["output_dir"]),
             record_screen=bool(data["record_screen"]),
@@ -89,9 +106,8 @@ class Config:
             stop_debounce_seconds=float(data["stop_debounce_seconds"]),
             poll_interval_seconds=float(data["poll_interval_seconds"]),
             min_recording_seconds=float(data["min_recording_seconds"]),
-            google_calendar_client_id=str(
-                os.environ.get("MEETING_RECORDER_GOOGLE_CLIENT_ID",
-                               data.get("google_calendar_client_id", ""))),
+            google_calendar_client_id=(str(env_client)
+                                       if env_client is not None else None),
             # Calendar commands validate this independently so a malformed
             # optional setting never prevents normal recording startup.
             google_calendar_loopback_port=data.get("google_calendar_loopback_port", 0),
@@ -110,11 +126,17 @@ def load_defaults() -> dict[str, Any]:
 
 
 def _normalize_user_overrides(user: dict[str, Any]) -> dict[str, Any]:
-    """Map the retired capture-mode key to the canonical video-source key."""
+    """Canonicalize legacy video settings and discard forbidden Calendar secrets."""
     normalized = dict(user)
     legacy_source = normalized.pop("capture_mode", None)
     if "video_source" not in normalized and legacy_source is not None:
         normalized["video_source"] = legacy_source
+    # Credential material belongs exclusively in Secret Service, never JSON.
+    for key in tuple(normalized):
+        if key in _FORBIDDEN_CALENDAR_KEYS or (
+                key.startswith("google_calendar_") and
+                any(term in key for term in ("secret", "credential", "_token", "_code"))):
+            normalized.pop(key)
     return normalized
 
 

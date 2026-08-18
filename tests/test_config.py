@@ -5,6 +5,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from meeting_recorder.calendar_oauth import CalendarOAuth
 from meeting_recorder.config import load_config, load_raw_config, save_user_config
 from meeting_recorder.domain import VideoSource
 
@@ -79,3 +80,46 @@ def test_google_client_environment_override_is_typed_only_and_not_saved():
             os.environ.pop("MEETING_RECORDER_GOOGLE_CLIENT_ID", None)
         else:
             os.environ["MEETING_RECORDER_GOOGLE_CLIENT_ID"] = previous
+
+
+def test_empty_google_client_environment_override_stays_calendar_only_invalid_state():
+    previous = os.environ.get("MEETING_RECORDER_GOOGLE_CLIENT_ID")
+    os.environ["MEETING_RECORDER_GOOGLE_CLIENT_ID"] = ""
+    try:
+        def check(path):
+            cfg = load_config()
+            assert cfg.google_calendar_client_id is None
+            assert cfg.video_source is VideoSource.FULLSCREEN
+            assert CalendarOAuth(cfg).status().state == "misconfigured"
+            assert load_raw_config()["google_calendar_client_id"] == "file.apps.googleusercontent.com"
+            save_user_config(load_raw_config())
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            assert saved["google_calendar_client_id"] == "file.apps.googleusercontent.com"
+
+        _with_user_config({"google_calendar_client_id": "file.apps.googleusercontent.com"}, check)
+    finally:
+        if previous is None:
+            os.environ.pop("MEETING_RECORDER_GOOGLE_CLIENT_ID", None)
+        else:
+            os.environ["MEETING_RECORDER_GOOGLE_CLIENT_ID"] = previous
+
+
+def test_calendar_credential_shaped_keys_are_not_retained_but_unknown_keys_are():
+    forbidden = {
+        "google_calendar_client_secret": "secret",
+        "google_calendar_credential_json": "{}",
+        "google_calendar_refresh_token": "refresh",
+        "google_calendar_access_token": "access",
+        "google_calendar_authorization_code": "code",
+    }
+
+    def check(path):
+        raw = load_raw_config()
+        assert not (set(forbidden) & set(raw))
+        assert raw["future_setting"] == "kept"
+        save_user_config(raw)
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert not (set(forbidden) & set(saved))
+        assert saved["future_setting"] == "kept"
+
+    _with_user_config({**forbidden, "future_setting": "kept"}, check)

@@ -33,6 +33,7 @@ SCOPES = (
 )
 _CLIENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.apps\.googleusercontent\.com$")
 _CALLBACK_PATH = "/oauth2/callback"
+_CONNECTION_TIMEOUT_SECONDS = 10
 
 
 class CalendarError(RuntimeError):
@@ -126,7 +127,11 @@ def calendar_cache_path() -> Path:
 
 def clear_calendar_cache() -> None:
     """Remove only Calendar's private cache subtree."""
-    shutil.rmtree(calendar_cache_path(), ignore_errors=True)
+    try:
+        shutil.rmtree(calendar_cache_path())
+    except FileNotFoundError:
+        # A missing dedicated subtree already confirms local cache removal.
+        return
 
 
 def _post_form(url: str, data: dict[str, str], timeout: float) -> tuple[int, bytes]:
@@ -157,6 +162,23 @@ def _required_scopes(data: dict[str, Any]) -> bool:
     return isinstance(scopes, str) and set(SCOPES).issubset(scopes.split())
 
 
+def _retryable_403(response: dict[str, Any]) -> bool:
+    """Recognize Google rate-limit payloads without treating all 403s as transient."""
+    error = response.get("error")
+    values: list[str] = []
+    if isinstance(error, str):
+        values.append(error)
+    elif isinstance(error, dict):
+        values.extend(str(error.get(key, "")) for key in ("status", "message"))
+        details = error.get("errors", [])
+        if isinstance(details, list):
+            values.extend(str(item.get("reason", "")) for item in details
+                          if isinstance(item, dict))
+    normalized = " ".join(values).lower().replace("_", "").replace(" ", "").replace("-", "")
+    return any(term in normalized for term in
+               ("ratelimit", "quota", "retry", "temporarily", "resourceexhausted"))
+
+
 class CalendarOAuth:
     """OAuth workflow with injectable I/O for deterministic, network-free tests."""
 
@@ -164,20 +186,20 @@ class CalendarOAuth:
                  post_form: Callable[[str, dict[str, str], float], tuple[int, bytes]] = _post_form,
                  browser_open: Callable[[str], bool] = webbrowser.open,
                  server_factory: Callable[..., HTTPServer] = HTTPServer,
+                 cache_clear: Callable[[], None] = clear_calendar_cache,
                  callback_timeout: float = 120, max_callback_requests: int = 3) -> None:
         self.config = config
         self.secrets = secret_store or CalendarSecrets()
         self._post_form = post_form
         self._browser_open = browser_open
         self._server_factory = server_factory
+        self._cache_clear = cache_clear
         self._callback_timeout = callback_timeout
         self._max_callback_requests = max_callback_requests
 
-    def _configuration(self, *, require_client: bool = True) -> tuple[str | None, int]:
+    def _configuration(self) -> tuple[str | None, int]:
         port = validate_loopback_port(self.config.google_calendar_loopback_port)
         raw_client = self.config.google_calendar_client_id
-        if raw_client == "" and not require_client:
-            return None, port
         if raw_client == "":
             return None, port
         return validate_client_id(raw_client), port
@@ -186,7 +208,11 @@ class CalendarOAuth:
         status, body = self._post_form(TOKEN_URL, data, 15)
         if status >= 500:
             raise CalendarUnavailableError("Google validation is temporarily unavailable")
+        if status in (408, 429):
+            raise CalendarUnavailableError("Google validation is temporarily unavailable")
         response = _json_response(body)
+        if status == 403 and _retryable_403(response):
+            raise CalendarUnavailableError("Google validation is temporarily unavailable")
         if status >= 400:
             error = response.get("error")
             if error == "invalid_grant":
@@ -213,8 +239,7 @@ class CalendarOAuth:
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(b"Authorization received. You may close this window.")
-                except CalendarConfigurationError as exc:
-                    result["error"] = str(exc)
+                except CalendarConfigurationError:
                     self.send_response(400)
                     self.end_headers()
                     self.wfile.write(b"Authorization callback rejected.")
@@ -226,6 +251,18 @@ class CalendarOAuth:
         # Replace the temporary handler assigned at bind time before accepting.
         server.RequestHandlerClass = CallbackHandler
         deadline = time.monotonic() + self._callback_timeout
+
+        # Bound each accepted socket so a partial local request cannot hold the
+        # single-threaded listener past the overall authorization deadline.
+        original_get_request = getattr(server, "get_request", None)
+        if original_get_request is not None:
+            def get_request_with_timeout():
+                request, address = original_get_request()
+                remaining = max(0.001, deadline - time.monotonic())
+                request.settimeout(min(_CONNECTION_TIMEOUT_SECONDS, remaining))
+                return request, address
+
+            server.get_request = get_request_with_timeout
         for _ in range(self._max_callback_requests):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -234,8 +271,6 @@ class CalendarOAuth:
             server.handle_request()
             if "code" in result:
                 return result["code"]
-            if "error" in result:
-                raise CalendarConfigurationError(result["error"])
         raise CalendarUnavailableError("OAuth callback timed out")
 
     def connect(self) -> None:
@@ -284,12 +319,15 @@ class CalendarOAuth:
             client_id, _port = self._configuration()
         except CalendarConfigurationError as exc:
             return CalendarStatus("misconfigured", str(exc), 1)
-        if client_id is None:
-            return CalendarStatus("disconnected")
         try:
             refresh_token = self.secrets.load()
         except SecretServiceError as exc:
             return CalendarStatus("misconfigured", str(exc), 1)
+        if client_id is None:
+            if refresh_token:
+                return CalendarStatus("misconfigured",
+                                      "credential present but client ID is not configured", 1)
+            return CalendarStatus("disconnected")
         if refresh_token is None:
             return CalendarStatus("disconnected")
         try:
@@ -300,13 +338,13 @@ class CalendarOAuth:
             })
             if not isinstance(response.get("access_token"), str) or not response["access_token"]:
                 raise CalendarConfigurationError("Google returned a malformed credential")
-            if not _required_scopes(response):
+            if "scope" in response and not _required_scopes(response):
                 raise CalendarConfigurationError("Google did not grant the required Calendar scopes")
         except CalendarExpiredError as exc:
             return CalendarStatus("expired", str(exc), 1)
         except CalendarUnavailableError:
             # Keep the token for diagnosis; a transient outage is not revocation.
-            return CalendarStatus("misconfigured", "credential present but validation unavailable", 1)
+            return CalendarStatus("connected", "credential present; validation unavailable", 1)
         except CalendarConfigurationError as exc:
             return CalendarStatus("misconfigured", str(exc), 1)
         return CalendarStatus("connected")
@@ -314,11 +352,11 @@ class CalendarOAuth:
     def disconnect(self) -> CalendarStatus:
         """Revoke best-effort and always remove local Calendar-only data."""
         token: str | None = None
-        clear_error: SecretServiceError | None = None
+        cleanup_errors: list[str] = []
         try:
             token = self.secrets.load()
         except SecretServiceError as exc:
-            clear_error = exc
+            cleanup_errors.append(str(exc))
         try:
             if token:
                 self._revoke(token)
@@ -326,8 +364,11 @@ class CalendarOAuth:
             try:
                 self.secrets.clear()
             except SecretServiceError as exc:
-                clear_error = exc
-            clear_calendar_cache()
-        if clear_error:
-            return CalendarStatus("misconfigured", str(clear_error), 1)
+                cleanup_errors.append(str(exc))
+            try:
+                self._cache_clear()
+            except OSError:
+                cleanup_errors.append("Calendar cache could not be removed")
+        if cleanup_errors:
+            return CalendarStatus("misconfigured", "; ".join(cleanup_errors), 1)
         return CalendarStatus("disconnected")
