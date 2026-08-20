@@ -47,7 +47,7 @@ def _media() -> MediaIdentity:
 def _job(state=PublicationState.READY, **changes) -> PublicationJob:
     values = dict(
         key=PublicationKey("HTTPS://EXAMPLE.COM:443/", HASH.upper()),
-        path_hint="renamed.mkv", media_device=1, media_inode=2, media_size=3,
+        media_device=1, media_inode=2, media_size=3,
         source_mtime_ns=4_000_000_000, file_last_modified_ms=4_000,
         state=state, created_at_ms=1_000, updated_at_ms=1_000,
     )
@@ -55,7 +55,10 @@ def _job(state=PublicationState.READY, **changes) -> PublicationJob:
         values.update(attempt_count=1, transfer_started_at_ms=1_000)
     elif state in {PublicationState.TRANSFER_REJECTED, PublicationState.TRANSFER_UNKNOWN}:
         values.update(attempt_count=1, transfer_started_at_ms=1_000,
-                      last_error_code="network_error", last_http_status=503, updated_at_ms=2_000)
+                      last_error_code=(
+                          "transfer_rejected" if state is PublicationState.TRANSFER_REJECTED
+                          else "transfer_unknown"
+                      ), last_http_status=503, updated_at_ms=2_000)
     elif state is PublicationState.METADATA_PENDING:
         values.update(attempt_count=1, remote_recording_id=9,
                       transfer_started_at_ms=1_000, accepted_at_ms=2_000, updated_at_ms=2_000)
@@ -74,6 +77,9 @@ def test_url_normalization_canonicalizes_origins_and_ports() -> None:
         "http://192.0.2.10:8080/": "http://192.0.2.10:8080",
         "https://[2001:DB8::1]/": "https://[2001:db8::1]",
         "http://[2001:DB8::2]:8080/": "http://[2001:db8::2]:8080",
+        "https://[2001:0db8:0000:0000:0000:0000:0000:0001]": "https://[2001:db8::1]",
+        "https://BÜCHER.example/": "https://xn--bcher-kva.example",
+        "https://XN--BCHER-KVA.EXAMPLE": "https://xn--bcher-kva.example",
         "https://example.com:8443": "https://example.com:8443",
     }
     for source, expected in cases.items():
@@ -89,6 +95,7 @@ def test_url_normalization_rejects_every_non_origin_class() -> None:
         "https://example.com:abc", "https://example.com:65536", "https://example.com:-1",
         "https://[not-ipv6]", "https://[2001:db8::1", "https://example.com\n",
         "https://example.com\t", "https://example.com\u2003",
+        "https://[fe80::1%eth0]", "https://[FE80::1%25eth0]",
     )
     for value in rejected:
         _raises(normalize_speakr_url, value)
@@ -112,24 +119,30 @@ def test_publication_job_has_only_public_scalar_schema_and_validates_states() ->
     ]
     names = {field.name for field in fields(PublicationJob)}
     assert names == {
-        "key", "state", "remote_recording_id", "path_hint", "media_device", "media_inode",
+        "key", "state", "remote_recording_id", "media_device", "media_inode",
         "media_size", "source_mtime_ns", "file_last_modified_ms", "attempt_count",
         "last_error_code", "last_http_status", "transfer_started_at_ms", "accepted_at_ms",
         "published_at_ms", "created_at_ms", "updated_at_ms",
     }
+    assert {field.name for field in fields(PublicationResult)} == {"job", "already_published"}
     assert _job().state is PublicationState.READY
     assert _job(PublicationState.TRANSFERRING).transfer_started_at_ms == 1_000
     assert _job(PublicationState.PUBLISHED).remote_recording_id == 9
     assert PublicationResult(_job(PublicationState.PUBLISHED), True).already_published
     _raises(PublicationResult, _job(), 1)
     _raises(_job, PublicationState.METADATA_PENDING, remote_recording_id=True)
+    _raises(_job, PublicationState.METADATA_PENDING, attempt_count=0)
     _raises(_job, PublicationState.PUBLISHED, remote_recording_id=0)
+    _raises(_job, PublicationState.PUBLISHED, attempt_count=0)
     _raises(_job, PublicationState.READY, transfer_started_at_ms=1_000)
     _raises(_job, PublicationState.PUBLISHED, published_at_ms=None)
     _raises(_job, PublicationState.TRANSFER_REJECTED, last_error_code="Bearer secret")
     _raises(_job, PublicationState.TRANSFER_REJECTED, last_http_status=True)
     pending = _job(PublicationState.METADATA_PENDING, last_error_code="metadata_failed", last_http_status=503)
     assert pending.last_error_code == "metadata_failed"
+    result = PublicationResult(pending)
+    assert result.error_code == "metadata_failed"
+    assert result.http_status == 503
     assert "secret" not in repr(pending).casefold()
     try:
         pending.state = PublicationState.READY

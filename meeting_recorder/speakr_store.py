@@ -13,7 +13,10 @@ import threading
 import time
 from typing import Callable, Iterator, Sequence
 
-from .speakr_domain import MediaIdentity, PublicationJob, PublicationKey, PublicationResult, PublicationState
+from .speakr_domain import (
+    MediaIdentity, PublicationJob, PublicationKey, PublicationResult, PublicationState,
+    _SAFE_ERROR_CODES,
+)
 
 
 class PublicationStoreError(RuntimeError):
@@ -42,18 +45,11 @@ _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 # Only bounded classifications cross the durable boundary.  In particular,
 # transport messages, response bodies, credentials, and filesystem details do
 # not belong in the database.
-_ALLOWED_ERROR_CODES = frozenset({
-    "auth_error", "connection_error", "conflict", "file_changed", "http_error",
-    "interrupted_transfer", "invalid_media", "invalid_response", "metadata_ambiguous",
-    "metadata_changed", "metadata_failed", "metadata_malformed", "metadata_missing",
-    "metadata_unavailable", "network_error", "not_found", "permission_denied",
-    "protocol_error", "server_error", "staging_failed", "timeout", "transfer_not_sent",
-    "transfer_rejected", "transfer_unknown", "unknown", "upload_failed",
-})
+_ALLOWED_ERROR_CODES = _SAFE_ERROR_CODES
 
 _COLUMN_NAMES = (
-    "instance_url", "recording_sha256", "path_hint", "media_device", "media_inode",
-    "media_size", "source_mtime_ns", "file_last_modified_ms", "state", "attempt_count",
+    "instance_url", "recording_sha256", "media_device", "media_inode", "media_size",
+    "source_mtime_ns", "file_last_modified_ms", "state", "attempt_count",
     "remote_recording_id", "last_error_code", "last_http_status", "transfer_started_at_ms",
     "accepted_at_ms", "published_at_ms", "created_at_ms", "updated_at_ms",
 )
@@ -67,7 +63,6 @@ def _schema_sql() -> str:
         CREATE TABLE publications (
             instance_url TEXT NOT NULL,
             recording_sha256 TEXT NOT NULL,
-            path_hint TEXT NOT NULL CHECK(length(path_hint) > 0),
             media_device INTEGER NOT NULL CHECK(media_device >= 0),
             media_inode INTEGER NOT NULL CHECK(media_inode >= 0),
             media_size INTEGER NOT NULL CHECK(media_size >= 0),
@@ -101,11 +96,11 @@ def _schema_sql() -> str:
                     AND remote_recording_id IS NULL AND last_error_code IS NOT NULL
                     AND transfer_started_at_ms IS NOT NULL AND accepted_at_ms IS NULL AND published_at_ms IS NULL)
                 OR
-                (state = 'metadata_pending' AND remote_recording_id > 0
+                (state = 'metadata_pending' AND attempt_count > 0 AND remote_recording_id > 0
                     AND transfer_started_at_ms IS NOT NULL AND accepted_at_ms IS NOT NULL AND published_at_ms IS NULL
                     AND accepted_at_ms >= transfer_started_at_ms)
                 OR
-                (state = 'published' AND remote_recording_id > 0
+                (state = 'published' AND attempt_count > 0 AND remote_recording_id > 0
                     AND last_error_code IS NULL AND last_http_status IS NULL
                     AND transfer_started_at_ms IS NOT NULL AND accepted_at_ms IS NOT NULL AND published_at_ms IS NOT NULL
                     AND accepted_at_ms >= transfer_started_at_ms AND published_at_ms >= accepted_at_ms)
@@ -138,12 +133,6 @@ def _validate_nonnegative_int(value: object, name: str) -> int:
     return value
 
 
-def _validate_path(value: object) -> str:
-    if not isinstance(value, (str, Path)) or not str(value) or "\x00" in str(value):
-        raise ValueError("publication path is invalid")
-    return str(value)
-
-
 def _validate_identity(value: object) -> MediaIdentity:
     if not isinstance(value, MediaIdentity):
         raise ValueError("media identity is invalid")
@@ -159,6 +148,8 @@ def _validate_fd(fd: int, message: str) -> os.stat_result:
         raise PublicationStoreSecurityError(message)
     if stat.S_IMODE(info.st_mode) != _PRIVATE_FILE_MODE:
         raise PublicationStoreSecurityError("state-store file permissions are unsafe")
+    if info.st_uid != os.getuid():
+        raise PublicationStoreSecurityError("state-store file ownership is unsafe")
     return info
 
 
@@ -170,11 +161,60 @@ def _private_directory(path: Path) -> None:
         raise PublicationStoreSecurityError("state-store directory is unavailable") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise PublicationStoreSecurityError("state-store directory is not a directory")
+    if info.st_uid != os.getuid():
+        raise PublicationStoreSecurityError("state-store directory ownership is unsafe")
     if stat.S_IMODE(info.st_mode) != _PRIVATE_DIR_MODE:
         try:
             os.chmod(path, _PRIVATE_DIR_MODE)
         except OSError as exc:
             raise PublicationStoreSecurityError("state-store directory permissions are unsafe") from exc
+        info = path.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != _PRIVATE_DIR_MODE
+        ):
+            raise PublicationStoreSecurityError("state-store directory permissions are unsafe")
+
+
+def _private_file_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_mode, info.st_uid
+
+
+def _verify_path_matches_fd(path: Path, descriptor_info: os.stat_result) -> None:
+    """Reject a pathname that no longer names the validated private inode."""
+    try:
+        path_info = os.lstat(path)
+    except OSError as exc:
+        raise PublicationStoreSecurityError("state-store path changed during open") from exc
+    if _private_file_identity(path_info) != _private_file_identity(descriptor_info):
+        raise PublicationStoreSecurityError("state-store path changed during open")
+
+
+def _verify_private_file(
+    path: Path, descriptor: int, expected_info: os.stat_result,
+) -> None:
+    """Revalidate the open inode and pathname after SQLite touches the database."""
+    current_info = _validate_fd(descriptor, "state-store component is not a regular file")
+    if _private_file_identity(current_info) != _private_file_identity(expected_info):
+        raise PublicationStoreSecurityError("state-store file changed during open")
+    _verify_path_matches_fd(path, current_info)
+
+
+def _verify_private_parent(path: Path) -> None:
+    """Recheck the parent before every SQLite open because DELETE journals use its pathname."""
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise PublicationStoreSecurityError("state-store directory is unavailable") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != _PRIVATE_DIR_MODE
+        or info.st_uid != os.getuid()
+    ):
+        raise PublicationStoreSecurityError("state-store directory is not private")
 
 
 def _open_private_file(path: Path) -> tuple[int, bool]:
@@ -272,19 +312,39 @@ class PublicationStore:
                     pass
 
     def _connect(self) -> sqlite3.Connection:
-        # Validate the final component immediately before SQLite opens it.
-        descriptor, _ = _open_private_file(self.database_path)
+        _verify_private_parent(self.state_directory)
+        descriptor = -1
+        connection: sqlite3.Connection | None = None
         try:
+            # Keep the validated inode open while SQLite resolves the pathname;
+            # this closes the replacement race before DELETE-journal setup.
+            descriptor, _ = _open_private_file(self.database_path)
+            descriptor_info = _validate_fd(descriptor, "state-store component is not a regular file")
+            _verify_path_matches_fd(self.database_path, descriptor_info)
             connection = sqlite3.connect(self.database_path, timeout=5.0, isolation_level=None)
+            _verify_private_file(self.database_path, descriptor, descriptor_info)
+            _verify_private_parent(self.state_directory)
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("PRAGMA journal_mode = DELETE")
+            connection.execute("PRAGMA synchronous = FULL")
+            _verify_private_file(self.database_path, descriptor, descriptor_info)
+            _verify_private_parent(self.state_directory)
+            return connection
         except Exception:
-            os.close(descriptor)
+            # Setup failures must not leak either side of the descriptor/path pair.
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
             raise
-        os.close(descriptor)
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def migrate(self) -> None:
         """Create schema version one and reject every private legacy schema."""
@@ -346,7 +406,6 @@ class PublicationStore:
                 key=PublicationKey(values["instance_url"], values["recording_sha256"]),
                 state=PublicationState(values["state"]),
                 remote_recording_id=values["remote_recording_id"],
-                path_hint=values["path_hint"],
                 media_device=values["media_device"], media_inode=values["media_inode"],
                 media_size=values["media_size"], source_mtime_ns=values["source_mtime_ns"],
                 file_last_modified_ms=values["file_last_modified_ms"],
@@ -410,8 +469,8 @@ class PublicationStore:
         file_last_modified_ms = _validate_nonnegative_int(file_last_modified_ms, "file last modified time")
         now = self._time_ms()
         values = (
-            key.instance_url, key.recording_sha256, _validate_path(identity.path),
-            identity.device, identity.inode, identity.size, identity.mtime_ns,
+            key.instance_url, key.recording_sha256, identity.device, identity.inode,
+            identity.size, identity.mtime_ns,
             file_last_modified_ms, PublicationState.READY.value, 0, None, None, None,
             None, None, None, now, now,
         )
@@ -440,7 +499,7 @@ class PublicationStore:
             cursor = connection.execute(
                 """
                 UPDATE publications
-                   SET state = 'transferring', path_hint = ?, media_device = ?, media_inode = ?,
+                   SET state = 'transferring', media_device = ?, media_inode = ?,
                        media_size = ?, source_mtime_ns = ?, file_last_modified_ms = ?,
                        attempt_count = attempt_count + 1, transfer_started_at_ms = ?,
                        accepted_at_ms = NULL, published_at_ms = NULL, remote_recording_id = NULL,
@@ -448,8 +507,8 @@ class PublicationStore:
                  WHERE instance_url = ? AND recording_sha256 = ?
                    AND state IN ('ready', 'transfer_rejected')
                 """,
-                (_validate_path(identity.path), identity.device, identity.inode, identity.size,
-                 identity.mtime_ns, mtime_ms, started, started,
+                (identity.device, identity.inode, identity.size, identity.mtime_ns,
+                 mtime_ms, started, started,
                  key.instance_url, key.recording_sha256),
             )
             if cursor.rowcount != 1:
@@ -521,26 +580,24 @@ class PublicationStore:
         return self._write(accept)  # type: ignore[return-value]
 
     def mark_metadata_pending(
-        self, key: PublicationKey, error_code: str, status: int | None, current_path: Path | str,
+        self, key: PublicationKey, error_code: str, status: int | None,
     ) -> PublicationJob:
         if not isinstance(key, PublicationKey):
             raise TypeError("mark_metadata_pending requires a PublicationKey")
         error_code = _validate_error_code(error_code)
         if status is not None:
             status = _validate_http_status(status)
-        current_path = _validate_path(current_path)
-
         def pending(connection: sqlite3.Connection) -> PublicationJob:
             now = self._time_ms()
             cursor = connection.execute(
                 """
-                UPDATE publications SET state = 'metadata_pending', path_hint = ?,
+                UPDATE publications SET state = 'metadata_pending',
                     last_error_code = ?, last_http_status = ?, published_at_ms = NULL,
                     updated_at_ms = ?
                  WHERE instance_url = ? AND recording_sha256 = ?
                    AND state = 'metadata_pending'
                 """,
-                (current_path, error_code, status, now, key.instance_url, key.recording_sha256),
+                (error_code, status, now, key.instance_url, key.recording_sha256),
             )
             if cursor.rowcount != 1:
                 raise self._transition_error(connection, key)
@@ -548,11 +605,9 @@ class PublicationStore:
 
         return self._write(pending)  # type: ignore[return-value]
 
-    def mark_published(self, key: PublicationKey, current_path: Path | str) -> PublicationResult:
+    def mark_published(self, key: PublicationKey) -> PublicationResult:
         if not isinstance(key, PublicationKey):
             raise TypeError("mark_published requires a PublicationKey")
-        current_path = _validate_path(current_path)
-
         def publish(connection: sqlite3.Connection) -> PublicationResult:
             row = self._fetch(connection, key)
             if row is None:
@@ -565,12 +620,12 @@ class PublicationStore:
             published = self._time_ms()
             cursor = connection.execute(
                 """
-                UPDATE publications SET state = 'published', path_hint = ?,
+                UPDATE publications SET state = 'published',
                     last_error_code = NULL, last_http_status = NULL,
                     published_at_ms = ?, updated_at_ms = ?
                  WHERE instance_url = ? AND recording_sha256 = ? AND state = 'metadata_pending'
                 """,
-                (current_path, published, published, key.instance_url, key.recording_sha256),
+                (published, published, key.instance_url, key.recording_sha256),
             )
             if cursor.rowcount != 1:
                 raise self._transition_error(connection, key)

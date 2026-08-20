@@ -127,6 +127,8 @@ def test_speakr_command_state_messages_are_safe_and_stable() -> None:
         result = SimpleNamespace(
             job=SimpleNamespace(state=state, last_http_status=503),
             already_published=expected_text == "already published",
+            error_code=None,
+            http_status=503,
         )
         with patch.dict(os.environ, {"MEETING_RECORDER_SPEAKR_TOKEN": TOKEN}, clear=False), \
                 patch("meeting_recorder.__main__.resolve_speakr_url", return_value="https://example.test"), \

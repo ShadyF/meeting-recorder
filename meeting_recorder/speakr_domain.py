@@ -62,11 +62,12 @@ def normalize_speakr_url(value: object) -> str:
         port_text = authority[closing_bracket + 1:]
         if not host_text or (port_text and not re.fullmatch(r":\d+", port_text)):
             raise ValueError("Speakr URL has a malformed authority")
+        if "%" in host_text:
+            raise ValueError("Speakr URL zone identifiers are not supported")
         try:
-            ipaddress.IPv6Address(host_text.split("%", 1)[0])
+            rendered_host = f"[{ipaddress.IPv6Address(host_text).compressed.casefold()}]"
         except ValueError as exc:
             raise ValueError("Speakr URL has a malformed IPv6 host") from exc
-        rendered_host = f"[{hostname.casefold()}]"
     else:
         if ":" in authority:
             host_text, port_text = authority.rsplit(":", 1)
@@ -76,7 +77,10 @@ def normalize_speakr_url(value: object) -> str:
             host_text = authority
         if not host_text or ":" in host_text or "[" in host_text or "]" in host_text:
             raise ValueError("Speakr URL has a malformed host")
-        rendered_host = hostname.casefold()
+        try:
+            rendered_host = hostname.encode("idna").decode("ascii").casefold()
+        except UnicodeError as exc:
+            raise ValueError("Speakr URL has a malformed DNS host") from exc
 
     if port is not None and not 0 <= port <= 65535:
         raise ValueError("Speakr URL port is out of range")
@@ -173,6 +177,11 @@ class SpeakrMetadata:
 
 
 _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_ERROR_CODES = frozenset({
+    "interrupted_transfer", "metadata_ambiguous", "metadata_changed", "metadata_failed",
+    "metadata_malformed", "metadata_missing", "metadata_unavailable", "protocol_error",
+    "transfer_not_sent", "transfer_rejected", "transfer_unknown",
+})
 
 
 @dataclass(frozen=True)
@@ -182,7 +191,6 @@ class PublicationJob:
     key: PublicationKey
     state: PublicationState = PublicationState.READY
     remote_recording_id: int | None = None
-    path_hint: str = ""
     media_device: int = 0
     media_inode: int = 0
     media_size: int = 0
@@ -202,11 +210,6 @@ class PublicationJob:
             raise ValueError("publication key is invalid")
         if not isinstance(self.state, PublicationState):
             raise ValueError("publication state is invalid")
-        if not isinstance(self.path_hint, (str, Path)) or not str(self.path_hint):
-            raise ValueError("publication path hint is invalid")
-        object.__setattr__(self, "path_hint", str(self.path_hint))
-        if "\x00" in self.path_hint:
-            raise ValueError("publication path hint is invalid")
         for value, name in (
             (self.media_device, "media device"), (self.media_inode, "media inode"),
             (self.media_size, "media size"), (self.source_mtime_ns, "source mtime"),
@@ -238,7 +241,10 @@ class PublicationJob:
         if self.remote_recording_id is not None and (
                 type(self.remote_recording_id) is not int or self.remote_recording_id <= 0):
             raise ValueError("remote recording ID must be a positive integer")
-        if self.last_error_code is not None and _SAFE_ERROR_CODE.fullmatch(self.last_error_code) is None:
+        if self.last_error_code is not None and (
+                not isinstance(self.last_error_code, str)
+                or _SAFE_ERROR_CODE.fullmatch(self.last_error_code) is None
+                or self.last_error_code not in _SAFE_ERROR_CODES):
             raise ValueError("error code is not an allowed safe code")
         if self.last_http_status is not None and (
                 type(self.last_http_status) is not int or not 100 <= self.last_http_status <= 599):
@@ -266,7 +272,7 @@ class PublicationJob:
             if self.remote_recording_id is not None or self.last_error_code is None:
                 raise ValueError("failed transfers require no remote ID and a safe error")
         else:
-            if self.remote_recording_id is None or self.transfer_started_at_ms is None:
+            if self.attempt_count <= 0 or self.remote_recording_id is None or self.transfer_started_at_ms is None:
                 raise ValueError("accepted states require a remote ID and transfer start")
             if self.accepted_at_ms is None or self.accepted_at_ms < self.transfer_started_at_ms:
                 raise ValueError("accepted states require an ordered acceptance time")
@@ -286,19 +292,22 @@ class PublicationResult:
 
     job: PublicationJob
     already_published: bool = False
-    error_code: str | None = None
-    http_status: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.job, PublicationJob):
             raise ValueError("publication result job is invalid")
         if type(self.already_published) is not bool:
             raise ValueError("already_published must be a bool")
-        if self.error_code is not None and _SAFE_ERROR_CODE.fullmatch(self.error_code) is None:
-            raise ValueError("publication result error code is invalid")
-        if self.http_status is not None and (
-                type(self.http_status) is not int or not 100 <= self.http_status <= 599):
-            raise ValueError("publication result HTTP status is invalid")
+
+    @property
+    def error_code(self) -> str | None:
+        """Expose the job's current safe error without duplicating durable state."""
+        return self.job.last_error_code
+
+    @property
+    def http_status(self) -> int | None:
+        """Expose the job's current HTTP status without duplicating durable state."""
+        return self.job.last_http_status
 
 
 def _mtime_utc(mtime_ns: int) -> datetime:

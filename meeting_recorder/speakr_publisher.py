@@ -121,31 +121,54 @@ class SpeakrPublisher:
                 if job.state not in {PublicationState.READY, PublicationState.TRANSFER_REJECTED}:
                     return self._result(job)
 
-                # Check the open source descriptor immediately before recording
-                # the transfer intent, so a preflight mutation cannot be sent.
+                # Check both descriptors before recording transfer intent so a
+                # preflight mutation cannot be sent under the staged identity.
                 self._require_unchanged(source_descriptor, staged.descriptor_info)
+                self._require_staged_unchanged(staged)
                 self.store.begin_transfer(
                     key, staged.identity, staged.file_last_modified_ms,
                 )
+
+                # A staging mutation after durable transfer intent is ambiguous,
+                # even if the transport has not started sending request bytes.
                 try:
-                    remote_id = self._upload(instance_url, token, source, staged)
-                except TransferNotSent:
-                    rejected = self.store.mark_transfer_rejected(key, "transfer_not_sent")
-                    return self._result(rejected)
-                except TransferRejected as exc:
-                    rejected = self.store.mark_transfer_rejected(
-                        key, "transfer_rejected", exc.status,
-                    )
-                    return self._result(rejected)
-                except TransferOutcomeUnknown:
+                    self._require_staged_unchanged(staged)
+                except ValueError:
                     unknown = self.store.mark_transfer_unknown(key, "transfer_unknown")
                     return self._result(unknown)
-                except (ValueError, TypeError):
-                    # Validation failures can occur before request bytes are sent;
-                    # the durable outcome remains a safe, retryable rejection.
-                    rejected = self.store.mark_transfer_rejected(key, "protocol_error")
-                    return self._result(rejected)
-                except Exception:
+
+                remote_id: int | None = None
+                upload_error: Exception | None = None
+                try:
+                    remote_id = self._upload(instance_url, token, source, staged)
+                except Exception as exc:
+                    upload_error = exc
+
+                # The remote ID is not durable until this post-transport check
+                # confirms that the exact staged inode remained intact.
+                try:
+                    self._require_staged_unchanged(staged)
+                except ValueError:
+                    unknown = self.store.mark_transfer_unknown(key, "transfer_unknown")
+                    return self._result(unknown)
+
+                if upload_error is not None:
+                    if isinstance(upload_error, TransferNotSent):
+                        rejected = self.store.mark_transfer_rejected(key, "transfer_not_sent")
+                        return self._result(rejected)
+                    if isinstance(upload_error, TransferRejected):
+                        rejected = self.store.mark_transfer_rejected(
+                            key, "transfer_rejected", upload_error.status,
+                        )
+                        return self._result(rejected)
+                    if isinstance(upload_error, TransferOutcomeUnknown):
+                        unknown = self.store.mark_transfer_unknown(key, "transfer_unknown")
+                        return self._result(unknown)
+                    if isinstance(upload_error, (ValueError, TypeError)):
+                        # Validation failures can occur before request bytes are sent;
+                        # the durable outcome remains a safe, retryable rejection.
+                        rejected = self.store.mark_transfer_rejected(key, "protocol_error")
+                        return self._result(rejected)
                     # An injected or future transport failure may have sent bytes.
                     unknown = self.store.mark_transfer_unknown(key, "transfer_unknown")
                     return self._result(unknown)
@@ -154,7 +177,14 @@ class SpeakrPublisher:
                     unknown = self.store.mark_transfer_unknown(key, "transfer_unknown")
                     return self._result(unknown)
 
-                # Commit the remote ID before any filesystem or PATCH work.
+                try:
+                    self._require_staged_unchanged(staged)
+                except ValueError:
+                    unknown = self.store.mark_transfer_unknown(key, "transfer_unknown")
+                    return self._result(unknown)
+
+                # Commit the remote ID only after the staged bytes have passed
+                # the final post-transport identity check.
                 accepted = self.store.accept_transfer(key, remote_id)
                 return self._finish_metadata(
                     key, accepted, source, source_descriptor, staged, token,
@@ -194,12 +224,12 @@ class SpeakrPublisher:
             )
         except _MetadataProblem as exc:
             pending = self.store.mark_metadata_pending(
-                key, exc.code, None, exc.path,
+                key, exc.code, None,
             )
             return self._result(pending)
         except Exception:
             pending = self.store.mark_metadata_pending(
-                key, "metadata_unavailable", None, job.path_hint,
+                key, "metadata_unavailable", None,
             )
             return self._result(pending)
 
@@ -208,7 +238,7 @@ class SpeakrPublisher:
             self._require_unchanged(source_descriptor, staged.descriptor_info)
         except ValueError:
             pending = self.store.mark_metadata_pending(
-                key, "metadata_changed", None, current_path,
+                key, "metadata_changed", None,
             )
             return self._result(pending)
 
@@ -218,12 +248,12 @@ class SpeakrPublisher:
             )
         except _MetadataProblem as exc:
             pending = self.store.mark_metadata_pending(
-                key, exc.code, None, exc.path,
+                key, exc.code, None,
             )
             return self._result(pending)
         except Exception:
             pending = self.store.mark_metadata_pending(
-                key, "metadata_malformed", None, current_path,
+                key, "metadata_malformed", None,
             )
             return self._result(pending)
 
@@ -233,21 +263,21 @@ class SpeakrPublisher:
             )
         except MetadataRejected as exc:
             pending = self.store.mark_metadata_pending(
-                key, "metadata_failed", exc.status, current_path,
+                key, "metadata_failed", exc.status,
             )
             return self._result(pending)
         except MetadataUnavailable:
             pending = self.store.mark_metadata_pending(
-                key, "metadata_failed", None, current_path,
+                key, "metadata_failed", None,
             )
             return self._result(pending)
         except Exception:
             pending = self.store.mark_metadata_pending(
-                key, "metadata_failed", None, current_path,
+                key, "metadata_failed", None,
             )
             return self._result(pending)
 
-        return self.store.mark_published(key, current_path)
+        return self.store.mark_published(key)
 
     def _stage(self, source: Path) -> tuple[_StagedMedia, int]:
         source_descriptor = -1
@@ -265,14 +295,12 @@ class SpeakrPublisher:
                 if not _regular_mode(source_info):
                     raise ValueError("recording media is invalid")
                 stage_path, stage_descriptor = self._new_staging_file()
-                digest = hashlib.sha256()
                 remaining = source_info.st_size
                 written = 0
                 while remaining:
                     chunk = os.read(source_descriptor, min(self.chunk_size, remaining))
                     if not chunk:
                         raise ValueError("recording media changed during staging")
-                    digest.update(chunk)
                     offset = 0
                     while offset < len(chunk):
                         count = os.write(stage_descriptor, chunk[offset:])
@@ -283,21 +311,27 @@ class SpeakrPublisher:
                     remaining -= len(chunk)
                 if written != source_info.st_size:
                     raise ValueError("recording media changed during staging")
+                os.fsync(stage_descriptor)
                 final_source_info = os.fstat(source_descriptor)
                 if _identity_tuple(final_source_info) != _identity_tuple(source_info):
                     raise ValueError("recording media changed during staging")
-                if os.fstat(stage_descriptor).st_size != source_info.st_size:
-                    raise ValueError("recording staging failed")
                 staging_info = os.fstat(stage_descriptor)
-                os.fsync(stage_descriptor)
-                os.lseek(stage_descriptor, 0, os.SEEK_SET)
+                if (
+                    not _regular_mode(staging_info)
+                    or stat.S_IMODE(staging_info.st_mode) != 0o600
+                    or staging_info.st_size != source_info.st_size
+                ):
+                    raise ValueError("recording staging failed")
+                # Hash only the completed, fsynced staging descriptor.  The
+                # bounded helper also detects same-size mutations around reads.
+                digest, staging_info = self._hash_staged(stage_descriptor, staging_info)
 
             identity = MediaIdentity(
                 source, source_info.st_dev, source_info.st_ino,
                 source_info.st_size, source_info.st_mtime_ns,
             )
             staged = _StagedMedia(
-                stage_path, stage_descriptor, digest.hexdigest(), identity,
+                stage_path, stage_descriptor, digest, identity,
                 source_info.st_mtime_ns // 1_000_000, source_info, staging_info,
             )
             stage_descriptor = -1
@@ -316,6 +350,36 @@ class SpeakrPublisher:
                 except OSError:
                     pass
             raise
+
+    def _hash_staged(
+        self, descriptor: int, expected: os.stat_result,
+    ) -> tuple[str, os.stat_result]:
+        before = os.fstat(descriptor)
+        if _identity_tuple(before) != _identity_tuple(expected):
+            raise ValueError("recording staging changed")
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while remaining:
+            chunk = os.read(descriptor, min(self.chunk_size, remaining))
+            if not chunk or len(chunk) > remaining:
+                raise ValueError("recording staging changed")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        if _identity_tuple(after) != _identity_tuple(before):
+            raise ValueError("recording staging changed")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return digest.hexdigest(), after
+
+    @staticmethod
+    def _require_staged_unchanged(staged: _StagedMedia) -> None:
+        try:
+            actual = os.fstat(staged.descriptor)
+        except OSError:
+            raise ValueError("recording staging is unavailable") from None
+        if not _regular_mode(actual) or _identity_tuple(actual) != _identity_tuple(staged.staging_info):
+            raise ValueError("recording staging changed")
 
     def _new_staging_file(self) -> tuple[Path, int]:
         for _ in range(8):
@@ -463,9 +527,7 @@ class SpeakrPublisher:
 
     @staticmethod
     def _result(job: PublicationJob) -> PublicationResult:
-        return PublicationResult(
-            job, False, error_code=job.last_error_code, http_status=job.last_http_status,
-        )
+        return PublicationResult(job, False)
 
 
 __all__ = ["SpeakrPublisher"]

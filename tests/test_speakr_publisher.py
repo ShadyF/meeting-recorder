@@ -83,6 +83,74 @@ def test_publish_stages_exact_bytes_and_hashes_the_staged_descriptor() -> None:
         directory.cleanup()
 
 
+def test_hash_uses_same_length_staged_bytes_that_are_uploaded() -> None:
+    directory, root, media, store, transport = _setup(b"0123456789abcdef")
+    replacement = b"fedcba9876543210"
+    try:
+        publisher = SpeakrPublisher(store, transport, chunk_size=3)
+        original_hash = publisher._hash_staged
+
+        def replace_before_hash(descriptor, expected):
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            assert os.write(descriptor, replacement) == len(replacement)
+            os.fsync(descriptor)
+            os.utime(descriptor, ns=(expected.st_atime_ns, expected.st_mtime_ns))
+            return original_hash(descriptor, expected)
+
+        publisher._hash_staged = replace_before_hash
+        result = publisher.publish(media, "https://example.com", TOKEN)
+        digest = hashlib.sha256(replacement).hexdigest()
+        assert result.job.state is PublicationState.PUBLISHED
+        assert result.job.key == PublicationKey("https://example.com", digest)
+        assert transport.uploads == [replacement]
+    finally:
+        directory.cleanup()
+
+
+def test_staged_modification_after_transfer_intent_is_unknown_without_remote_id() -> None:
+    directory, root, media, store, transport = _setup(b"0123456789abcdef")
+    replacement = b"fedcba9876543210"
+    try:
+        publisher = SpeakrPublisher(store, transport, chunk_size=3)
+        original_upload = publisher._upload
+
+        def replace_before_upload(instance_url, token, source, staged):
+            os.lseek(staged.descriptor, 0, os.SEEK_SET)
+            assert os.write(staged.descriptor, replacement) == len(replacement)
+            os.fsync(staged.descriptor)
+            return original_upload(instance_url, token, source, staged)
+
+        publisher._upload = replace_before_upload
+        result = publisher.publish(media, "https://example.com", TOKEN)
+        digest = hashlib.sha256(media.read_bytes()).hexdigest()
+        assert result.job.state is PublicationState.TRANSFER_UNKNOWN
+        assert result.job.remote_recording_id is None
+        assert result.error_code == "transfer_unknown"
+        assert transport.uploads == [replacement]
+        assert store.get(PublicationKey("https://example.com", digest)).state is PublicationState.TRANSFER_UNKNOWN
+    finally:
+        directory.cleanup()
+
+
+def test_equivalent_ipv6_and_unicode_origins_share_one_post_each() -> None:
+    directory, root, media, store, transport = _setup()
+    try:
+        publisher = SpeakrPublisher(store, transport, chunk_size=3)
+        first_ipv6 = publisher.publish(
+            media, "https://[2001:0db8:0000:0000:0000:0000:0000:0001]", TOKEN,
+        )
+        second_ipv6 = publisher.publish(media, "https://[2001:db8::1]/", TOKEN)
+        first_unicode = publisher.publish(media, "https://BÜCHER.example/", TOKEN)
+        second_unicode = publisher.publish(media, "https://xn--bcher-kva.example", TOKEN)
+        assert first_ipv6.job.state is PublicationState.PUBLISHED
+        assert second_ipv6.already_published
+        assert first_unicode.job.state is PublicationState.PUBLISHED
+        assert second_unicode.already_published
+        assert len(transport.uploads) == 2
+    finally:
+        directory.cleanup()
+
+
 def test_symlink_fifo_and_directory_are_rejected_before_upload() -> None:
     directory, root, media, store, transport = _setup()
     try:
@@ -211,7 +279,6 @@ def test_rename_during_blocked_upload_uses_current_sidecar_path() -> None:
         thread.join(5)
         assert not thread.is_alive()
         assert result_holder[0].job.state is PublicationState.PUBLISHED
-        assert result_holder[0].job.path_hint == str(renamed)
         assert transport.patches[0][1].title == "renamed"
     finally:
         directory.cleanup()

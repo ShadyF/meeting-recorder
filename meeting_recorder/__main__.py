@@ -309,7 +309,7 @@ def _cmd_speakr_upload(cfg, path: str) -> int:
         print("Speakr: already published." if result.already_published else "Speakr: published.")
         return 0
     if state is PublicationState.TRANSFER_REJECTED:
-        status = result.job.last_http_status
+        status = result.http_status
         suffix = f" HTTP {status}" if status is not None else ""
         print(f"Speakr: transfer rejected{suffix}; retry is explicit.", file=sys.stderr)
         return 1
