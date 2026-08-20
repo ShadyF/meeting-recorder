@@ -241,11 +241,16 @@ stored in SQLite. Publication state is public-only and lives at
 unset); it contains no credentials or private Meeting metadata.
 
 For a matched visible Meeting, the publisher sends the current title, scheduled
-time, description/location notes, and participants. Hidden or unmatched
-Recordings use the current filename stem and file modification time instead.
-After the media transfer, the publisher rereads the current filename and
-adjacent sidecar before sending metadata, so a rename or updated visible Meeting
-metadata is not taken from the stale upload snapshot.
+time, description/location notes, and participants. A hidden matched Meeting
+uses the current filename title and its non-private scheduled start, without
+private notes or participants. An unmatched Recording with a valid sidecar uses
+the current filename title and capture start, without notes or participants. If
+there is no valid sidecar, it uses the current filename title and file mtime.
+The metadata POST includes an explicit timezone-aware `meeting_date` and
+`file_last_modified`. After the media transfer, the publisher rereads the
+current filename and adjacent sidecar before sending the authoritative metadata
+PATCH, so a rename or updated visible Meeting metadata is not taken from the
+stale upload snapshot.
 
 The media POST is non-idempotent: `transfer_unknown` is never automatically
 resent. A rejected transfer may be retried only by explicitly rerunning the

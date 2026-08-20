@@ -45,9 +45,13 @@ _Avoid_: Capture mode, screen mode
 
 **Speakr publisher**:
 The optional, explicitly invoked component that uploads a Recording and its
-visible Meeting metadata to Speakr. Hidden or unmatched Recordings use their
-current filename and modification time as fallback metadata; the current path
-and sidecar are reread after transfer.
+selected public metadata to Speakr. A visible matched Meeting supplies current
+title/details and scheduled start; a hidden matched Meeting supplies the
+current filename title and non-private scheduled start without private
+notes/participants; an unmatched Recording with a valid sidecar supplies the
+current filename title and capture start; without a valid sidecar, file mtime is
+the date fallback. The current path and sidecar are reread after transfer before
+the authoritative metadata PATCH.
 _Avoid_: Speakr plugin, Speakr connector
 
 **Publication job**:

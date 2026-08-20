@@ -33,6 +33,9 @@ All notable changes to this project are documented here. Format follows
 - Speakr publication is never automatic: media transfers are non-idempotent,
   uncertain transfers are not resent, rejected transfers require an explicit
   rerun, metadata-pending jobs retry only PATCH, and published reruns send nothing.
+- Speakr publication now selects an explicit timezone-aware `meeting_date` from
+  the visible or hidden Meeting's scheduled start, a valid unmatched sidecar's
+  capture start, or file mtime as the final fallback.
 
 ## [0.3.5] — 2026-07-19
 
