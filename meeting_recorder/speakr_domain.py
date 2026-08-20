@@ -250,6 +250,8 @@ class PublicationJob:
                 type(self.last_http_status) is not int or not 100 <= self.last_http_status <= 599):
             raise ValueError("HTTP status is invalid")
 
+        # Enforce a closed restart-safe progression: only accepted transfers
+        # may carry remote identity, and every accepted state needs an attempt.
         if self.state is PublicationState.READY:
             if self.attempt_count != 0 or self.remote_recording_id is not None:
                 raise ValueError("ready jobs have no transfer identity")
@@ -331,9 +333,14 @@ def map_speakr_metadata(
     if sidecar is not None and not isinstance(sidecar, MeetingSidecar):
         raise ValueError("sidecar is invalid")
 
-    meeting: MeetingSnapshot | None = sidecar.meeting if sidecar is not None else None
-    if meeting is None or not meeting.details_visible:
+    if sidecar is None:
         return SpeakrMetadata(fallback_title, _mtime_utc(media_mtime_ns), "", "")
+
+    meeting = sidecar.meeting
+    if meeting is None:
+        return SpeakrMetadata(fallback_title, sidecar.capture_started_at, "", "")
+    if not meeting.details_visible:
+        return SpeakrMetadata(fallback_title, meeting.scheduled_start_utc, "", "")
 
     description = _normalize_notes(meeting.description or "")
     location = _normalize_line(meeting.location or "", "location", required=False)

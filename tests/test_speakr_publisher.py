@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 import hashlib
 import os
@@ -10,7 +11,7 @@ from tempfile import TemporaryDirectory
 from threading import Event, Thread
 
 from meeting_recorder.meeting_sidecar import MeetingSidecar, sidecar_path, write_sidecar
-from meeting_recorder.speakr_domain import PublicationKey, PublicationState
+from meeting_recorder.speakr_domain import PublicationKey, PublicationState, map_speakr_metadata
 from meeting_recorder.speakr_http import MetadataRejected, TransferNotSent, TransferOutcomeUnknown, TransferRejected
 from meeting_recorder.speakr_publisher import SpeakrPublisher
 from meeting_recorder.speakr_store import PublicationStore
@@ -23,7 +24,7 @@ class FakeTransport:
     def __init__(self, *, upload_result=7) -> None:
         self.upload_result = upload_result
         self.uploads: list[bytes] = []
-        self.upload_args: list[tuple[str, str, int, str, int]] = []
+        self.upload_args: list[tuple[str, str, int, str, int, datetime]] = []
         self.patches: list[tuple[int, object]] = []
         self.upload_started = Event()
         self.release_upload = Event()
@@ -31,7 +32,10 @@ class FakeTransport:
         self.upload_failure: Exception | None = None
         self.patch_failure: Exception | None = None
 
-    def upload(self, instance_url, token, media, media_size, filename, file_last_modified_ms):
+    def upload(
+        self, instance_url, token, media, media_size, filename,
+        file_last_modified_ms, meeting_date,
+    ):
         self.upload_started.set()
         if self.block_upload:
             assert self.release_upload.wait(5)
@@ -45,7 +49,9 @@ class FakeTransport:
             chunks.append(chunk)
         body = b"".join(chunks)
         self.uploads.append(body)
-        self.upload_args.append((instance_url, token, media_size, filename, file_last_modified_ms))
+        self.upload_args.append(
+            (instance_url, token, media_size, filename, file_last_modified_ms, meeting_date),
+        )
         return self.upload_result
 
     def patch_metadata(self, instance_url, token, remote_recording_id, metadata):
@@ -71,13 +77,17 @@ def _publish(media, store, transport):
 def test_publish_stages_exact_bytes_and_hashes_the_staged_descriptor() -> None:
     directory, root, media, store, transport = _setup(b"0123456789abcdef")
     try:
+        source_mtime_ns = media.stat().st_mtime_ns
         result = _publish(media, store, transport)
         digest = hashlib.sha256(media.read_bytes()).hexdigest()
         job = store.get(PublicationKey("https://example.com", digest))
         assert result.job.state is PublicationState.PUBLISHED
         assert job is not None and job.state is PublicationState.PUBLISHED
         assert transport.uploads == [b"0123456789abcdef"]
-        assert transport.upload_args[0][2:] == (16, "recording.mkv", media.stat().st_mtime_ns // 1_000_000)
+        assert transport.upload_args[0][2:] == (
+            16, "recording.mkv", source_mtime_ns // 1_000_000,
+            map_speakr_metadata(media, source_mtime_ns, None).meeting_date,
+        )
         assert list(store.state_directory.glob(".staging-*")) == []
     finally:
         directory.cleanup()
@@ -114,11 +124,11 @@ def test_staged_modification_after_transfer_intent_is_unknown_without_remote_id(
         publisher = SpeakrPublisher(store, transport, chunk_size=3)
         original_upload = publisher._upload
 
-        def replace_before_upload(instance_url, token, source, staged):
+        def replace_before_upload(instance_url, token, source, staged, meeting_date):
             os.lseek(staged.descriptor, 0, os.SEEK_SET)
             assert os.write(staged.descriptor, replacement) == len(replacement)
             os.fsync(staged.descriptor)
-            return original_upload(instance_url, token, source, staged)
+            return original_upload(instance_url, token, source, staged, meeting_date)
 
         publisher._upload = replace_before_upload
         result = publisher.publish(media, "https://example.com", TOKEN)

@@ -28,10 +28,11 @@ NOW = datetime(2026, 8, 20, 12, 34, 56, 789000, tzinfo=timezone.utc)
 TOKEN = "speakr-token-private-sentinel"
 
 
-def _meeting() -> MeetingSnapshot:
+def _meeting(*, visible: bool = True) -> MeetingSnapshot:
     return MeetingSnapshot(
-        OccurrenceKey.single("calendar", "event"), "Design review", NOW,
-        NOW + timedelta(hours=1), ("Alice", "Bob"), "Public notes", "Room 7", True,
+        OccurrenceKey.single("calendar", "event"), "Design review" if visible else None, NOW,
+        NOW + timedelta(hours=1), ("Alice", "Bob") if visible else (),
+        "Public notes" if visible else None, "Room 7" if visible else None, visible,
     )
 
 
@@ -174,6 +175,7 @@ def test_local_server_acceptance_is_restart_safe_and_sends_current_public_metada
         parts = multipart_parts(upload)
         assert parts["file"][1] == payload
         assert parts["file_last_modified"][1] == b"4000"
+        assert parts["meeting_date"][1] == b"2026-08-20T12:34:56.789000Z"
         assert second_patch.path == "/api/v1/recordings/42"
         assert second_patch.headers["authorization"] == "Bearer " + TOKEN
         assert json_body(second_patch) == {
@@ -201,9 +203,48 @@ def test_unmatched_sidecar_uses_current_filename_and_mtime_without_private_metad
                 store, StdlibSpeakrTransport(timeout_seconds=2),
             ).publish(media, url, TOKEN)
         assert result.job.state is PublicationState.PUBLISHED
+        assert multipart_parts(server.requests[0])["meeting_date"][1] == b"1970-01-01T00:00:05Z"
         assert json_body(server.requests[1]) == {
             "title": "renamed",
             "meeting_date": "1970-01-01T00:00:05Z",
             "notes": "",
             "participants": "",
         }
+
+
+def test_upload_meeting_date_is_explicit_for_hidden_absent_and_malformed_sidecars() -> None:
+    cases = ("hidden", "absent", "malformed")
+    for case in cases:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "recording.mkv"
+            media.write_bytes(b"date cases")
+            os.utime(media, ns=(5_000_000_000, 5_000_000_000))
+            if case == "hidden":
+                write_sidecar(sidecar_path(media), _sidecar(media, _meeting(visible=False)))
+            elif case == "malformed":
+                sidecar_path(media).write_bytes(b"not valid sidecar")
+            store = PublicationStore(root / "state" / "publications.sqlite3", clock=lambda: 1_000)
+
+            with fake_speakr_server() as (url, server):
+                result = SpeakrPublisher(
+                    store, StdlibSpeakrTransport(timeout_seconds=2),
+                ).publish(media, url, TOKEN)
+
+            upload = server.requests[0]
+            parts = multipart_parts(upload)
+            expected_date = NOW if case == "hidden" else datetime.fromtimestamp(5, timezone.utc)
+            assert parts["meeting_date"][1] == expected_date.isoformat().replace(
+                "+00:00", "Z",
+            ).encode()
+            if case == "malformed":
+                assert result.job.state is PublicationState.METADATA_PENDING
+                assert len(server.requests) == 1
+            else:
+                assert result.job.state is PublicationState.PUBLISHED
+                assert len(server.requests) == 2
+                assert json_body(server.requests[1])["meeting_date"] == (
+                    expected_date.isoformat().replace("+00:00", "Z")
+                )
+                assert json_body(server.requests[1])["notes"] == ""
+                assert json_body(server.requests[1])["participants"] == ""

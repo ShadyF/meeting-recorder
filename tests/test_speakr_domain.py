@@ -154,12 +154,23 @@ def test_publication_job_has_only_public_scalar_schema_and_validates_states() ->
 def test_unmatched_and_hidden_sidecars_use_current_media_fallbacks() -> None:
     media = Path("renamed.capture.mkv")
     mtime_ns = 1_735_689_123_456_789_000
-    for sidecar in (None, _sidecar(), _sidecar(_meeting(visible=False))):
-        result = map_speakr_metadata(media, mtime_ns, sidecar)
-        assert result.title == "renamed.capture"
-        assert result.meeting_date == datetime.fromtimestamp(mtime_ns / 1e9, timezone.utc)
-        assert result.notes == ""
-        assert result.participants == ""
+    no_sidecar = map_speakr_metadata(media, mtime_ns, None)
+    assert no_sidecar.title == "renamed.capture"
+    assert no_sidecar.meeting_date == datetime.fromtimestamp(mtime_ns / 1e9, timezone.utc)
+    assert no_sidecar.notes == ""
+    assert no_sidecar.participants == ""
+
+    unmatched = map_speakr_metadata(media, mtime_ns, _sidecar())
+    assert unmatched.title == "renamed.capture"
+    assert unmatched.meeting_date == NOW
+    assert unmatched.notes == ""
+    assert unmatched.participants == ""
+
+    hidden = map_speakr_metadata(media, mtime_ns, _sidecar(_meeting(visible=False)))
+    assert hidden.title == "renamed.capture"
+    assert hidden.meeting_date == NOW
+    assert hidden.notes == ""
+    assert hidden.participants == ""
 
 
 def test_visible_match_maps_public_fields_and_preserves_description_lines() -> None:

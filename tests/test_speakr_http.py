@@ -216,7 +216,9 @@ def test_upload_sends_exact_streamed_multipart_request() -> None:
     media.seek(4)
     with _server() as (server, state):
         transport = StdlibSpeakrTransport(timeout_seconds=2, chunk_size=3)
-        assert transport.upload(_url(server), TOKEN, media, 16, 'café "clip".mkv', 123456789) == 7
+        assert transport.upload(
+            _url(server), TOKEN, media, 16, 'café "clip".mkv', 123456789, NOW,
+        ) == 7
         assert media.tell() == 4
         assert media.read_sizes == [3, 3, 3, 3, 3, 1]
         assert state.request_received.is_set()
@@ -231,6 +233,7 @@ def test_upload_sends_exact_streamed_multipart_request() -> None:
         parts = _multipart_parts(headers["content-type"], body)
         assert parts["file"][1] == b"0123456789abcdef"
         assert parts["file_last_modified"][1] == b"123456789"
+        assert parts["meeting_date"][1] == b"2026-08-20T12:34:56.789000Z"
         assert "filename*=UTF-8''caf%C3%A9%20%22clip%22.mkv" in parts["file"][0]
         assert "\r" not in parts["file"][0] and "\n" not in parts["file"][0]
         assert max(media.read_sizes) <= 3
@@ -250,7 +253,7 @@ def test_upload_accepts_only_positive_integer_id() -> None:
         with _server(response_body=response_body) as (server, _):
             try:
                 StdlibSpeakrTransport(timeout_seconds=2).upload(
-                    _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0
+                    _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0, NOW
                 )
             except TransferOutcomeUnknown as exc:
                 assert isinstance(exc, InvalidSpeakrResponse)
@@ -262,7 +265,7 @@ def test_upload_rejects_oversized_and_truncated_success_responses() -> None:
     with _server(response_body=b'{"id": 123456789}') as (server, _):
         try:
             StdlibSpeakrTransport(timeout_seconds=2, max_response_bytes=8).upload(
-                _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0
+                _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0, NOW
             )
         except TransferOutcomeUnknown:
             pass
@@ -272,7 +275,7 @@ def test_upload_rejects_oversized_and_truncated_success_responses() -> None:
     with _server(response_body=b'{"id": 7}', truncated_response=True) as (server, _):
         try:
             StdlibSpeakrTransport(timeout_seconds=2).upload(
-                _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0
+                _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0, NOW
             )
         except TransferOutcomeUnknown:
             pass
@@ -286,7 +289,7 @@ def test_complete_non_202_uploads_are_rejected_without_body_exposure() -> None:
         with _server(response_status=status, response_body=private_body) as (server, _):
             try:
                 StdlibSpeakrTransport(timeout_seconds=2).upload(
-                    _url(server), TOKEN, io.BytesIO(b"x"), 1, "private-name.mkv", 0
+                    _url(server), TOKEN, io.BytesIO(b"x"), 1, "private-name.mkv", 0, NOW
                 )
             except TransferRejected as exc:
                 assert exc.status == status
@@ -315,7 +318,7 @@ def test_known_rejections_survive_oversized_truncated_malformed_and_stalled_bodi
         with _scripted_connection(response) as connection:
             try:
                 StdlibSpeakrTransport(timeout_seconds=0.1, max_response_bytes=8).upload(
-                    "http://scripted.invalid", TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0
+                    "http://scripted.invalid", TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0, NOW
                 )
             except TransferRejected as exc:
                 assert type(exc) is TransferRejected, name
@@ -364,7 +367,7 @@ def test_connect_failure_is_not_sent_and_drop_after_body_is_unknown() -> None:
     try:
         try:
             StdlibSpeakrTransport().upload(
-                "http://example.invalid", TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0
+                "http://example.invalid", TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0, NOW
             )
         except TransferNotSent as exc:
             assert calls == ["connect", "close"]
@@ -377,7 +380,7 @@ def test_connect_failure_is_not_sent_and_drop_after_body_is_unknown() -> None:
     with _server(drop_after_body=True) as (server, state):
         try:
             StdlibSpeakrTransport(timeout_seconds=2).upload(
-                _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0
+                _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0, NOW
             )
         except TransferOutcomeUnknown:
             assert state.request_received.is_set()
@@ -393,7 +396,7 @@ def test_redirect_is_rejected_without_following_or_forwarding_token() -> None:
     ) as (server, state):
         try:
             StdlibSpeakrTransport(timeout_seconds=2).upload(
-                _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0
+                _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0, NOW
             )
         except TransferRejected as exc:
             assert exc.status == 302
@@ -480,7 +483,7 @@ def test_validation_and_error_representations_are_sanitized() -> None:
     with _server(response_status=202, response_body=b"not-json token=test-token notes=Notes") as (server, _):
         try:
             StdlibSpeakrTransport(timeout_seconds=2).upload(
-                _url(server), TOKEN, io.BytesIO(b"x"), 1, "private-name.mkv", 0
+                _url(server), TOKEN, io.BytesIO(b"x"), 1, "private-name.mkv", 0, NOW
             )
         except TransferOutcomeUnknown as exc:
             rendered = str(exc) + repr(exc)
@@ -493,13 +496,23 @@ def test_validation_and_error_representations_are_sanitized() -> None:
     for bad_filename, bad_token in (("name\r\nX-Leak: yes", TOKEN), ("name.mkv", "bad\r\ntoken")):
         try:
             StdlibSpeakrTransport().upload(
-                "http://127.0.0.1:1", bad_token, io.BytesIO(b"x"), 1, bad_filename, 0
+                "http://127.0.0.1:1", bad_token, io.BytesIO(b"x"), 1, bad_filename, 0, NOW
             )
         except ValueError as exc:
             assert "X-Leak" not in str(exc)
             assert "bad" not in repr(exc).casefold()
         else:
             raise AssertionError("header injection value was accepted")
+
+    try:
+        StdlibSpeakrTransport().upload(
+            "http://127.0.0.1:1", TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0,
+            datetime(2026, 8, 20),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("naive meeting date was accepted")
 
     try:
         StdlibSpeakrTransport().patch_metadata(

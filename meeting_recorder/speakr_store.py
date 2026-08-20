@@ -351,6 +351,8 @@ class PublicationStore:
         connection = self._connect()
         created_schema = False
         try:
+            # Validate and create the schema in one exclusive transaction so a
+            # rejected legacy database cannot leave a partially migrated state.
             connection.execute("BEGIN EXCLUSIVE")
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version > _SCHEMA_VERSION:
@@ -368,6 +370,8 @@ class PublicationStore:
                 self._validate_schema(connection, tables)
             connection.commit()
         except Exception:
+            # Roll back validation or DDL failures before closing so no partial
+            # migration can be mistaken for a usable schema on the next open.
             try:
                 connection.rollback()
             except sqlite3.Error:
@@ -376,6 +380,8 @@ class PublicationStore:
         finally:
             connection.close()
         if created_schema and self._database_created_and_unsynced:
+            # Make the first database name durable only after its schema commit
+            # succeeds; later transactions do not need this creation fsync.
             _fsync_directory(self.state_directory)
             self._database_created_and_unsynced = False
 

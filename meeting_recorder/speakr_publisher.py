@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ from .meeting_sidecar import MeetingSidecar, load_sidecar, sidecar_path
 from .recording_paths import recording_directory_lock
 from .speakr_domain import (
     MediaIdentity, PublicationJob, PublicationKey, PublicationResult, PublicationState,
-    map_speakr_metadata,
+    _mtime_utc, map_speakr_metadata,
 )
 from .speakr_http import (
     MetadataRejected, MetadataUnavailable, SpeakrTransport, TransferNotSent,
@@ -125,6 +126,7 @@ class SpeakrPublisher:
                 # preflight mutation cannot be sent under the staged identity.
                 self._require_unchanged(source_descriptor, staged.descriptor_info)
                 self._require_staged_unchanged(staged)
+                meeting_date = self._initial_meeting_date(source, staged)
                 self.store.begin_transfer(
                     key, staged.identity, staged.file_last_modified_ms,
                 )
@@ -140,7 +142,9 @@ class SpeakrPublisher:
                 remote_id: int | None = None
                 upload_error: Exception | None = None
                 try:
-                    remote_id = self._upload(instance_url, token, source, staged)
+                    remote_id = self._upload(
+                        instance_url, token, source, staged, meeting_date,
+                    )
                 except Exception as exc:
                     upload_error = exc
 
@@ -198,7 +202,24 @@ class SpeakrPublisher:
                 if staged is not None:
                     self._close_and_remove_staging(staged)
 
-    def _upload(self, instance_url: str, token: str, source: Path, staged: _StagedMedia) -> int:
+    def _initial_meeting_date(self, source: Path, staged: _StagedMedia) -> datetime:
+        fallback = _mtime_utc(staged.identity.mtime_ns)
+        try:
+            adjacent = load_sidecar(sidecar_path(source))
+            if adjacent.recording_filename != source.name:
+                return fallback
+            return map_speakr_metadata(
+                source, staged.identity.mtime_ns, adjacent,
+            ).meeting_date
+        except Exception:
+            # Upload date is only a non-authoritative hint; PATCH will use the
+            # sidecar rediscovered after transfer or retain the safe fallback.
+            return fallback
+
+    def _upload(
+        self, instance_url: str, token: str, source: Path, staged: _StagedMedia,
+        meeting_date: datetime,
+    ) -> int:
         # The staged descriptor is the immutable upload source; the original
         # source descriptor stays open in publish() until this command ends.
         os.lseek(staged.descriptor, 0, os.SEEK_SET)
@@ -208,7 +229,7 @@ class SpeakrPublisher:
                 duplicate = -1
                 return self.transport.upload(
                     instance_url, token, media, staged.identity.size,
-                    source.name, staged.file_last_modified_ms,
+                    source.name, staged.file_last_modified_ms, meeting_date,
                 )
         finally:
             if duplicate >= 0:
@@ -218,6 +239,8 @@ class SpeakrPublisher:
         self, key: PublicationKey, job: PublicationJob, source: Path,
         source_descriptor: int, staged: _StagedMedia, token: str,
     ) -> PublicationResult:
+        # Rediscover the current pathname by inode so a rename during upload
+        # cannot make PATCH use stale or unrelated adjacent metadata.
         try:
             discovered = self._discover_current(
                 source.parent, source_descriptor, staged.descriptor_info, staged.identity,
@@ -234,6 +257,9 @@ class SpeakrPublisher:
             return self._result(pending)
 
         current_path = discovered.path
+
+        # Revalidate the source after directory discovery before projecting any
+        # metadata, preserving the uploaded identity across the rename window.
         try:
             self._require_unchanged(source_descriptor, staged.descriptor_info)
         except ValueError:
@@ -242,6 +268,8 @@ class SpeakrPublisher:
             )
             return self._result(pending)
 
+        # Project only the currently discovered public filename and visible
+        # meeting fields; no durable state carries this transient path.
         try:
             metadata = map_speakr_metadata(
                 current_path, discovered.info.st_mtime_ns, discovered.sidecar,
@@ -257,6 +285,8 @@ class SpeakrPublisher:
             )
             return self._result(pending)
 
+        # PATCH is authoritative for visible metadata and is deliberately last
+        # so transfer acceptance is durable before the remote record is edited.
         try:
             self.transport.patch_metadata(
                 key.instance_url, token, job.remote_recording_id or 0, metadata,
@@ -295,6 +325,9 @@ class SpeakrPublisher:
                 if not _regular_mode(source_info):
                     raise ValueError("recording media is invalid")
                 stage_path, stage_descriptor = self._new_staging_file()
+
+                # Copy bounded source chunks into private staging before hashing;
+                # fsync then source revalidation make the snapshot identity safe.
                 remaining = source_info.st_size
                 written = 0
                 while remaining:
@@ -315,6 +348,9 @@ class SpeakrPublisher:
                 final_source_info = os.fstat(source_descriptor)
                 if _identity_tuple(final_source_info) != _identity_tuple(source_info):
                     raise ValueError("recording media changed during staging")
+
+                # Validate the completed staging inode and size before hashing;
+                # the bounded descriptor hash must name bytes ready for upload.
                 staging_info = os.fstat(stage_descriptor)
                 if (
                     not _regular_mode(staging_info)

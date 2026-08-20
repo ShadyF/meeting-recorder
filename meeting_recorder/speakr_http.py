@@ -8,7 +8,7 @@ import json
 import math
 import secrets
 import ssl
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import BinaryIO, Protocol, runtime_checkable
 from urllib.parse import quote, urlsplit
 
@@ -88,6 +88,7 @@ class SpeakrTransport(Protocol):
         media_size: int,
         filename: str,
         file_last_modified_ms: int,
+        meeting_date: datetime,
     ) -> int:
         ...
 
@@ -195,9 +196,19 @@ def _filename_parameters(filename: str) -> str:
     return f'filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
 
 
+def _validate_meeting_date(value: object) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Speakr meeting date must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def _utc_timestamp(value: datetime) -> str:
+    return _validate_meeting_date(value).isoformat().replace("+00:00", "Z")
+
+
 def _multipart_parts(
-    filename: str, file_last_modified_ms: int
-) -> tuple[bytes, bytes, bytes, bytes, str]:
+    filename: str, file_last_modified_ms: int, meeting_date: datetime,
+) -> tuple[bytes, bytes, bytes, bytes, bytes, str]:
     boundary = "----meeting-recorder-" + secrets.token_hex(16)
     disposition = _filename_parameters(filename)
     file_prefix = (
@@ -213,8 +224,14 @@ def _multipart_parts(
         "\r\n"
         f"{file_last_modified_ms}\r\n"
     ).encode("ascii")
+    meeting_date_part = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="meeting_date"\r\n'
+        "\r\n"
+        f"{_utc_timestamp(meeting_date)}\r\n"
+    ).encode("ascii")
     closing = f"--{boundary}--\r\n".encode("ascii")
-    return file_prefix, file_suffix, modified_part, closing, boundary
+    return file_prefix, file_suffix, modified_part, meeting_date_part, closing, boundary
 
 
 def _read_bounded(response: http.client.HTTPResponse, limit: int) -> bytes:
@@ -301,6 +318,7 @@ class StdlibSpeakrTransport:
         media_size: int,
         filename: str,
         file_last_modified_ms: int,
+        meeting_date: datetime,
     ) -> int:
         origin = _origin(instance_url)
         safe_token = _validate_token(token)
@@ -309,12 +327,14 @@ class StdlibSpeakrTransport:
         file_last_modified_ms = _validate_nonnegative_int(
             file_last_modified_ms, "file last modified time"
         )
+        meeting_date = _validate_meeting_date(meeting_date)
         initial_position = self._prepare_media(media)
-        file_prefix, file_suffix, modified_part, closing, boundary = _multipart_parts(
-            safe_filename, file_last_modified_ms
+        file_prefix, file_suffix, modified_part, meeting_date_part, closing, boundary = _multipart_parts(
+            safe_filename, file_last_modified_ms, meeting_date,
         )
         content_length = (
-            len(file_prefix) + media_size + len(file_suffix) + len(modified_part) + len(closing)
+            len(file_prefix) + media_size + len(file_suffix) + len(modified_part)
+            + len(meeting_date_part) + len(closing)
         )
 
         connection: http.client.HTTPConnection | None = None
@@ -342,6 +362,7 @@ class StdlibSpeakrTransport:
                 self._send_media(connection, media, media_size)
                 self._send_bytes(connection, file_suffix)
                 self._send_bytes(connection, modified_part)
+                self._send_bytes(connection, meeting_date_part)
                 self._send_bytes(connection, closing)
                 response = connection.getresponse()
                 status = _response_status(response)
@@ -387,9 +408,7 @@ class StdlibSpeakrTransport:
             raise ValueError("Speakr metadata is invalid")
 
         # Emit UTC explicitly so the API never has to infer a local timezone.
-        meeting_date = metadata.meeting_date.astimezone(timezone.utc).isoformat().replace(
-            "+00:00", "Z"
-        )
+        meeting_date = _utc_timestamp(metadata.meeting_date)
         payload = {
             "title": metadata.title,
             "meeting_date": meeting_date,
