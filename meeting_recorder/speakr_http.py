@@ -273,6 +273,13 @@ def _response_status(response: http.client.HTTPResponse) -> int:
         raise _ResponseReadError from None
 
 
+def _close_response(response: http.client.HTTPResponse) -> None:
+    try:
+        response.close()
+    except Exception:
+        pass
+
+
 class StdlibSpeakrTransport:
     """Bounded HTTP transport with no redirect or third-party dependencies."""
 
@@ -338,7 +345,6 @@ class StdlibSpeakrTransport:
                 self._send_bytes(connection, closing)
                 response = connection.getresponse()
                 status = _response_status(response)
-                body = _read_bounded(response, self.max_response_bytes)
             except _ResponseReadError:
                 raise TransferOutcomeUnknown from None
             except SpeakrError:
@@ -346,8 +352,17 @@ class StdlibSpeakrTransport:
             except Exception:
                 raise TransferOutcomeUnknown from None
 
+            # Classify a completed rejection before touching its untrusted body;
+            # rejection status must survive bad framing, truncation, and stalls.
             if status != 202:
+                _close_response(response)
                 raise TransferRejected(status)
+
+            try:
+                body = _read_bounded(response, self.max_response_bytes)
+            except _ResponseReadError:
+                raise TransferOutcomeUnknown from None
+
             return self._recording_id(body)
         finally:
             if connection is not None:
@@ -404,14 +419,21 @@ class StdlibSpeakrTransport:
                 self._send_bytes(connection, body)
                 response = connection.getresponse()
                 status = _response_status(response)
-                _read_bounded(response, self.max_response_bytes)
-            except (_ResponseReadError, SpeakrError):
+            except _ResponseReadError:
                 raise MetadataUnavailable from None
             except Exception:
                 raise MetadataUnavailable from None
 
+            # Preserve a known HTTP rejection without reading a body that may
+            # be oversized, truncated, malformed, or indefinitely stalled.
             if not 200 <= status <= 299:
+                _close_response(response)
                 raise MetadataRejected(status)
+
+            try:
+                _read_bounded(response, self.max_response_bytes)
+            except _ResponseReadError:
+                raise MetadataUnavailable from None
         finally:
             if connection is not None:
                 try:

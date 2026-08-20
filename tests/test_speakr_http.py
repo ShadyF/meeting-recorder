@@ -12,6 +12,7 @@ import socket
 from threading import Event, Thread
 from typing import Iterator, cast
 
+import meeting_recorder.speakr_http as speakr_http
 from meeting_recorder.speakr_domain import SpeakrMetadata
 from meeting_recorder.speakr_http import (
     InvalidSpeakrResponse,
@@ -129,6 +130,72 @@ class _BoundedMedia(io.BytesIO):
         return super().read(size)
 
 
+class _ScriptedResponse:
+    def __init__(
+        self,
+        status: int,
+        *,
+        declared_length: object,
+        chunks: tuple[bytes, ...] = (),
+        read_failure: Exception | None = None,
+    ) -> None:
+        self.status = status
+        self.length = declared_length
+        self._chunks = list(chunks)
+        self._read_failure = read_failure
+        self.read_calls = 0
+        self.closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_calls += 1
+        if self._read_failure is not None:
+            raise self._read_failure
+        if self._chunks:
+            return self._chunks.pop(0)
+        return b""
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _ScriptedConnection:
+    def __init__(self, response: _ScriptedResponse) -> None:
+        self.response = response
+        self.closed = False
+
+    def connect(self) -> None:
+        return
+
+    def putrequest(self, *args: object, **kwargs: object) -> None:
+        return
+
+    def putheader(self, *args: object, **kwargs: object) -> None:
+        return
+
+    def endheaders(self) -> None:
+        return
+
+    def send(self, payload: bytes) -> None:
+        return
+
+    def getresponse(self) -> _ScriptedResponse:
+        return self.response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@contextmanager
+def _scripted_connection(response: _ScriptedResponse) -> Iterator[_ScriptedConnection]:
+    original = speakr_http._connection_for
+    connection = _ScriptedConnection(response)
+    speakr_http._connection_for = lambda origin, timeout: connection  # type: ignore[assignment]
+    try:
+        yield connection
+    finally:
+        speakr_http._connection_for = original
+
+
 def _multipart_parts(content_type: str, body: bytes) -> dict[str, tuple[str, bytes]]:
     boundary = content_type.split("boundary=", 1)[1].encode("ascii")
     result: dict[str, tuple[str, bytes]] = {}
@@ -227,6 +294,55 @@ def test_complete_non_202_uploads_are_rejected_without_body_exposure() -> None:
                 assert "private" not in repr(exc)
             else:
                 raise AssertionError("rejected upload was accepted")
+
+
+def test_known_rejections_survive_oversized_truncated_malformed_and_stalled_bodies() -> None:
+    cases = (
+        ("oversized", 413, 9, (b"ignored",), None),
+        ("truncated", 422, 4, (b"x",), None),
+        ("malformed framing", 500, "not-a-length", (), None),
+        ("stalled", 503, 1, (), socket.timeout("body stalled")),
+    )
+    metadata = SpeakrMetadata("Title", NOW, "Notes", "Alice")
+
+    for name, status, declared_length, chunks, read_failure in cases:
+        response = _ScriptedResponse(
+            status,
+            declared_length=declared_length,
+            chunks=chunks,
+            read_failure=read_failure,
+        )
+        with _scripted_connection(response) as connection:
+            try:
+                StdlibSpeakrTransport(timeout_seconds=0.1, max_response_bytes=8).upload(
+                    "http://scripted.invalid", TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0
+                )
+            except TransferRejected as exc:
+                assert type(exc) is TransferRejected, name
+                assert exc.status == status
+            else:
+                raise AssertionError(f"{name} upload rejection was not classified")
+        assert response.read_calls == 0, name
+        assert response.closed and connection.closed, name
+
+        response = _ScriptedResponse(
+            status,
+            declared_length=declared_length,
+            chunks=chunks,
+            read_failure=read_failure,
+        )
+        with _scripted_connection(response) as connection:
+            try:
+                StdlibSpeakrTransport(timeout_seconds=0.1, max_response_bytes=8).patch_metadata(
+                    "http://scripted.invalid", TOKEN, 1, metadata
+                )
+            except MetadataRejected as exc:
+                assert type(exc) is MetadataRejected, name
+                assert exc.status == status
+            else:
+                raise AssertionError(f"{name} metadata rejection was not classified")
+        assert response.read_calls == 0, name
+        assert response.closed and connection.closed, name
 
 
 def test_connect_failure_is_not_sent_and_drop_after_body_is_unknown() -> None:
