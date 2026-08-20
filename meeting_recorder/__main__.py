@@ -25,7 +25,9 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import load_config, write_default_user_config
+from .config import (
+    load_config, require_speakr_token, resolve_speakr_url, write_default_user_config,
+)
 from .utils import LOG, build_output_path, setup_logging
 
 _SERVICE = "meeting-recorder.service"
@@ -276,6 +278,51 @@ def _cmd_config(_cfg) -> int:
     return 0
 
 
+def _cmd_speakr_upload(cfg, path: str) -> int:
+    """Publish one recording only when the user invokes this command."""
+    from .speakr_domain import PublicationState
+    from .speakr_http import StdlibSpeakrTransport
+    from .speakr_publisher import SpeakrPublisher
+    from .speakr_store import PublicationStore
+
+    try:
+        instance_url = resolve_speakr_url(cfg)
+    except (TypeError, ValueError):
+        print("Speakr: invalid instance URL configuration.", file=sys.stderr)
+        return 2
+    try:
+        token = require_speakr_token()
+    except (TypeError, ValueError):
+        print("Speakr: bearer token is missing or invalid.", file=sys.stderr)
+        return 2
+
+    try:
+        result = SpeakrPublisher(
+            PublicationStore(), StdlibSpeakrTransport(),
+        ).publish(path, instance_url, token)
+    except Exception:
+        print("Speakr: publication failed; no private error details are available.", file=sys.stderr)
+        return 1
+
+    state = result.job.state
+    if state is PublicationState.PUBLISHED:
+        print("Speakr: already published." if result.already_published else "Speakr: published.")
+        return 0
+    if state is PublicationState.TRANSFER_REJECTED:
+        status = result.job.last_http_status
+        suffix = f" HTTP {status}" if status is not None else ""
+        print(f"Speakr: transfer rejected{suffix}; retry is explicit.", file=sys.stderr)
+        return 1
+    if state is PublicationState.TRANSFER_UNKNOWN:
+        print("Speakr: transfer outcome is unknown; media was not re-sent.", file=sys.stderr)
+        return 1
+    if state is PublicationState.METADATA_PENDING:
+        print("Speakr: metadata remains pending; no media re-upload.", file=sys.stderr)
+        return 1
+    print("Speakr: unexpected publication state; no private details available.", file=sys.stderr)
+    return 1
+
+
 def _cmd_settings(_cfg) -> int:
     """Open the GTK settings window."""
     from .settings_gui import run
@@ -484,6 +531,10 @@ def build_parser() -> argparse.ArgumentParser:
     correct_group = correct.add_mutually_exclusive_group()
     correct_group.add_argument("--select", dest="selector")
     correct_group.add_argument("--clear", action="store_true")
+    speakr = sub.add_parser("speakr", parents=[common], help="explicitly publish recordings to Speakr")
+    speakr_sub = speakr.add_subparsers(dest="speakr_command", required=True)
+    upload = speakr_sub.add_parser("upload", parents=[common], help="publish one recording")
+    upload.add_argument("path")
     return parser
 
 
@@ -509,6 +560,10 @@ def main(argv: list[str] | None = None) -> int:
                                          args.selector, args.clear)
         return _cmd_calendar(cfg, args.calendar_command,
                              getattr(args, "calendar_ids", None), getattr(args, "clear", False))
+    if command == "speakr":
+        if args.speakr_command == "upload":
+            return _cmd_speakr_upload(cfg, args.path)
+        parser.error("unknown Speakr command")
     handler = {
         "run": _cmd_run,
         "record": _cmd_record,

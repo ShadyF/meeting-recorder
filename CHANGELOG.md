@@ -13,6 +13,8 @@ All notable changes to this project are documented here. Format follows
   background refresh independent from recording.
 - #21 adds cache-only recording enrichment, versioned `.meeting.json` sidecars,
   collision-safe Calendar naming, and `calendar correct` for offline corrections.
+- #22 adds explicit `speakr upload PATH` publication with public-only durable
+  Publication job state and environment-only Speakr token handling.
 
 ### Changed
 - Detected meetings now ask directly whether to record Video, Audio only, or
@@ -28,6 +30,9 @@ All notable changes to this project are documented here. Format follows
   matched visible meeting uses the scheduled local time and title for its name;
   hidden or unmatched recordings retain the fallback name. Later Calendar
   refreshes do not retroactively rename or rewrite earlier recordings.
+- Speakr publication is never automatic: media transfers are non-idempotent,
+  uncertain transfers are not resent, rejected transfers require an explicit
+  rerun, metadata-pending jobs retry only PATCH, and published reruns send nothing.
 
 ## [0.3.5] — 2026-07-19
 

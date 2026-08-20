@@ -44,9 +44,15 @@ The selected screen content for video capture: fullscreen, window, or area.
 _Avoid_: Capture mode, screen mode
 
 **Speakr publisher**:
-The optional component that uploads a recording and its meeting metadata to Speakr.
+The optional, explicitly invoked component that uploads a Recording and its
+visible Meeting metadata to Speakr. Hidden or unmatched Recordings use their
+current filename and modification time as fallback metadata; the current path
+and sidecar are reread after transfer.
 _Avoid_: Speakr plugin, Speakr connector
 
 **Publication job**:
-The durable record of one Recording's progress toward publication in Speakr.
+The durable public-only record of one Recording's progress toward publication in
+Speakr. It contains no credentials or private Meeting metadata; uncertain media
+transfers are not automatically resent, metadata-pending jobs retry PATCH only,
+and published reruns send nothing.
 _Avoid_: Upload record, queue item

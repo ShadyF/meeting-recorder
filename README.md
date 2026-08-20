@@ -139,6 +139,7 @@ meeting-recorder run        # run the detector in the foreground
 meeting-recorder record     # record right now until Ctrl-C
 meeting-recorder config     # create/print the config file
 meeting-recorder calendar connect|status|disconnect  # manage Calendar credentials
+meeting-recorder speakr upload PATH                   # explicitly publish one Recording
 ```
 
 `start`/`stop`/`restart`/`logs` wrap `systemctl --user`, so you never need to
@@ -222,6 +223,35 @@ never stores credentials, prints private meeting details, or mutates old files
 because a later Calendar refresh changes its cache. Metadata, rename, and sidecar
 failures leave the authoritative media in place.
 
+### Optional Speakr publication
+
+Speakr publication is always explicit and on demand; the recorder never uploads a
+Recording automatically. Configure the public Speakr instance origin with
+`speakr_url`, then provide the bearer token only through
+`MEETING_RECORDER_SPEAKR_TOKEN` when invoking:
+
+```bash
+MEETING_RECORDER_SPEAKR_TOKEN='…' meeting-recorder speakr upload PATH
+```
+
+The token is never accepted from the config file or CLI arguments and is never
+stored in SQLite. Publication state is public-only and lives at
+`$XDG_STATE_HOME/meeting-recorder/publications.sqlite3` (or
+`~/.local/state/meeting-recorder/publications.sqlite3` when `XDG_STATE_HOME` is
+unset); it contains no credentials or private Meeting metadata.
+
+For a matched visible Meeting, the publisher sends the current title, scheduled
+time, description/location notes, and participants. Hidden or unmatched
+Recordings use the current filename stem and file modification time instead.
+After the media transfer, the publisher rereads the current filename and
+adjacent sidecar before sending metadata, so a rename or updated visible Meeting
+metadata is not taken from the stale upload snapshot.
+
+The media POST is non-idempotent: `transfer_unknown` is never automatically
+resent. A rejected transfer may be retried only by explicitly rerunning the
+command. `metadata_pending` retries only the metadata PATCH, while a `published`
+rerun sends no requests.
+
 ## Configuration
 
 The GUI covers everything, but the config file is
@@ -248,6 +278,7 @@ The GUI covers everything, but the config file is
 | `min_recording_seconds` | Discard recordings shorter than this |
 | `google_calendar_client_id` | Optional bare user-owned Google Desktop OAuth client ID; no secret or credential JSON |
 | `google_calendar_loopback_port` | OAuth loopback port: `0` for an OS-selected port (default), or `1`--`65535` |
+| `speakr_url` | Public Speakr HTTP(S) origin; the bearer token must come from `MEETING_RECORDER_SPEAKR_TOKEN` |
 | `allowlist` | `{"match": "<substring>", "app": "<Display Name>"}` rules |
 
 To watch another app, add an allowlist entry matching its process name:

@@ -3,8 +3,6 @@
 from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from typing import Any
 
 from meeting_recorder.calendar_domain import (
     CalendarOccurrence, CalendarParticipant, OccurrenceKey, meeting_snapshot,
@@ -23,9 +21,9 @@ HASH = "a" * 64
 def _raises(callable_object, *args, **kwargs) -> None:
     try:
         callable_object(*args, **kwargs)
-    except ValueError:
+    except (TypeError, ValueError):
         return
-    raise AssertionError("expected ValueError")
+    raise AssertionError("expected validation failure")
 
 
 def _meeting(*, visible=True, title="  Design review  ", description=None, location=None,
@@ -47,25 +45,24 @@ def _media() -> MediaIdentity:
 
 
 def _job(state=PublicationState.READY, **changes) -> PublicationJob:
-    values: dict[str, Any] = dict(
+    values = dict(
         key=PublicationKey("HTTPS://EXAMPLE.COM:443/", HASH.upper()),
-        media=_media(),
-        metadata=SpeakrMetadata("Title", NOW, "", ""),
-        state=state,
-        attempt_count=1,
+        path_hint="renamed.mkv", media_device=1, media_inode=2, media_size=3,
+        source_mtime_ns=4_000_000_000, file_last_modified_ms=4_000,
+        state=state, created_at_ms=1_000, updated_at_ms=1_000,
     )
     if state is PublicationState.TRANSFERRING:
-        values["transfer_started_at"] = NOW
+        values.update(attempt_count=1, transfer_started_at_ms=1_000)
     elif state in {PublicationState.TRANSFER_REJECTED, PublicationState.TRANSFER_UNKNOWN}:
-        values.update(transfer_started_at=NOW, transfer_completed_at=NOW + timedelta(seconds=1),
-                      error_code="network_error", http_status=503)
+        values.update(attempt_count=1, transfer_started_at_ms=1_000,
+                      last_error_code="network_error", last_http_status=503, updated_at_ms=2_000)
     elif state is PublicationState.METADATA_PENDING:
-        values.update(remote_recording_id=9, transfer_started_at=NOW,
-                      transfer_completed_at=NOW + timedelta(seconds=1))
+        values.update(attempt_count=1, remote_recording_id=9,
+                      transfer_started_at_ms=1_000, accepted_at_ms=2_000, updated_at_ms=2_000)
     elif state is PublicationState.PUBLISHED:
-        values.update(remote_recording_id=9, transfer_started_at=NOW,
-                      transfer_completed_at=NOW + timedelta(seconds=1),
-                      published_at=NOW + timedelta(seconds=2))
+        values.update(attempt_count=1, remote_recording_id=9,
+                      transfer_started_at_ms=1_000, accepted_at_ms=2_000,
+                      published_at_ms=3_000, updated_at_ms=3_000)
     values.update(changes)
     return PublicationJob(**values)
 
@@ -88,11 +85,10 @@ def test_url_normalization_rejects_every_non_origin_class() -> None:
         "", "ftp://example.com", "https:///missing-host", "https://",
         "https://user@example.com", "https://user:secret@example.com",
         "https://example.com?token=secret", "https://example.com#secret",
-        "https://example.com/path", "https://example.com//",
-        "https://example.com:", "https://example.com:abc", "https://example.com:65536",
-        "https://example.com:-1", "https://[not-ipv6]", "https://[2001:db8::1",
-        "https://example.com\n", "https://example.com\t", "https://example.com\u2003",
-        "https://token@example.com/path?x=1#y",
+        "https://example.com/path", "https://example.com//", "https://example.com:",
+        "https://example.com:abc", "https://example.com:65536", "https://example.com:-1",
+        "https://[not-ipv6]", "https://[2001:db8::1", "https://example.com\n",
+        "https://example.com\t", "https://example.com\u2003",
     )
     for value in rejected:
         _raises(normalize_speakr_url, value)
@@ -109,49 +105,48 @@ def test_keys_and_media_identity_are_canonical_and_nonnegative() -> None:
     _raises(PublicationKey, "https://example.com", True)
 
 
-def test_publication_states_and_results_enforce_frozen_state_machine() -> None:
+def test_publication_job_has_only_public_scalar_schema_and_validates_states() -> None:
     assert [state.value for state in PublicationState] == [
         "ready", "transferring", "transfer_rejected", "transfer_unknown",
         "metadata_pending", "published",
     ]
+    names = {field.name for field in fields(PublicationJob)}
+    assert names == {
+        "key", "state", "remote_recording_id", "path_hint", "media_device", "media_inode",
+        "media_size", "source_mtime_ns", "file_last_modified_ms", "attempt_count",
+        "last_error_code", "last_http_status", "transfer_started_at_ms", "accepted_at_ms",
+        "published_at_ms", "created_at_ms", "updated_at_ms",
+    }
     assert _job().state is PublicationState.READY
-    assert _job(PublicationState.TRANSFERRING).transfer_started_at == NOW
+    assert _job(PublicationState.TRANSFERRING).transfer_started_at_ms == 1_000
     assert _job(PublicationState.PUBLISHED).remote_recording_id == 9
     assert PublicationResult(_job(PublicationState.PUBLISHED), True).already_published
     _raises(PublicationResult, _job(), 1)
     _raises(_job, PublicationState.METADATA_PENDING, remote_recording_id=True)
     _raises(_job, PublicationState.PUBLISHED, remote_recording_id=0)
-    _raises(_job, PublicationState.READY, transfer_started_at=NOW)
-    _raises(_job, PublicationState.PUBLISHED, published_at=None)
-    _raises(_job, PublicationState.TRANSFER_REJECTED, error_code="Bearer secret")
-    _raises(_job, PublicationState.TRANSFER_REJECTED, http_status=True)
-    _raises(_job, PublicationState.METADATA_PENDING, error_code="network_error")
-
-
-def test_publication_job_has_only_public_schema_fields_and_is_immutable() -> None:
-    job = _job(PublicationState.PUBLISHED)
-    names = {field.name for field in fields(PublicationJob)}
-    assert not names.intersection({"token", "credentials", "authorization", "headers", "request_metadata"})
-    assert "secret" not in repr(job).casefold()
-    assert "secret" not in repr(PublicationKey("https://example.com", HASH)).casefold()
-    _raises(_job, PublicationState.TRANSFER_UNKNOWN, error_code="x\n")
+    _raises(_job, PublicationState.READY, transfer_started_at_ms=1_000)
+    _raises(_job, PublicationState.PUBLISHED, published_at_ms=None)
+    _raises(_job, PublicationState.TRANSFER_REJECTED, last_error_code="Bearer secret")
+    _raises(_job, PublicationState.TRANSFER_REJECTED, last_http_status=True)
+    pending = _job(PublicationState.METADATA_PENDING, last_error_code="metadata_failed", last_http_status=503)
+    assert pending.last_error_code == "metadata_failed"
+    assert "secret" not in repr(pending).casefold()
     try:
-        job.state = PublicationState.READY
+        pending.state = PublicationState.READY
         assert False, "publication jobs must be frozen"
     except AttributeError:
         pass
 
 
 def test_unmatched_and_hidden_sidecars_use_current_media_fallbacks() -> None:
-    with TemporaryDirectory() as directory:
-        media = Path(directory) / "renamed.capture.mkv"
-        mtime_ns = 1_735_689_123_456_789_000
-        for sidecar in (None, _sidecar(), _sidecar(_meeting(visible=False))):
-            result = map_speakr_metadata(media, mtime_ns, sidecar)
-            assert result.title == "renamed.capture"
-            assert result.meeting_date == datetime.fromtimestamp(mtime_ns / 1e9, timezone.utc)
-            assert result.notes == ""
-            assert result.participants == ""
+    media = Path("renamed.capture.mkv")
+    mtime_ns = 1_735_689_123_456_789_000
+    for sidecar in (None, _sidecar(), _sidecar(_meeting(visible=False))):
+        result = map_speakr_metadata(media, mtime_ns, sidecar)
+        assert result.title == "renamed.capture"
+        assert result.meeting_date == datetime.fromtimestamp(mtime_ns / 1e9, timezone.utc)
+        assert result.notes == ""
+        assert result.participants == ""
 
 
 def test_visible_match_maps_public_fields_and_preserves_description_lines() -> None:
@@ -166,14 +161,15 @@ def test_visible_match_maps_public_fields_and_preserves_description_lines() -> N
     assert result.participants == "Alice, Bob Smith"
 
 
-def test_visible_match_supports_description_only_location_only_and_public_cleaning() -> None:
+def test_visible_match_supports_public_cleaning_and_utc_dates() -> None:
     for description, location, expected in (
-        ("Details", None, "Details"),
-        (None, "Room", "Location: Room"),
+        ("Details", None, "Details"), (None, "Room", "Location: Room"),
         ("Details", "Room", "Details\n\nLocation: Room"),
     ):
-        result = map_speakr_metadata(Path("current.mkv"), 0,
-                                     _sidecar(_meeting(description=description, location=location)))
+        result = map_speakr_metadata(
+            Path("current.mkv"), 0,
+            _sidecar(_meeting(description=description, location=location)),
+        )
         assert result.notes == expected
     cleaned = map_speakr_metadata(
         Path("  current.mkv"), 0,
@@ -181,9 +177,6 @@ def test_visible_match_supports_description_only_location_only_and_public_cleani
     )
     assert cleaned.notes == "a b"
     assert cleaned.participants == "Alice"
-
-
-def test_metadata_requires_utc_dates_and_public_strings() -> None:
     _raises(SpeakrMetadata, "Title", datetime.now(), "", "")
     _raises(SpeakrMetadata, "\x00", NOW, "", "")
     _raises(SpeakrMetadata, "Title", NOW, "", ["Alice"])

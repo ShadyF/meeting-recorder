@@ -13,8 +13,10 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import unicodedata
 
 from .domain import VideoSource
+from .speakr_domain import normalize_speakr_url
 from .utils import LOG, expand_path
 
 # Ships inside the package so it resolves the same from a source checkout and an
@@ -42,6 +44,17 @@ _FORBIDDEN_CALENDAR_KEYS = frozenset({
     "google_calendar_authorization_code",
     "google_calendar_auth_code",
     "refresh_token",
+})
+_FORBIDDEN_SPEAKR_KEYS = frozenset({
+    "speakr_token",
+    "speakr_api_token",
+    "speakr_bearer_token",
+    "speakr_authorization",
+    "speakr_access_token",
+    "speakr_refresh_token",
+    "speakr_secret",
+    "speakr_password",
+    "speakr_credentials",
 })
 _GOOGLE_CLIENT_DOCUMENT_KEYS = frozenset({
     "client_id", "client_secret", "auth_uri", "token_uri", "redirect_uris",
@@ -87,6 +100,7 @@ class Config:
     min_recording_seconds: float
     google_calendar_client_id: str | None
     google_calendar_loopback_port: Any
+    speakr_url: str | None
     allowlist: list[AllowEntry] = field(default_factory=list)
 
     @classmethod
@@ -97,6 +111,10 @@ class Config:
         env_client = (os.environ["MEETING_RECORDER_GOOGLE_CLIENT_ID"] or None
                       if "MEETING_RECORDER_GOOGLE_CLIENT_ID" in os.environ else
                       data.get("google_calendar_client_id", ""))
+        configured_speakr_url = data.get("speakr_url")
+        env_speakr_url = (os.environ["MEETING_RECORDER_SPEAKR_URL"]
+                          if "MEETING_RECORDER_SPEAKR_URL" in os.environ else
+                          configured_speakr_url)
         return cls(
             output_dir=expand_path(data["output_dir"]),
             record_screen=bool(data["record_screen"]),
@@ -126,6 +144,8 @@ class Config:
             # Calendar commands validate this independently so a malformed
             # optional setting never prevents normal recording startup.
             google_calendar_loopback_port=data.get("google_calendar_loopback_port", 0),
+            # Speakr validates this only when its explicit command resolves it.
+            speakr_url=(str(env_speakr_url) if env_speakr_url is not None else None),
             allowlist=allow,
         )
 
@@ -141,7 +161,7 @@ def load_defaults() -> dict[str, Any]:
 
 
 def _normalize_user_overrides(user: dict[str, Any]) -> dict[str, Any]:
-    """Canonicalize legacy video settings and discard forbidden Calendar secrets."""
+    """Canonicalize settings and discard credential-shaped values."""
     normalized = dict(user)
     legacy_source = normalized.pop("capture_mode", None)
     if "video_source" not in normalized and legacy_source is not None:
@@ -152,11 +172,39 @@ def _normalize_user_overrides(user: dict[str, Any]) -> dict[str, Any]:
         is_google_document = (
             key in {"installed", "web"} and isinstance(value, dict) and
             _GOOGLE_CLIENT_DOCUMENT_KEYS.issubset(value))
-        if key in _FORBIDDEN_CALENDAR_KEYS or is_google_document or (
+        is_speakr_credential = key in _FORBIDDEN_SPEAKR_KEYS or (
+            key.startswith("speakr_") and any(
+                term in key for term in ("token", "secret", "authorization", "credential", "password")
+            )
+        )
+        if key in _FORBIDDEN_CALENDAR_KEYS or is_speakr_credential or is_google_document or (
                 key.startswith("google_calendar_") and
                 any(term in key for term in ("secret", "credential", "_token", "_code"))):
             normalized.pop(key)
     return normalized
+
+
+def resolve_speakr_url(config: Config, environ: Any | None = None) -> str:
+    """Resolve and validate the explicit Speakr instance URL."""
+    values = os.environ if environ is None else environ
+    value = values["MEETING_RECORDER_SPEAKR_URL"] if "MEETING_RECORDER_SPEAKR_URL" in values else config.speakr_url
+    return normalize_speakr_url(value)
+
+
+def require_speakr_token(environ: Any | None = None) -> str:
+    """Require the on-demand Speakr bearer token from the process environment."""
+    values = os.environ if environ is None else environ
+    if "MEETING_RECORDER_SPEAKR_TOKEN" not in values:
+        raise ValueError("Speakr token is not configured")
+    token = values["MEETING_RECORDER_SPEAKR_TOKEN"]
+    if (
+        not isinstance(token, str)
+        or not token
+        or len(token) > 4096
+        or any(char.isspace() or unicodedata.category(char).startswith("C") for char in token)
+    ):
+        raise ValueError("Speakr token is invalid")
+    return token
 
 
 def _load_effective_config() -> dict[str, Any]:

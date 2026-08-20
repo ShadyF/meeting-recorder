@@ -37,6 +37,13 @@ please pay particular attention to:
   as root. It deliberately is not a system service.
 - Recordings are written to `~/Videos/MeetingRecorder/` (configurable) and owned
   by you.
-- Nothing is uploaded anywhere: the app has **no network functionality**.
+- Recordings are uploaded only after the user explicitly runs
+  `meeting-recorder speakr upload PATH`. There is no automatic upload. The
+  public `speakr_url` may be configured, but the bearer token is accepted only
+  from `MEETING_RECORDER_SPEAKR_TOKEN`; it is never stored in configuration,
+  CLI arguments, or SQLite.
+- Speakr's local publication database stores only bounded public state under
+  `XDG_STATE_HOME` (or the user's local state directory); it contains no
+  credentials or private Meeting metadata.
 - Detection reads audio-stream metadata via `pactl`; it never reads audio content
   to decide whether to record.
