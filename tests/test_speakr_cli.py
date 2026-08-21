@@ -1,62 +1,150 @@
-"""CLI and local-server acceptance tests for explicit Speakr publication."""
+"""Focused CLI tests for the explicit Speakr decision-record forms."""
 
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from typing import cast
 from unittest.mock import patch
 
-from meeting_recorder.__main__ import _cmd_speakr_upload, build_parser
-from meeting_recorder.calendar_domain import MeetingSnapshot, OccurrenceKey
-from meeting_recorder.config import Config, require_speakr_token, resolve_speakr_url
-from meeting_recorder.meeting_sidecar import MeetingSidecar, sidecar_path, write_sidecar
-from meeting_recorder.speakr_domain import PublicationState
-from meeting_recorder.speakr_http import StdlibSpeakrTransport
-from meeting_recorder.speakr_publisher import SpeakrPublisher
+from meeting_recorder.__main__ import (
+    _cmd_speakr_upload, _publication_rename_tracker, build_parser, main,
+)
+from meeting_recorder.speakr_domain import MediaIdentity, PublicationKey, PublicationState
 from meeting_recorder.speakr_store import PublicationStore
-from tests.speakr_fake_server import fake_speakr_server, json_body, multipart_parts
 
 
-NOW = datetime(2026, 8, 20, 12, 34, 56, 789000, tzinfo=timezone.utc)
-TOKEN = "speakr-token-private-sentinel"
+ORIGIN = "https://configured.example"
+TOKEN = "cli-token-private-sentinel"
+HASH = "a" * 64
 
 
-def _meeting(*, visible: bool = True) -> MeetingSnapshot:
-    return MeetingSnapshot(
-        OccurrenceKey.single("calendar", "event"), "Design review" if visible else None, NOW,
-        NOW + timedelta(hours=1), ("Alice", "Bob") if visible else (),
-        "Public notes" if visible else None, "Room 7" if visible else None, visible,
+def _job(
+    job_id: str = "job-1",
+    state: PublicationState = PublicationState.QUEUED,
+    *,
+    operation: str = "post",
+    resume_intent: str = "post",
+    origin: str = ORIGIN,
+):
+    # Return the smallest job-shaped object needed by the command handlers.
+    return SimpleNamespace(
+        job_id=job_id,
+        state=state,
+        operation=operation,
+        resume_intent=resume_intent,
+        key=SimpleNamespace(instance_url=origin, recording_sha256=HASH),
+        attempt_count=2,
+        next_attempt_at_ms=1234,
+        remote_recording_id=42,
+        last_error_code="transfer_unknown",
+        last_http_status=503,
+        reconciliation_eligible=operation == "reconcile",
     )
 
 
-def _sidecar(
-    media: Path, meeting: MeetingSnapshot | None, *, recording_filename: str | None = None,
-) -> MeetingSidecar:
-    return MeetingSidecar(
-        recording_filename or media.name, "fallback.mkv", NOW, NOW + timedelta(minutes=1), meeting,
-    )
+def _result(job, already_published: bool = False):
+    return SimpleNamespace(job=job, already_published=already_published)
+
+
+class FakePublisher:
+    def __init__(self, jobs=()) -> None:
+        # Keep calls and returned jobs in memory so tests can inspect CLI routing.
+        self.jobs = {job.job_id: job for job in jobs}
+        self.calls: list[tuple] = []
+        self.next_result = _result(_job("job-1", PublicationState.PUBLISHED))
+
+    def get(self, reference):
+        # Record local lookup requests without contacting a transport.
+        self.calls.append(("get", reference))
+        return self.jobs.get(reference)
+
+    def list(self):
+        # Record local list requests and return the current fake rows.
+        self.calls.append(("list",))
+        return list(self.jobs.values())
+
+    def enqueue(self, path, origin):
+        # Create a fake queued row for path-form command tests.
+        self.calls.append(("enqueue", path, origin))
+        job = _job()
+        self.jobs[job.job_id] = job
+        return job
+
+    def run_one(self, origin, token, reference):
+        # Record one-job execution with the credentials supplied by the CLI.
+        self.calls.append(("run_one", origin, token, reference))
+        return self.next_result
+
+    def run_due(self, origin, token):
+        # Record bounded execution requests from the fake engine.
+        self.calls.append(("run_due", origin, token))
+        return [self.next_result]
+
+    def run_all_due(self, origin, token):
+        # Record fixed-snapshot batch execution requests.
+        self.calls.append(("run_all_due", origin, token))
+        return [self.next_result]
+
+    def retry(self, reference):
+        # Record explicit local retry resets.
+        self.calls.append(("retry", reference))
+        return self.jobs.get(reference, _job(reference))
+
+    def block_configuration(self, reference, *, instance_url=None):
+        # Model engine-side fencing when credentials are unavailable.
+        self.calls.append(("block_configuration", reference))
+        job = self.jobs.get(reference, _job(reference, PublicationState.BLOCKED))
+        job.state = PublicationState.BLOCKED
+        job.last_error_code = "protocol_error"
+        return job
+
+    def relink(self, reference, path):
+        # Record local path replacement without running publication.
+        self.calls.append(("relink", reference, path))
+        return self.jobs.get(reference, _job(reference))
+
+    def forget(self, reference):
+        # Remove only the local fake row after recording the action.
+        self.calls.append(("forget", reference))
+        self.jobs.pop(reference, None)
 
 
 def _output(callable_object, *args, **kwargs) -> tuple[int, str]:
+    # Capture both streams so command errors are checked without terminal output.
     output = io.StringIO()
     with redirect_stdout(output), redirect_stderr(output):
         result = callable_object(*args, **kwargs)
     return result, output.getvalue()
 
 
-def test_speakr_parser_has_only_explicit_upload_path_and_no_credential_options() -> None:
+def _run_with_fake(fake: FakePublisher, **kwargs) -> tuple[int, str]:
+    # Replace configuration and construction so each test observes only CLI calls.
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token", return_value=TOKEN):
+        return _output(_cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), **kwargs)
+
+
+def test_speakr_parser_exposes_all_decision_forms_and_rejects_credential_flags() -> None:
+    # Build the parser once, then exercise every supported decision form.
     parser = build_parser()
-    args = parser.parse_args(["speakr", "upload", "recording.mkv"])
-    assert args.command == "speakr"
-    assert args.speakr_command == "upload"
-    assert args.path == "recording.mkv"
+    forms = (
+        ["recording.mkv"], ["--all"], ["--status", "JOB"],
+        ["--status", "--all"], ["--retry", "JOB"],
+        ["--relink", "JOB", "new.mkv"], ["--forget", "JOB"],
+    )
+
+    # Every accepted form must select the Speakr upload command.
+    for form in forms:
+        args = parser.parse_args(["speakr", "upload", *form])
+        assert args.command == "speakr" and args.speakr_command == "upload"
+
+    # Credential flags remain rejected because credentials come from configuration.
     for option in ("--token", "--url", "--secret"):
         try:
             parser.parse_args(["speakr", "upload", option, "value"])
@@ -66,185 +154,177 @@ def test_speakr_parser_has_only_explicit_upload_path_and_no_credential_options()
             raise AssertionError(f"forbidden Speakr option accepted: {option}")
 
 
-def test_speakr_url_is_typed_only_and_token_is_environment_only() -> None:
-    config = cast(Config, SimpleNamespace(speakr_url="https://configured.example/"))
-    with patch.dict(os.environ, {
-        "MEETING_RECORDER_SPEAKR_URL": "HTTP://env.example:80/",
-        "MEETING_RECORDER_SPEAKR_TOKEN": TOKEN,
-    }, clear=False):
-        assert resolve_speakr_url(config) == "http://env.example"
-        assert require_speakr_token() == TOKEN
-    assert resolve_speakr_url(config, {}) == "https://configured.example"
+def test_status_and_status_all_are_local_and_secret_free() -> None:
+    # Status for one job must not resolve credentials or contact the network.
+    job = _job()
+    fake = FakePublisher((job,))
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=AssertionError):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), status_job=job.job_id,
+        )
+        assert result == 0
+        assert job.job_id in output and HASH in output
+        assert TOKEN not in output and "Design review" not in output
+        assert not any(call[0] == "run_one" for call in fake.calls)
 
-    for value in ("", "https://example.test/path", "https://example.test?token=x"):
-        try:
-            resolve_speakr_url(config, {"MEETING_RECORDER_SPEAKR_URL": value})
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("malformed Speakr URL was accepted")
-    for value in ("", "x y", "x\r\ny", "x\x00", "x" * 4097):
-        try:
-            require_speakr_token({"MEETING_RECORDER_SPEAKR_TOKEN": value})
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("malformed Speakr token was accepted")
+    # Listing all jobs follows the same local, secret-free path.
+    fake = FakePublisher((job,))
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=AssertionError):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), all_jobs=True, status_all=True,
+        )
+    assert result == 0 and job.job_id in output and TOKEN not in output
 
 
-def test_speakr_command_config_errors_are_safe_and_do_not_construct_publisher() -> None:
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("MEETING_RECORDER_SPEAKR_URL", None)
-        os.environ.pop("MEETING_RECORDER_SPEAKR_TOKEN", None)
-        result, output = _output(_cmd_speakr_upload, SimpleNamespace(speakr_url=""), "missing.mkv")
-    assert result == 2
-    assert "invalid instance URL" in output
+def test_path_upload_and_all_use_configured_origin_and_token() -> None:
+    # A path upload must enqueue and run with the configured origin and token.
+    fake = FakePublisher()
+    result, output = _run_with_fake(fake, path="recording.mkv")
+    assert result == 0 and "published" in output
+    assert ("enqueue", "recording.mkv", ORIGIN) in fake.calls
+    assert any(call[:3] == ("run_one", ORIGIN, TOKEN) for call in fake.calls)
+
+    # The all-jobs form must use the batch operation with the same credentials.
+    fake = FakePublisher()
+    result, output = _run_with_fake(fake, all_jobs=True)
+    assert result == 0 and "published" in output
+    assert any(call[:3] == ("run_all_due", ORIGIN, TOKEN) for call in fake.calls)
+
+
+def test_retry_warns_for_terminal_uncertain_and_runs_only_after_explicit_reset() -> None:
+    # An uncertain job requires an explicit retry reset before execution.
+    job = _job("uncertain", PublicationState.UNCERTAIN, operation="none", resume_intent="reconcile")
+    fake = FakePublisher((job,))
+    result, output = _run_with_fake(fake, retry_job=job.job_id)
+    assert result == 0
+    assert "duplicate" in output
+    assert fake.calls[:3] == [("get", job.job_id), ("retry", job.job_id),
+                               ("run_one", ORIGIN, TOKEN, job.job_id)]
     assert TOKEN not in output
 
-    with patch.dict(os.environ, {"MEETING_RECORDER_SPEAKR_TOKEN": TOKEN}, clear=False), \
-            patch("meeting_recorder.__main__.resolve_speakr_url", side_effect=ValueError):
+
+def test_missing_token_uses_engine_fencing_to_block_network_jobs() -> None:
+    # A missing token still reaches the engine, which blocks the path job safely.
+    blocked = _job("blocked", PublicationState.BLOCKED)
+    fake = FakePublisher((blocked,))
+    fake.next_result = _result(blocked)
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=ValueError):
         result, output = _output(
-            _cmd_speakr_upload, SimpleNamespace(speakr_url="https://example.test"), "missing.mkv",
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), path="recording.mkv",
         )
-    assert result == 2 and TOKEN not in output
+    assert result == 1 and "blocked" in output
+    assert ("run_one", ORIGIN, "", "job-1") in fake.calls
+    assert TOKEN not in output
 
-    with patch.dict(os.environ, {"MEETING_RECORDER_SPEAKR_TOKEN": "bad token"}, clear=False), \
-            patch("meeting_recorder.__main__.resolve_speakr_url", return_value="https://example.test"):
+    # The all-jobs form applies the same empty-token fencing to its batch call.
+    fake = FakePublisher((blocked,))
+    fake.next_result = _result(blocked)
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=ValueError):
         result, output = _output(
-            _cmd_speakr_upload, SimpleNamespace(speakr_url="https://example.test"), "missing.mkv",
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), all_jobs=True,
         )
-    assert result == 2 and TOKEN not in output
+    assert result == 1 and ("run_all_due", ORIGIN, "") in fake.calls
+
+    # Retry without credentials blocks the referenced job instead of resetting it.
+    fake = FakePublisher((blocked,))
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=ValueError):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), retry_job=blocked.job_id,
+        )
+    assert result == 1 and ("block_configuration", blocked.job_id) in fake.calls
+    assert not any(call[0] == "retry" for call in fake.calls)
 
 
-def test_speakr_command_state_messages_are_safe_and_stable() -> None:
-    states = (
-        (PublicationState.PUBLISHED, 0, "published"),
-        (PublicationState.PUBLISHED, 0, "already published"),
-        (PublicationState.TRANSFER_REJECTED, 1, "HTTP 503"),
-        (PublicationState.TRANSFER_UNKNOWN, 1, "media was not re-sent"),
-        (PublicationState.METADATA_PENDING, 1, "no media re-upload"),
+def test_missing_origin_does_not_guess_or_create_a_new_path_job() -> None:
+    # A missing configured origin must fail before enqueueing local state.
+    fake = FakePublisher()
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", side_effect=ValueError), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=AssertionError):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=None), path="recording.mkv",
+        )
+    assert result == 2
+    assert not any(call[0] == "enqueue" for call in fake.calls)
+    assert TOKEN not in output
+
+
+def test_relink_and_forget_are_local_and_report_invalid_references() -> None:
+    # Relinking changes only local state and must not run a publication.
+    job = _job()
+    fake = FakePublisher((job,))
+    result, output = _run_with_fake(fake, relink_job=job.job_id, relink_path="new.mkv")
+    assert result == 0 and "new.mkv" not in output
+    assert ("relink", job.job_id, "new.mkv") in fake.calls
+    assert not any(call[0] == "run_one" for call in fake.calls)
+
+    # Forgetting also stays local and reports the requested action.
+    result, output = _run_with_fake(fake, forget_job=job.job_id)
+    assert result == 0 and "forgot" in output
+    assert ("forget", job.job_id) in fake.calls
+
+    # A missing local reference is reported as a command error.
+    missing = FakePublisher()
+    result, output = _run_with_fake(missing, status_job="missing")
+    assert result == 2 and "not found" in output
+
+
+def test_action_required_results_and_ambiguous_forms_are_nonzero() -> None:
+    # Blocked execution returns a nonzero result and exposes the next action.
+    fake = FakePublisher()
+    fake.next_result = _result(_job(state=PublicationState.BLOCKED))
+    result, output = _run_with_fake(fake, path="recording.mkv")
+    assert result == 1 and "action required" in output and "blocked" in output
+
+    # Supplying both path and batch forms is rejected as ambiguous.
+    fake = FakePublisher()
+    result, output = _output(
+        _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), path="recording.mkv", all_jobs=True,
     )
-    for state, expected_code, expected_text in states:
-        result = SimpleNamespace(
-            job=SimpleNamespace(state=state, last_http_status=503),
-            already_published=expected_text == "already published",
-            error_code=None,
-            http_status=503,
-        )
-        with patch.dict(os.environ, {"MEETING_RECORDER_SPEAKR_TOKEN": TOKEN}, clear=False), \
-                patch("meeting_recorder.__main__.resolve_speakr_url", return_value="https://example.test"), \
-                patch("meeting_recorder.__main__.require_speakr_token", return_value=TOKEN), \
-                patch("meeting_recorder.speakr_store.PublicationStore"), \
-                patch("meeting_recorder.speakr_http.StdlibSpeakrTransport"), \
-                patch("meeting_recorder.speakr_publisher.SpeakrPublisher") as publisher:
-            publisher.return_value.publish.return_value = result
-            exit_code, output = _output(
-                _cmd_speakr_upload, SimpleNamespace(speakr_url="https://example.test"), "recording.mkv",
-            )
-        assert exit_code == expected_code
-        assert expected_text in output
-        assert TOKEN not in output
+    assert result == 2 and "PATH" in output
 
 
-def test_local_server_acceptance_is_restart_safe_and_sends_current_public_metadata() -> None:
+def test_parser_rejects_status_without_job_or_all_and_status_job_with_all() -> None:
+    # Invalid status combinations must terminate through parser validation.
+    for argv in (
+        ["speakr", "upload", "--status"],
+        ["speakr", "upload", "--status", "JOB", "--all"],
+    ):
+        try:
+            main(argv)
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError("ambiguous Speakr form was accepted")
+
+
+def test_cli_rename_tracker_updates_matching_unleased_identity_without_creating_new_state() -> None:
+    # Use an isolated state directory so rename tracking cannot affect other jobs.
     with TemporaryDirectory() as directory:
         root = Path(directory)
-        media = root / "fallback.mkv"
-        payload = b"exact recording bytes\x00\xff"
-        media.write_bytes(payload)
-        os.utime(media, ns=(4_000_000_000, 4_000_000_000))
-        write_sidecar(sidecar_path(media), _sidecar(media, _meeting()))
-        store = PublicationStore(root / "state" / "publications.sqlite3", clock=lambda: 1_000)
+        state_home = root / "state-home"
+        old = root / "old.mkv"
+        new = root / "new.mkv"
+        old.write_bytes(b"recording")
+        info = os.lstat(old)
+        identity = MediaIdentity(old, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        database = state_home / "meeting-recorder" / "publications.sqlite3"
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home)}, clear=False):
+            # Create one matching identity, rename it, and update the existing row.
+            store = PublicationStore(database)
+            key = PublicationKey(ORIGIN, hashlib.sha256(b"recording").hexdigest())
+            job = store.create_or_reuse(key, os.fsencode(old), identity=identity)
+            old.rename(new)
+            _publication_rename_tracker()(old, new)
+            updated = PublicationStore(database).get(job.job_id)
 
-        with fake_speakr_server(patch_statuses=(503, 204)) as (url, server):
-            publisher = SpeakrPublisher(
-                store, StdlibSpeakrTransport(timeout_seconds=2, chunk_size=3), chunk_size=3,
-            )
-            first = publisher.publish(media, url, TOKEN)
-            second = publisher.publish(media, url, TOKEN)
-            third = publisher.publish(media, url, TOKEN)
-
-        assert first.job.state is PublicationState.METADATA_PENDING
-        assert second.job.state is PublicationState.PUBLISHED
-        assert third.already_published
-        assert [request.method for request in server.requests] == ["POST", "PATCH", "PATCH"]
-
-        upload, first_patch, second_patch = server.requests
-        assert upload.path == "/api/v1/recordings/upload"
-        assert upload.headers["authorization"] == "Bearer " + TOKEN
-        parts = multipart_parts(upload)
-        assert parts["file"][1] == payload
-        assert parts["file_last_modified"][1] == b"4000"
-        assert parts["meeting_date"][1] == b"2026-08-20T12:34:56.789000Z"
-        assert second_patch.path == "/api/v1/recordings/42"
-        assert second_patch.headers["authorization"] == "Bearer " + TOKEN
-        assert json_body(second_patch) == {
-            "title": "Design review",
-            "meeting_date": "2026-08-20T12:34:56.789000Z",
-            "notes": "Public notes\n\nLocation: Room 7",
-            "participants": "Alice, Bob",
-        }
-        assert hashlib.sha256(payload).hexdigest().encode() in store.database_path.read_bytes()
-        assert TOKEN.encode() not in store.database_path.read_bytes()
-
-
-def test_unmatched_sidecar_uses_current_filename_and_mtime_without_private_metadata() -> None:
-    with TemporaryDirectory() as directory:
-        root = Path(directory)
-        media = root / "renamed.mkv"
-        media.write_bytes(b"unmatched")
-        os.utime(media, ns=(5_000_000_000, 5_000_000_000))
-        write_sidecar(
-            sidecar_path(media), _sidecar(media, _meeting(), recording_filename="other.mkv"),
-        )
-        store = PublicationStore(root / "state" / "publications.sqlite3", clock=lambda: 1_000)
-        with fake_speakr_server() as (url, server):
-            result = SpeakrPublisher(
-                store, StdlibSpeakrTransport(timeout_seconds=2),
-            ).publish(media, url, TOKEN)
-        assert result.job.state is PublicationState.PUBLISHED
-        assert multipart_parts(server.requests[0])["meeting_date"][1] == b"1970-01-01T00:00:05Z"
-        assert json_body(server.requests[1]) == {
-            "title": "renamed",
-            "meeting_date": "1970-01-01T00:00:05Z",
-            "notes": "",
-            "participants": "",
-        }
-
-
-def test_upload_meeting_date_is_explicit_for_hidden_absent_and_malformed_sidecars() -> None:
-    cases = ("hidden", "absent", "malformed")
-    for case in cases:
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            media = root / "recording.mkv"
-            media.write_bytes(b"date cases")
-            os.utime(media, ns=(5_000_000_000, 5_000_000_000))
-            if case == "hidden":
-                write_sidecar(sidecar_path(media), _sidecar(media, _meeting(visible=False)))
-            elif case == "malformed":
-                sidecar_path(media).write_bytes(b"not valid sidecar")
-            store = PublicationStore(root / "state" / "publications.sqlite3", clock=lambda: 1_000)
-
-            with fake_speakr_server() as (url, server):
-                result = SpeakrPublisher(
-                    store, StdlibSpeakrTransport(timeout_seconds=2),
-                ).publish(media, url, TOKEN)
-
-            upload = server.requests[0]
-            parts = multipart_parts(upload)
-            expected_date = NOW if case == "hidden" else datetime.fromtimestamp(5, timezone.utc)
-            assert parts["meeting_date"][1] == expected_date.isoformat().replace(
-                "+00:00", "Z",
-            ).encode()
-            if case == "malformed":
-                assert result.job.state is PublicationState.METADATA_PENDING
-                assert len(server.requests) == 1
-            else:
-                assert result.job.state is PublicationState.PUBLISHED
-                assert len(server.requests) == 2
-                assert json_body(server.requests[1])["meeting_date"] == (
-                    expected_date.isoformat().replace("+00:00", "Z")
-                )
-                assert json_body(server.requests[1])["notes"] == ""
-                assert json_body(server.requests[1])["participants"] == ""
+        # The tracker must preserve the job while replacing only its local path.
+        assert updated is not None and updated.private_path == os.fsencode(new)

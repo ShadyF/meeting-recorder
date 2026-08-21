@@ -19,22 +19,65 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
+import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 
 from . import __version__
 from .config import (
-    load_config, require_speakr_token, resolve_speakr_url, write_default_user_config,
+    Config, load_config, require_speakr_token, resolve_speakr_url, write_default_user_config,
 )
+from .speakr_domain import PublicationJob, PublicationResult
 from .utils import LOG, build_output_path, setup_logging
+
+if TYPE_CHECKING:
+    from .speakr_publisher import SpeakrPublisher
 
 _SERVICE = "meeting-recorder.service"
 # How long `record` stays alive after saving, so the notification's Open Folder
 # button still has a process to call back into. Bounded: the file is already
 # safely written by this point, this is only about the button.
 _NOTIFICATION_LINGER_SECONDS = 180
+
+
+def _publication_rename_tracker() -> Callable[[Path, Path], None]:
+    """Build a lazy, best-effort callback for app-managed media moves."""
+    holder: dict[str, Any] = {}
+
+    def track(old_path: Path, new_path: Path) -> None:
+        try:
+            from .speakr_domain import MediaIdentity
+            from .speakr_store import PublicationStore, default_database_path
+
+            old_absolute = Path(os.path.abspath(os.fspath(old_path)))
+            new_absolute = Path(os.path.abspath(os.fspath(new_path)))
+            info = os.lstat(new_absolute)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                return
+            identity = MediaIdentity(
+                new_absolute, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            )
+
+            # Do not create publication state just because an untracked file was renamed.
+            store = holder.get("store")
+            if store is None:
+                database_path = default_database_path()
+                if not database_path.exists():
+                    return
+                store = PublicationStore(database_path)
+                holder["store"] = store
+            store.update_path(
+                os.fsencode(old_absolute), os.fsencode(new_absolute), identity,
+            )
+        except Exception as exc:
+            # Publication tracking must never affect a committed recording move.
+            LOG.debug("Publication rename tracking unavailable: %s", type(exc).__name__)
+
+    return track
 
 
 def _cmd_run(cfg) -> int:
@@ -56,7 +99,10 @@ def _cmd_run(cfg) -> int:
 
     notifier = Notifier()
     recorder = Recorder(cfg)
-    enricher = RecordingEnricher(cache_only_occurrence_provider()).enrich
+    enricher = RecordingEnricher(
+        cache_only_occurrence_provider(),
+        on_media_renamed=_publication_rename_tracker(),
+    ).enrich
     controller = Controller(cfg, notifier, recorder, recording_enricher=enricher)
     detector = MeetingDetector(
         allowlist=cfg.allowlist,
@@ -133,7 +179,10 @@ def _cmd_record(cfg) -> int:
 
     notifier = Notifier()
     recorder = Recorder(cfg)
-    enricher = RecordingEnricher(cache_only_occurrence_provider()).enrich
+    enricher = RecordingEnricher(
+        cache_only_occurrence_provider(),
+        on_media_renamed=_publication_rename_tracker(),
+    ).enrich
     controller = Controller(cfg, notifier, recorder, recording_enricher=enricher)
     loop = GLib.MainLoop()
     result: dict = {}
@@ -278,49 +327,204 @@ def _cmd_config(_cfg) -> int:
     return 0
 
 
-def _cmd_speakr_upload(cfg, path: str) -> int:
-    """Publish one recording only when the user invokes this command."""
-    from .speakr_domain import PublicationState
-    from .speakr_http import StdlibSpeakrTransport
-    from .speakr_publisher import SpeakrPublisher
-    from .speakr_store import PublicationStore
+def _speakr_status(job: PublicationJob) -> dict[str, object]:
+    """Return only bounded operational fields safe for terminal output."""
+    return {
+        "job_id": job.job_id,
+        "state": job.state.value,
+        "action": job.operation,
+        "resume_intent": job.resume_intent,
+        "origin": job.key.instance_url,
+        "sha256": job.key.recording_sha256,
+        "attempts": job.attempt_count,
+        "next_attempt_at_ms": job.next_attempt_at_ms,
+        "remote_recording_id": job.remote_recording_id,
+        "last_error_code": job.last_error_code,
+        "last_http_status": job.last_http_status,
+    }
 
+
+def _print_speakr_status(job: PublicationJob) -> None:
+    print(json.dumps(_speakr_status(job), sort_keys=True))
+
+
+def _speakr_credentials(cfg: Config) -> tuple[str, str | None] | None:
+    """Resolve network credentials only for operations that may contact Speakr."""
     try:
         instance_url = resolve_speakr_url(cfg)
     except (TypeError, ValueError):
         print("Speakr: invalid instance URL configuration.", file=sys.stderr)
-        return 2
+        return None
     try:
         token = require_speakr_token()
     except (TypeError, ValueError):
         print("Speakr: bearer token is missing or invalid.", file=sys.stderr)
+        return instance_url, None
+    return instance_url, token
+
+
+def _speakr_publisher() -> SpeakrPublisher:
+    from .speakr_http import StdlibSpeakrTransport
+    from .speakr_publisher import SpeakrPublisher
+    from .speakr_store import PublicationStore
+
+    return SpeakrPublisher(PublicationStore(), StdlibSpeakrTransport())
+
+
+def _speakr_result_code(result: PublicationResult) -> int:
+    from .speakr_domain import PublicationState
+
+    _print_speakr_status(result.job)
+    if result.job.state is PublicationState.PUBLISHED:
+        print("Speakr: already published." if result.already_published else "Speakr: published.")
+        return 0
+    print(
+        f"Speakr: action required; publication remains {result.job.state.value}.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _cmd_speakr_upload(
+    cfg: Config,
+    path: str | None = None,
+    *,
+    all_jobs: bool = False,
+    status_job: str | None = None,
+    status_all: bool = False,
+    retry_job: str | None = None,
+    relink_job: str | None = None,
+    relink_path: str | None = None,
+    forget_job: str | None = None,
+) -> int:
+    """Run one explicit Speakr operation without exposing private values."""
+    from .speakr_domain import PublicationState
+
+    operation_count = sum(item is not None for item in (
+        status_job, retry_job, relink_job, forget_job,
+    ))
+    if status_all and status_job is not None:
+        print("Speakr: --status JOB cannot be combined with --status --all.", file=sys.stderr)
+        return 2
+    if status_all and not all_jobs:
+        print("Speakr: --status --all requires the --all form.", file=sys.stderr)
+        return 2
+    if operation_count > 1 or (operation_count and (all_jobs or path is not None)):
+        print("Speakr: Speakr upload options are ambiguous.", file=sys.stderr)
+        return 2
+    if status_all and operation_count:
+        print("Speakr: Speakr upload options are ambiguous.", file=sys.stderr)
+        return 2
+    if not any((path is not None, all_jobs, status_all, operation_count)):
+        print("Speakr: upload requires PATH, --all, or one operation option.", file=sys.stderr)
+        return 2
+    if all_jobs and path is not None:
+        print("Speakr: PATH cannot be combined with --all.", file=sys.stderr)
         return 2
 
     try:
-        result = SpeakrPublisher(
-            PublicationStore(), StdlibSpeakrTransport(),
-        ).publish(path, instance_url, token)
+        publisher = _speakr_publisher()
+    except Exception:
+        print("Speakr: publication state is unavailable.", file=sys.stderr)
+        return 1
+
+    # Local inspection and mutations intentionally do not resolve credentials.
+    if status_job is not None or status_all:
+        if status_all:
+            for job in publisher.list():
+                _print_speakr_status(job)
+            return 0
+        assert status_job is not None
+        job = publisher.get(status_job)
+        if job is None:
+            print("Speakr: publication job was not found.", file=sys.stderr)
+            return 2
+        _print_speakr_status(job)
+        return 0
+    if relink_job is not None:
+        try:
+            job = publisher.relink(relink_job, relink_path or "")
+        except Exception:
+            print("Speakr: relink failed; the local job was not changed.", file=sys.stderr)
+            return 1
+        _print_speakr_status(job)
+        return 0
+    if forget_job is not None:
+        try:
+            if publisher.get(forget_job) is None:
+                print("Speakr: publication job was not found.", file=sys.stderr)
+                return 2
+            publisher.forget(forget_job)
+        except Exception:
+            print("Speakr: forget failed; the local job was not changed.", file=sys.stderr)
+            return 1
+        print(f"Speakr: forgot {forget_job}.")
+        return 0
+
+    credentials = _speakr_credentials(cfg)
+    if credentials is None:
+        # A referenced job can still be fenced without guessing its origin.
+        if retry_job is not None:
+            try:
+                blocked = publisher.block_configuration(retry_job)
+            except Exception:
+                blocked = None
+            if blocked is None:
+                print("Speakr: publication job was not found or is unavailable.", file=sys.stderr)
+                return 2
+            _print_speakr_status(blocked)
+            return 1
+        return 2
+    instance_url, token = credentials
+    safe_token = token or ""
+    try:
+        if retry_job is not None:
+            job = publisher.get(retry_job)
+            if job is None:
+                print("Speakr: publication job was not found.", file=sys.stderr)
+                return 2
+            if job.key.instance_url != instance_url:
+                print("Speakr: publication job origin does not match configuration.", file=sys.stderr)
+                return 2
+            if token is None:
+                # Let the engine claim and block the current phase before any reset.
+                blocked = publisher.block_configuration(retry_job, instance_url=instance_url)
+                if blocked is None:
+                    print("Speakr: publication job is leased or not due.", file=sys.stderr)
+                    return 1
+                _print_speakr_status(blocked)
+                return 1
+            if job.state is PublicationState.UNCERTAIN and not job.reconciliation_eligible:
+                print(
+                    "WARNING: explicit retry may create a duplicate Speakr recording.",
+                    file=sys.stderr,
+                )
+            reset = publisher.retry(retry_job)
+            result = publisher.run_one(instance_url, safe_token, reset.job_id)
+            if result is None:
+                print("Speakr: publication job is leased or not due.", file=sys.stderr)
+                return 1
+            return _speakr_result_code(result)
+        if all_jobs:
+            # The engine snapshots due IDs so zero-delay retries cannot starve later jobs.
+            results = publisher.run_all_due(instance_url, safe_token)
+            if not results:
+                print("Speakr: no due publication jobs.")
+                return 2 if token is None else 0
+            result_codes = [_speakr_result_code(result) for result in results]
+            return 0 if all(code == 0 for code in result_codes) else 1
+        if path is None:
+            print("Speakr: PATH is required.", file=sys.stderr)
+            return 2
+        job = publisher.enqueue(path, instance_url)
+        result = publisher.run_one(instance_url, safe_token, job.job_id)
+        if result is None:
+            print("Speakr: publication job is leased or not due.", file=sys.stderr)
+            return 1
+        return _speakr_result_code(result)
     except Exception:
         print("Speakr: publication failed; no private error details are available.", file=sys.stderr)
         return 1
-
-    state = result.job.state
-    if state is PublicationState.PUBLISHED:
-        print("Speakr: already published." if result.already_published else "Speakr: published.")
-        return 0
-    if state is PublicationState.TRANSFER_REJECTED:
-        status = result.http_status
-        suffix = f" HTTP {status}" if status is not None else ""
-        print(f"Speakr: transfer rejected{suffix}; retry is explicit.", file=sys.stderr)
-        return 1
-    if state is PublicationState.TRANSFER_UNKNOWN:
-        print("Speakr: transfer outcome is unknown; media was not re-sent.", file=sys.stderr)
-        return 1
-    if state is PublicationState.METADATA_PENDING:
-        print("Speakr: metadata remains pending; no media re-upload.", file=sys.stderr)
-        return 1
-    print("Speakr: unexpected publication state; no private details available.", file=sys.stderr)
-    return 1
 
 
 def _cmd_settings(_cfg) -> int:
@@ -371,7 +575,7 @@ def _cmd_calendar_correct(cfg, recording: str, refresh: bool,
         return 1
 
     if clear:
-        service = RecordingCorrectionService(())
+        service = RecordingCorrectionService((), on_media_renamed=_publication_rename_tracker())
         try:
             before = service.discover(Path(recording))
             final = service.clear(Path(recording))
@@ -388,7 +592,9 @@ def _cmd_calendar_correct(cfg, recording: str, refresh: bool,
         _correction_refresh(cfg)
     provider = cache_only_occurrence_provider()
     occurrences = tuple(provider())
-    service = RecordingCorrectionService(occurrences)
+    service = RecordingCorrectionService(
+        occurrences, on_media_renamed=_publication_rename_tracker(),
+    )
     try:
         if selector is None:
             if service.discover(Path(recording)) is None:
@@ -533,8 +739,19 @@ def build_parser() -> argparse.ArgumentParser:
     correct_group.add_argument("--clear", action="store_true")
     speakr = sub.add_parser("speakr", parents=[common], help="explicitly publish recordings to Speakr")
     speakr_sub = speakr.add_subparsers(dest="speakr_command", required=True)
-    upload = speakr_sub.add_parser("upload", parents=[common], help="publish one recording")
-    upload.add_argument("path")
+    upload = speakr_sub.add_parser("upload", parents=[common], help="publish or inspect Speakr recordings")
+    upload.add_argument("path", nargs="?", help="recording path for an explicit upload")
+    upload.add_argument("--all", dest="all_jobs", action="store_true",
+                        help="run all due jobs; combine with --status for --status --all")
+    upload.add_argument("--status", nargs="?", const="", default=None, metavar="JOB",
+                        help="print one job status, or use --status --all")
+    action_group = upload.add_mutually_exclusive_group()
+    action_group.add_argument("--retry", dest="retry_job", metavar="JOB",
+                              help="explicitly authorize and retry one job")
+    action_group.add_argument("--relink", dest="relink_args", nargs=2,
+                              metavar=("JOB", "NEW_PATH"), help="securely relink one job")
+    action_group.add_argument("--forget", dest="forget_job", metavar="JOB",
+                              help="forget one local job")
     return parser
 
 
@@ -542,6 +759,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
 
     args = parser.parse_args(argv)
+    if args.command == "speakr" and args.speakr_command == "upload":
+        if args.status == "" and not args.all_jobs:
+            parser.error("speakr upload --status requires --all when JOB is omitted")
+        if args.status not in (None, "") and args.all_jobs:
+            parser.error("speakr upload --status JOB cannot be combined with --all")
     setup_logging(args.verbose)
     if (args.command == "calendar" and args.calendar_command == "correct"):
         try:
@@ -561,8 +783,26 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_calendar(cfg, args.calendar_command,
                              getattr(args, "calendar_ids", None), getattr(args, "clear", False))
     if command == "speakr":
+        assert cfg is not None
         if args.speakr_command == "upload":
-            return _cmd_speakr_upload(cfg, args.path)
+            status_job = args.status if args.status else None
+            status_all = args.status == ""
+            if status_all and not args.all_jobs:
+                parser.error("speakr upload --status requires --all when JOB is omitted")
+            if status_job is not None and args.all_jobs:
+                parser.error("speakr upload --status JOB cannot be combined with --all")
+            relink_args = args.relink_args or (None, None)
+            return _cmd_speakr_upload(
+                cfg,
+                args.path,
+                all_jobs=args.all_jobs,
+                status_job=status_job,
+                status_all=status_all,
+                retry_job=args.retry_job,
+                relink_job=relink_args[0],
+                relink_path=relink_args[1],
+                forget_job=args.forget_job,
+            )
         parser.error("unknown Speakr command")
     handler = {
         "run": _cmd_run,

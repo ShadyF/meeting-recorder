@@ -55,8 +55,13 @@ the authoritative metadata PATCH.
 _Avoid_: Speakr plugin, Speakr connector
 
 **Publication job**:
-The durable public-only record of one Recording's progress toward publication in
-Speakr. It contains no credentials or private Meeting metadata; uncertain media
-transfers are not automatically resent, metadata-pending jobs retry PATCH only,
-and published reruns send nothing.
+The durable record of one Recording's progress toward publication in Speakr.
+Its durable progress fields remain public-only. It also contains one private
+filesystem locator for the current Recording path, protected by the private
+0700 directory and 0600 SQLite boundary; that locator is operational state,
+not public publication data. It contains no API credentials and no copied or
+frozen Meeting title, notes, or participants. Metadata is reread from the
+Meeting sidecar at attempt time. Uncertain media transfers are not
+automatically resent, metadata-pending jobs retry PATCH only, and published
+reruns send nothing.
 _Avoid_: Upload record, queue item

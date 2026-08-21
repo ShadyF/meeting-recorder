@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -11,13 +12,18 @@ import json
 import socket
 from threading import Event, Thread
 from typing import Iterator, cast
+from urllib.parse import parse_qs, urlsplit
 
 import meeting_recorder.speakr_http as speakr_http
 from meeting_recorder.speakr_domain import SpeakrMetadata
+from tests.speakr_fake_server import fake_speakr_server, multipart_parts
 from meeting_recorder.speakr_http import (
     InvalidSpeakrResponse,
     MetadataRejected,
     MetadataUnavailable,
+    ReconciliationRejected,
+    ReconciliationUnavailable,
+    SpeakrHTTPError,
     StdlibSpeakrTransport,
     TransferNotSent,
     TransferOutcomeUnknown,
@@ -216,8 +222,10 @@ def test_upload_sends_exact_streamed_multipart_request() -> None:
     media.seek(4)
     with _server() as (server, state):
         transport = StdlibSpeakrTransport(timeout_seconds=2, chunk_size=3)
+        # Send the temporary title through the same bounded multipart path.
         assert transport.upload(
             _url(server), TOKEN, media, 16, 'café "clip".mkv', 123456789, NOW,
+            title="Temporary title",
         ) == 7
         assert media.tell() == 4
         assert media.read_sizes == [3, 3, 3, 3, 3, 1]
@@ -231,9 +239,12 @@ def test_upload_sends_exact_streamed_multipart_request() -> None:
         assert headers["content-length"] == str(len(body))
         assert headers["content-type"].startswith("multipart/form-data; boundary=")
         parts = _multipart_parts(headers["content-type"], body)
+        # Confirm the new scalar fields and the existing streamed file fields.
         assert parts["file"][1] == b"0123456789abcdef"
+        assert parts["title"][1] == "Temporary title".encode()
         assert parts["file_last_modified"][1] == b"123456789"
         assert parts["meeting_date"][1] == b"2026-08-20T12:34:56.789000Z"
+        assert parts["keep_audio_only"][1] == b"false"
         assert "filename*=UTF-8''caf%C3%A9%20%22clip%22.mkv" in parts["file"][0]
         assert "\r" not in parts["file"][0] and "\n" not in parts["file"][0]
         assert max(media.read_sizes) <= 3
@@ -522,3 +533,200 @@ def test_validation_and_error_representations_are_sanitized() -> None:
         pass
     else:
         raise AssertionError("invalid recording ID was accepted")
+
+
+def test_reconciliation_returns_exact_zero_one_or_multiple_matches() -> None:
+    # Script two pages so matching also exercises the pagination contract.
+    pages = (
+        {
+            "recordings": [
+                {"id": 1, "title": "[mr:abc] first"},
+                {"id": 2, "title": "before [mr:abc] first"},
+            ],
+            "page": 1,
+            "pages": 2,
+        },
+        {
+            "recordings": [
+                {"id": 3, "title": "[mr:abc] second"},
+                {"id": 4, "title": "[mr:abcd] not exact"},
+            ],
+            "page": 2,
+            "pages": 2,
+        },
+    )
+    with fake_speakr_server(recording_pages=pages) as (url, state):
+        # Reconcile locally after the server's substring search returns pages.
+        result = StdlibSpeakrTransport(timeout_seconds=2).reconcile_recordings(
+            url, TOKEN, "abc",
+        )
+        assert result == (1, 3)
+        assert len(state.requests) == 2
+
+        # Confirm both requests retained the bounded query and Bearer header.
+        for request in state.requests:
+            assert request.method == "GET"
+            query = parse_qs(urlsplit(request.path).query)
+            assert query["q"] == ["[mr:abc]"]
+            assert query["per_page"] == ["100"]
+            assert request.headers["authorization"] == "Bearer " + TOKEN
+
+    # Check that the engine receives exact zero and one-match tuples as well.
+    for title, expected in (
+        ("not a match", ()),
+        ("[mr:abc] one", (7,)),
+    ):
+        with fake_speakr_server(
+            recording_pages=({"recordings": [{"id": 7, "title": title}]},),
+        ) as (url, _):
+            assert StdlibSpeakrTransport(timeout_seconds=2).find_recording_ids(
+                url, TOKEN, "abc",
+            ) == expected
+
+
+def test_reconciliation_rejects_unsafe_marker_and_bounds_pages_items_and_body(
+) -> None:
+    # Reject marker input that could change the server-side search semantics.
+    for marker in ("abc_def", "abc%def", "abc/def", ""):
+        try:
+            StdlibSpeakrTransport().reconcile_recordings(
+                "http://127.0.0.1:1", TOKEN, marker,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe reconciliation marker was accepted")
+
+    # Prepare a response that advertises a second page.
+    pages = (
+        {
+            "recordings": [{"id": 1, "title": "[mr:abc] one"}],
+            "page": 1,
+            "pages": 2,
+        },
+        {
+            "recordings": [{"id": 2, "title": "[mr:abc] two"}],
+            "page": 2,
+            "pages": 2,
+        },
+    )
+    with fake_speakr_server(recording_pages=pages) as (url, _):
+        # A configured page cap must fail instead of returning a partial set.
+        try:
+            transport = StdlibSpeakrTransport(
+                timeout_seconds=2, max_reconciliation_pages=1,
+            )
+            transport.reconcile_recordings(
+                url, TOKEN, "abc",
+            )
+        except ReconciliationUnavailable:
+            pass
+        else:
+            raise AssertionError("page bound was ignored")
+
+    with fake_speakr_server(
+        recording_pages=(
+            {"recordings": [
+                {"id": 1, "title": "[mr:abc] one"},
+                {"id": 2, "title": "other"},
+            ]},
+        ),
+    ) as (url, _):
+        # The item cap counts unmatched records too.
+        try:
+            transport = StdlibSpeakrTransport(
+                timeout_seconds=2, max_reconciliation_items=1,
+            )
+            transport.reconcile_recordings(
+                url, TOKEN, "abc",
+            )
+        except ReconciliationUnavailable:
+            pass
+        else:
+            raise AssertionError("item bound was ignored")
+
+    with fake_speakr_server(
+        recording_pages=(b'{"recordings": [',),
+    ) as (url, _):
+        # Invalid JSON must not become a partial result.
+        try:
+            StdlibSpeakrTransport(timeout_seconds=2).reconcile_recordings(
+                url, TOKEN, "abc",
+            )
+        except ReconciliationUnavailable:
+            pass
+        else:
+            raise AssertionError("malformed reconciliation body was accepted")
+
+    with fake_speakr_server(recording_pages=(b"x" * 20,)) as (url, _):
+        # The response byte cap must reject an oversized body before decoding.
+        try:
+            StdlibSpeakrTransport(
+                timeout_seconds=2, max_response_bytes=8,
+            ).reconcile_recordings(
+                url, TOKEN, "abc",
+            )
+        except ReconciliationUnavailable:
+            pass
+        else:
+            raise AssertionError("oversized reconciliation body was accepted")
+
+
+def test_reconciliation_http_failures_are_typed_sanitized_and_retryable(
+) -> None:
+    # Use a fixed clock so both Retry-After formats have deterministic results.
+    retry_clock = NOW.replace(microsecond=0)
+    future = format_datetime(retry_clock + timedelta(seconds=37), usegmt=True)
+    cases = (
+        (401, {}, "auth", None),
+        (422, {}, "permanent", None),
+        (503, {"Retry-After": "999999"}, "server", 21600.0),
+        (429, {"Retry-After": "7"}, "rate_limited", 7.0),
+        (429, {"Retry-After": future}, "rate_limited", 37.0),
+    )
+    for status, headers, classification, retry_after in cases:
+        # Return a private body to prove typed failures retain no raw text.
+        with fake_speakr_server(
+            recording_statuses=(status,), recording_headers=(headers,),
+            recording_pages=(b"private token=secret",),
+        ) as (url, _):
+            # Exercise only the status path; rejection bodies must not be read.
+            try:
+                StdlibSpeakrTransport(
+                    timeout_seconds=2, clock=lambda: retry_clock,
+                ).reconcile_recordings(
+                    url, TOKEN, "abc",
+                )
+            except ReconciliationRejected as exc:
+                assert isinstance(exc, SpeakrHTTPError)
+                assert exc.classification == classification
+                assert exc.retry_after == retry_after
+                assert "secret" not in str(exc) and TOKEN not in repr(exc)
+            else:
+                raise AssertionError(
+                    "HTTP reconciliation failure was accepted",
+                )
+
+
+def test_fake_server_integration_covers_temporary_title_and_reconciliation(
+) -> None:
+    # Exercise upload and reconciliation against the same local HTTP fixture.
+    with fake_speakr_server(
+        recording_pages=(
+            {"recordings": [{"id": 42, "title": "[mr:abc] upload"}]},
+        ),
+    ) as (url, state):
+        transport = StdlibSpeakrTransport(timeout_seconds=2)
+        # Upload the marker, then use it for exact reconciliation.
+        assert transport.upload(
+            url, TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0, NOW,
+            title="[mr:abc] upload",
+        ) == 42
+        assert transport.reconcile_recordings(url, TOKEN, "abc") == (42,)
+        # Inspect the recorded upload without changing the transport assertion.
+        upload_request = next(
+            request for request in state.requests if request.method == "POST"
+        )
+        parts = multipart_parts(upload_request)
+        assert parts["title"][1] == b"[mr:abc] upload"
+        assert parts["keep_audio_only"][1] == b"false"

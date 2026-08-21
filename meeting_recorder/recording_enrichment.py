@@ -38,6 +38,7 @@ def _utc(value: datetime) -> datetime:
 
 OccurrenceSource = (Callable[[], Sequence[CalendarOccurrence]] |
                     Sequence[CalendarOccurrence])
+RenameCallback = Callable[[Path, Path], None]
 
 
 def _provider_occurrences(provider: OccurrenceSource) -> tuple[CalendarOccurrence, ...]:
@@ -123,6 +124,17 @@ def _safe_enrichment_error(exc: Exception) -> None:
     LOG.warning("Recording metadata transaction failed: %s", type(exc).__name__)
 
 
+def _notify_media_rename(callback: RenameCallback | None, old_path: Path, new_path: Path) -> None:
+    """Notify optional publication tracking only after a committed media move."""
+    if callback is None or old_path == new_path:
+        return
+    try:
+        callback(old_path, new_path)
+    except Exception as exc:
+        # Publication tracking is advisory and must not change enrichment success.
+        LOG.warning("Publication rename tracking failed: %s", type(exc).__name__)
+
+
 def _ensure_regular_media(path: Path) -> None:
     info = os.lstat(path)
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
@@ -133,9 +145,11 @@ class RecordingEnricher:
     """Synchronously enrich finalized media from a cache-only occurrence provider."""
 
     def __init__(self, occurrence_provider: OccurrenceSource,
-                 to_local: Callable[[datetime], datetime] | None = None) -> None:
+                 to_local: Callable[[datetime], datetime] | None = None,
+                 on_media_renamed: RenameCallback | None = None) -> None:
         self.occurrence_provider = occurrence_provider
         self.to_local = to_local or _to_local_default
+        self.on_media_renamed = on_media_renamed
 
     def enrich(self, completed: CompletedRecording) -> CompletedRecording:
         """Write unmatched metadata or transactionally move a uniquely matched recording."""
@@ -217,6 +231,7 @@ class RecordingEnricher:
             except Exception as exc:
                 _safe_enrichment_error(exc)
                 return _replace_completed(completed, destination, snapshot)
+            _notify_media_rename(self.on_media_renamed, source, destination)
             return _replace_completed(completed, destination, snapshot)
 
 
@@ -260,9 +275,14 @@ class RecordingCorrectionService:
     """Correct sidecars and names from supplied cached Calendar occurrences only."""
 
     def __init__(self, occurrence_provider: OccurrenceSource = (),
-                 to_local: Callable[[datetime], datetime] | None = None) -> None:
+                 to_local: Callable[[datetime], datetime] | None = None,
+                 on_media_renamed: RenameCallback | None = None) -> None:
         self.occurrence_provider = occurrence_provider
         self.to_local = to_local or _to_local_default
+        self.on_media_renamed = on_media_renamed
+
+    def _notify_media_renamed(self, old_path: Path, new_path: Path) -> None:
+        _notify_media_rename(self.on_media_renamed, old_path, new_path)
 
     def _recover_duplicate_unlocked(
             self, source: Path, sidecar_file: Path, sidecar: MeetingSidecar,
@@ -318,8 +338,10 @@ class RecordingCorrectionService:
                     and sidecar.original_fallback_filename != media.name):
                 raise ValueError("direct sidecar does not describe this media")
             if sidecar.recording_filename != media.name:
-                return self._recover_duplicate_unlocked(
+                recovered = self._recover_duplicate_unlocked(
                     media, direct, sidecar, media.with_name(sidecar.recording_filename))
+                self._notify_media_renamed(media, recovered[0])
+                return recovered
             return media, direct, sidecar
         candidates: list[tuple[Path, MeetingSidecar]] = []
         for candidate in sorted(media.parent.glob(f"*{'.meeting.json'}"), key=lambda item: item.name):
@@ -339,8 +361,12 @@ class RecordingCorrectionService:
         candidate, sidecar = candidates[0]
         old_name = candidate.name[:-len(".meeting.json")]
         old_media = media.with_name(old_name)
-        return self._recover_duplicate_unlocked(media if old_media == media else old_media,
-                                                 candidate, sidecar, media)
+        recovery_source = media if old_media == media else old_media
+        recovered = self._recover_duplicate_unlocked(
+            recovery_source, candidate, sidecar, media,
+        )
+        self._notify_media_renamed(recovery_source, recovered[0])
+        return recovered
 
     def discover(self, media: Path | str) -> MeetingSidecar | None:
         media_path = Path(media)
@@ -407,6 +433,7 @@ class RecordingCorrectionService:
             except Exception as exc:
                 raise self._failure("clear", media_path, False, False,
                                     "precommit-failed", exc) from exc
+            self._notify_media_renamed(media_path, fallback)
             return fallback
 
     def _change(self, media: Path | str, key: OccurrenceKey,
@@ -441,6 +468,7 @@ class RecordingCorrectionService:
             except Exception as exc:
                 raise self._failure("select", media_path, False, False,
                                     "precommit-failed", exc) from exc
+            self._notify_media_renamed(media_path, destination)
             return destination
 
     @staticmethod

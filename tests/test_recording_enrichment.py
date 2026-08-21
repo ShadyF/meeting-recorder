@@ -63,7 +63,7 @@ def test_enrich_hidden_and_unmatched_keep_fallback_name_but_write_sidecar() -> N
             metadata = load_sidecar(sidecar_path(source))
             assert result.path == source and (metadata.meeting is not None) == expected_meeting
             if expected_meeting:
-                assert metadata.meeting.title is None
+                assert metadata.meeting is not None and metadata.meeting.title is None
 
 
 def test_enrich_ambiguous_match_and_provider_exception_preserve_media() -> None:
@@ -121,6 +121,7 @@ def test_enrich_does_not_mutate_input_or_react_to_later_occurrence_mutation() ->
         result = RecordingEnricher([occurrence], lambda value: value).enrich(original)
         before = load_sidecar(sidecar_path(result.path))
         changed = replace(occurrence, summary="Changed", details_visible=True)
+        assert before.meeting is not None
         assert changed.summary == "Changed" and before.meeting.title == "Design review"
         assert original.path == source
 
@@ -139,7 +140,7 @@ def test_correction_discovery_list_order_select_switch_clear_and_missing() -> No
         selected = service.select(source, second.key, [first, second])
         assert selected.exists() and selected != source
         metadata = load_sidecar(sidecar_path(selected))
-        assert metadata.meeting.occurrence_key == second.key
+        assert metadata.meeting is not None and metadata.meeting.occurrence_key == second.key
         cleared = service.clear(selected)
         assert cleared.name == "capture.mkv" and cleared.exists()
         assert not sidecar_path(cleared).exists()
@@ -155,7 +156,8 @@ def test_correction_hidden_selection_uses_fallback_and_exact_cached_key() -> Non
         service = RecordingCorrectionService([hidden])
         selected = service.select(source, hidden.key)
         assert selected.name == "visible.mkv"
-        assert load_sidecar(sidecar_path(selected)).meeting.title is None
+        hidden_metadata = load_sidecar(sidecar_path(selected))
+        assert hidden_metadata.meeting is not None and hidden_metadata.meeting.title is None
         try:
             service.select(selected, OccurrenceKey.single("calendar", "missing"), [hidden])
             assert False, "unknown cached key must be rejected"
@@ -193,14 +195,16 @@ def test_correction_discovery_recovers_pre_move_and_post_move_crash_sidecars() -
         write_sidecar(sidecar_path(old), MeetingSidecar(
             intended.name, old.name, NOW, NOW + timedelta(minutes=1), None))
         service = RecordingCorrectionService(())
-        assert service.discover(old).recording_filename == intended.name
+        recovered_old = service.discover(old)
+        assert recovered_old is not None and recovered_old.recording_filename == intended.name
 
         relocated = root / "relocated.mkv"
         relocated.write_bytes(b"recording")
         stale_sidecar = root / "old-name.meeting.json"
         write_sidecar(stale_sidecar, MeetingSidecar(
             relocated.name, "original.mkv", NOW, NOW + timedelta(minutes=1), None))
-        assert service.discover(relocated).recording_filename == relocated.name
+        recovered_relocated = service.discover(relocated)
+        assert recovered_relocated is not None and recovered_relocated.recording_filename == relocated.name
 
 
 def test_correction_nearby_ties_use_start_distance_then_start_and_key() -> None:
@@ -236,11 +240,13 @@ def test_active_controller_reservation_forces_clear_collision_and_preserves_late
     with TemporaryDirectory() as directory, TemporaryDirectory() as cache:
         import os
         original_cache = os.environ.get("XDG_CACHE_HOME")
+        controller = None
+        reserved = None
         os.environ["XDG_CACHE_HOME"] = cache
         try:
             root = Path(directory)
             fallback = root / "fallback.mkv"
-            controller = Controller(load_config(), Notifier(), object())
+            controller = Controller(load_config(), Notifier(), object())  # type: ignore[arg-type]
             reserved = controller._reserve_path(fallback)
             source = root / "renamed.mkv"
             _write_capture(source, fallback=fallback.name)
@@ -268,7 +274,8 @@ def test_active_controller_reservation_forces_clear_collision_and_preserves_late
             assert late_target.read_bytes() == b"foreign"
             assert late_source.read_bytes() == b"finalized"
         finally:
-            controller._release_path(reserved)
+            if controller is not None and reserved is not None:
+                controller._release_path(reserved)
             if original_cache is None:
                 os.environ.pop("XDG_CACHE_HOME", None)
             else:
@@ -398,3 +405,84 @@ def test_correction_recovers_same_inode_duplicates_from_both_names_and_refuses_f
         except ValueError:
             pass
         assert old.exists() and new.read_bytes() == b"foreign"
+
+
+def test_enricher_notifies_once_after_committed_media_and_sidecar_move() -> None:
+    with TemporaryDirectory() as directory:
+        source = Path(directory) / "capture.mkv"
+        source.write_bytes(b"recording")
+        moves: list[tuple[Path, Path]] = []
+        result = RecordingEnricher(
+            [_occurrence()], on_media_renamed=lambda old, new: moves.append((old, new)),
+        ).enrich(_completed(source))
+        assert result.path != source
+        assert moves == [(source, result.path)]
+
+
+def test_enricher_rename_callback_isolated_and_not_called_for_noop_or_failed_move() -> None:
+    with TemporaryDirectory() as directory:
+        source = Path(directory) / "capture.mkv"
+        source.write_bytes(b"recording")
+        moves: list[tuple[Path, Path]] = []
+        no_op = RecordingEnricher(
+            [], on_media_renamed=lambda old, new: moves.append((old, new)),
+        ).enrich(_completed(source))
+        assert no_op.path == source and moves == []
+
+        original_move = enrichment_module.move_regular_file_no_replace
+        enrichment_module.move_regular_file_no_replace = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(OSError("move failed")))
+        try:
+            failed = RecordingEnricher(
+                [_occurrence()], on_media_renamed=lambda old, new: moves.append((old, new)),
+            ).enrich(_completed(source))
+        finally:
+            enrichment_module.move_regular_file_no_replace = original_move
+        assert failed.path == source and moves == []
+
+        def broken_callback(_old: Path, _new: Path) -> None:
+            raise RuntimeError("publication state unavailable")
+
+        result = RecordingEnricher([_occurrence()], on_media_renamed=broken_callback).enrich(
+            _completed(source),
+        )
+        assert result.path != source
+
+
+def test_correction_notifies_select_and_clear_only_after_successful_commits() -> None:
+    with TemporaryDirectory() as directory:
+        source = Path(directory) / "capture.mkv"
+        _write_capture(source)
+        moves: list[tuple[Path, Path]] = []
+        service = RecordingCorrectionService(
+            [_occurrence()], on_media_renamed=lambda old, new: moves.append((old, new)),
+        )
+        selected = service.select(source, _occurrence().key)
+        assert moves == [(source, selected)]
+        cleared = service.clear(selected)
+        assert moves == [(source, selected), (selected, cleared)]
+
+        original_move = enrichment_module.move_regular_file_no_replace
+        enrichment_module.move_regular_file_no_replace = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(OSError("move failed")))
+        try:
+            _write_capture(cleared)
+            try:
+                RecordingCorrectionService(
+                    [_occurrence("failed")],
+                    on_media_renamed=lambda old, new: moves.append((old, new)),
+                ).select(cleared, _occurrence("failed").key)
+            except CorrectionTransactionError:
+                pass
+        finally:
+            enrichment_module.move_regular_file_no_replace = original_move
+        assert moves == [(source, selected), (selected, cleared)]
+
+        isolated = Path(directory) / "isolated.mkv"
+        _write_capture(isolated)
+        def broken_callback(_old: Path, _new: Path) -> None:
+            raise RuntimeError("publication state unavailable")
+        isolated_result = RecordingCorrectionService(
+            [_occurrence("isolated")], on_media_renamed=broken_callback,
+        ).select(isolated, _occurrence("isolated").key)
+        assert isolated_result.exists()
