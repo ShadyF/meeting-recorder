@@ -621,6 +621,21 @@ def test_origin_filter_never_sends_credentials_to_another_job() -> None:
         directory.cleanup()
 
 
+def test_due_commands_use_indexed_ids_without_operator_list_or_directory_discovery() -> None:
+    directory, root, media, now, store, transport, publisher = _setup()
+    try:
+        # The indexed path must remain independent of the operator status listing.
+        store.list = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("list was called"))  # type: ignore[method-assign]
+        assert publisher.due_job_ids("HTTPS://EXAMPLE.COM:443/", now_ms=1_000) == ()
+        assert publisher.next_wake_at_ms("HTTPS://EXAMPLE.COM:443/", now_ms=1_000) is None
+        assert publisher.run_due(ORIGIN, TOKEN) == []
+        assert publisher.run_all_due(ORIGIN, TOKEN) == []
+        assert transport.uploads == []
+    finally:
+        # Remove the isolated database and recording.
+        directory.cleanup()
+
+
 def test_stale_worker_cannot_commit_after_lease_recovery() -> None:
     # Force lease loss during an upload and verify the stale worker cannot commit.
     directory, root, media, now, store, transport, publisher = _setup()

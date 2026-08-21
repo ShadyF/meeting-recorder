@@ -16,11 +16,13 @@ from meeting_recorder.__main__ import (
 )
 from meeting_recorder.speakr_domain import MediaIdentity, PublicationKey, PublicationState
 from meeting_recorder.speakr_store import PublicationStore
+from meeting_recorder.network_manager import NetworkSSIDStatus
 
 
 ORIGIN = "https://configured.example"
 TOKEN = "cli-token-private-sentinel"
 HASH = "a" * 64
+ALLOWED_SSIDS = (b"test-network",)
 
 
 def _job(
@@ -124,10 +126,17 @@ def _output(callable_object, *args, **kwargs) -> tuple[int, str]:
 
 def _run_with_fake(fake: FakePublisher, **kwargs) -> tuple[int, str]:
     # Replace configuration and construction so each test observes only CLI calls.
+    # These legacy routing tests use force; focused runtime tests cover NetworkManager admission.
+    if kwargs.get("path") is not None or kwargs.get("all_jobs") or kwargs.get("retry_job"):
+        kwargs.setdefault("force", True)
     with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
             patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
             patch("meeting_recorder.__main__.require_speakr_token", return_value=TOKEN):
-        return _output(_cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), **kwargs)
+        return _output(
+            _cmd_speakr_upload,
+            SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=ALLOWED_SSIDS),
+            **kwargs,
+        )
 
 
 def test_speakr_parser_exposes_all_decision_forms_and_rejects_credential_flags() -> None:
@@ -215,9 +224,10 @@ def test_missing_token_uses_engine_fencing_to_block_network_jobs() -> None:
             patch("meeting_recorder.__main__.require_speakr_token", side_effect=ValueError):
         result, output = _output(
             _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), path="recording.mkv",
+            force=True,
         )
     assert result == 1 and "blocked" in output
-    assert ("run_one", ORIGIN, "", "job-1") in fake.calls
+    assert ("block_configuration", "job-1") in fake.calls
     assert TOKEN not in output
 
     # The all-jobs form applies the same empty-token fencing to its batch call.
@@ -228,6 +238,7 @@ def test_missing_token_uses_engine_fencing_to_block_network_jobs() -> None:
             patch("meeting_recorder.__main__.require_speakr_token", side_effect=ValueError):
         result, output = _output(
             _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), all_jobs=True,
+            force=True,
         )
     assert result == 1 and ("run_all_due", ORIGIN, "") in fake.calls
 
@@ -238,6 +249,7 @@ def test_missing_token_uses_engine_fencing_to_block_network_jobs() -> None:
             patch("meeting_recorder.__main__.require_speakr_token", side_effect=ValueError):
         result, output = _output(
             _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), retry_job=blocked.job_id,
+            force=True,
         )
     assert result == 1 and ("block_configuration", blocked.job_id) in fake.calls
     assert not any(call[0] == "retry" for call in fake.calls)
@@ -304,6 +316,151 @@ def test_parser_rejects_status_without_job_or_all_and_status_job_with_all() -> N
             assert exc.code == 2
         else:
             raise AssertionError("ambiguous Speakr form was accepted")
+
+
+def test_force_is_limited_to_network_operations() -> None:
+    # The parser accepts force alongside each candidate operation form.
+    parser = build_parser()
+    for arguments in (
+        ["recording.mkv", "--force"], ["--all", "--force"], ["--retry", "JOB", "--force"],
+    ):
+        assert parser.parse_args(["speakr", "upload", *arguments]).force
+
+    # Local inspection and mutation forms reject force before publisher construction.
+    for kwargs in (
+        {"status_job": "JOB"}, {"status_all": True, "all_jobs": True},
+        {"relink_job": "JOB", "relink_path": "new.mkv"}, {"forget_job": "JOB"},
+    ):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), force=True, **kwargs,
+        )
+        assert result == 2 and "--force" in output
+
+
+def test_normal_network_admission_fails_closed_without_reading_token() -> None:
+    # Each denied status leaves a path job queued and stops before token lookup.
+    statuses = (NetworkSSIDStatus.DISALLOWED, "unexpected", NetworkSSIDStatus.UNAVAILABLE)
+    for status in statuses:
+        fake = FakePublisher()
+        adapter_calls = []
+
+        class Adapter:
+            def __init__(self, allowed):
+                adapter_calls.append(allowed)
+
+            def probe(self):
+                return SimpleNamespace(status=status)
+
+        with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+                patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+                patch("meeting_recorder.__main__.require_speakr_token",
+                      side_effect=AssertionError("token must not be read")), \
+                patch("meeting_recorder.network_manager.NetworkManagerSSIDAdapter", Adapter):
+            result, output = _output(
+                _cmd_speakr_upload,
+                SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=(b"allowed",)),
+                path="recording.mkv",
+            )
+
+        assert result == 3 and "waiting" in output
+        assert any(call[0] == "enqueue" for call in fake.calls)
+        assert adapter_calls == [(b"allowed",)]
+
+    # Missing and empty allowlists fail closed before any adapter or token work.
+    for allowlist in (None, ()):
+        fake = FakePublisher()
+        with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+                patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+                patch("meeting_recorder.__main__.require_speakr_token",
+                      side_effect=AssertionError("token must not be read")), \
+                patch("meeting_recorder.network_manager.NetworkManagerSSIDAdapter",
+                      side_effect=AssertionError("adapter must not be constructed")):
+            result, _output_text = _output(
+                _cmd_speakr_upload,
+                SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=allowlist),
+                path="recording.mkv",
+            )
+        assert result == 3 and any(call[0] == "enqueue" for call in fake.calls)
+
+
+def test_normal_retry_admission_does_not_reset_the_job() -> None:
+    # A retry is inspected locally but remains untouched while the network is denied.
+    job = _job("retry")
+    fake = FakePublisher((job,))
+
+    class Adapter:
+        def __init__(self, _allowed):
+            pass
+
+        def probe(self):
+            return SimpleNamespace(status=NetworkSSIDStatus.DISALLOWED)
+
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token",
+                  side_effect=AssertionError("token must not be read")), \
+            patch("meeting_recorder.network_manager.NetworkManagerSSIDAdapter", Adapter):
+        result, _output_text = _output(
+            _cmd_speakr_upload,
+            SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=(b"allowed",)),
+            retry_job=job.job_id,
+        )
+
+    assert result == 3
+    assert not any(call[0] in ("retry", "run_one") for call in fake.calls)
+
+
+def test_no_due_all_skips_network_adapter_and_token() -> None:
+    # A local empty due snapshot avoids D-Bus and credential work entirely.
+    class DuePublisher(FakePublisher):
+        def due_job_ids(self, _origin, *, limit):
+            self.calls.append(("due_job_ids", limit))
+            return ()
+
+    fake = DuePublisher()
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token",
+                  side_effect=AssertionError("token must not be read")), \
+            patch("meeting_recorder.network_manager.NetworkManagerSSIDAdapter",
+                  side_effect=AssertionError("adapter must not be constructed")):
+        result, output = _output(
+            _cmd_speakr_upload,
+            SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=(b"allowed",)),
+            all_jobs=True,
+        )
+
+    assert result == 0 and "no due" in output
+    assert ("due_job_ids", 100) in fake.calls
+    assert not any(call[0] == "run_all_due" for call in fake.calls)
+
+
+def test_force_skips_only_network_admission() -> None:
+    # Force bypasses the SSID adapter but keeps origin, token, and engine checks.
+    fake = FakePublisher()
+    resolved, tokens = [], []
+
+    def resolve(_cfg):
+        resolved.append(True)
+        return ORIGIN
+
+    def token():
+        tokens.append(True)
+        return TOKEN
+
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", side_effect=resolve), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=token), \
+            patch("meeting_recorder.network_manager.NetworkManagerSSIDAdapter",
+                  side_effect=AssertionError("force must skip adapter")):
+        result, _output_text = _output(
+            _cmd_speakr_upload,
+            SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=()),
+            path="recording.mkv", force=True,
+        )
+
+    assert result == 0 and resolved == [True] and tokens == [True]
+    assert any(call[:3] == ("run_one", ORIGIN, TOKEN) for call in fake.calls)
 
 
 def test_cli_rename_tracker_updates_matching_unleased_identity_without_creating_new_state() -> None:

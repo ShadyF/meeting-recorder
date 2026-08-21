@@ -9,10 +9,12 @@ from pathlib import Path
 
 from meeting_recorder.calendar_oauth import CalendarOAuth
 from meeting_recorder.config import (
-    load_config, load_raw_config, save_google_calendar_ids, save_user_config,
-    validate_google_calendar_ids,
+    Config, PublicationMode, load_config, load_defaults, load_raw_config,
+    resolve_speakr_url, save_google_calendar_ids, save_user_config,
+    validate_google_calendar_ids, validate_speakr_allowed_ssids,
 )
 from meeting_recorder.domain import VideoSource
+from meeting_recorder.speakr_domain import normalize_speakr_url
 
 
 def _with_user_config(data, check):
@@ -30,6 +32,104 @@ def _with_user_config(data, check):
                 os.environ.pop("XDG_CONFIG_HOME", None)
             else:
                 os.environ["XDG_CONFIG_HOME"] = previous
+
+
+def test_speakr_defaults_and_publication_modes_are_typed():
+    defaults = load_defaults()
+    config = load_config_for_test({})
+
+    assert defaults["speakr_publication_mode"] == "disabled"
+    assert defaults["speakr_allowed_ssids"] == []
+    assert config.speakr_publication_mode is PublicationMode.DISABLED
+    assert config.speakr_allowed_ssids == ()
+    assert config.speakr_allowed_ssid_bytes == ()
+    assert [mode.value for mode in PublicationMode] == ["disabled", "manual", "automatic"]
+
+    # Each supported spelling maps to its corresponding typed policy.
+    for mode in PublicationMode:
+        assert load_config_for_test({"speakr_publication_mode": mode.value}).speakr_publication_mode is mode
+
+
+def load_config_for_test(overrides):
+    """Build a typed config from shipped defaults without touching user files."""
+    data = load_defaults()
+    data.update(overrides)
+    return Config.from_dict(data)
+
+
+def test_legacy_config_without_speakr_keys_uses_shipped_defaults():
+    def check(_path):
+        config = load_config()
+        assert config.speakr_publication_mode is PublicationMode.DISABLED
+        assert config.speakr_allowed_ssids == ()
+
+    _with_user_config({"future_setting": "kept"}, check)
+
+
+def test_invalid_publication_mode_and_legacy_missing_keys_are_safe():
+    config = load_config_for_test({"speakr_publication_mode": "unexpected"})
+
+    assert config.speakr_publication_mode is PublicationMode.DISABLED
+    assert config.speakr_allowed_ssids == ()
+
+
+def test_speakr_ssids_preserve_exact_text_and_project_to_network_bytes():
+    ssids = [" Cafe ", "café", "CAFE"]
+    config = load_config_for_test({"speakr_allowed_ssids": ssids})
+
+    assert config.speakr_allowed_ssids == tuple(ssids)
+    assert config.speakr_allowed_ssid_bytes == tuple(ssid.encode("utf-8") for ssid in ssids)
+
+
+def test_invalid_speakr_ssid_lists_fail_closed():
+    invalid = (None, "Cafe", [""], ["Cafe", "Cafe"], ["Cafe", 7],
+               ["Cafe\x00wifi"], ["Cafe\nwifi"], ["é" * 17])
+
+    # Validation rejects every invalid list instead of partially admitting it.
+    for value in invalid:
+        try:
+            validate_speakr_allowed_ssids(value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid SSID list accepted: {value!r}")
+
+    for value in invalid:
+        assert load_config_for_test({"speakr_allowed_ssids": value}).speakr_allowed_ssids == ()
+
+
+def test_production_speakr_resolver_requires_https_but_normalizer_keeps_http():
+    https_config = load_config_for_test({"speakr_url": "https://Example.com/"})
+    assert resolve_speakr_url(https_config, {}) == "https://example.com"
+
+    # The low-level transport normalizer still supports local HTTP fake servers.
+    assert normalize_speakr_url("http://127.0.0.1:8080/") == "http://127.0.0.1:8080"
+    for value in ("http://127.0.0.1:8080/", None, ""):
+        config = load_config_for_test({"speakr_url": value})
+        try:
+            resolve_speakr_url(config, {})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unsafe Speakr URL accepted: {value!r}")
+
+
+def test_speakr_publication_keys_roundtrip_and_credentials_are_scrubbed():
+    def check(path):
+        raw = load_raw_config()
+        assert raw["speakr_publication_mode"] == "automatic"
+        assert raw["speakr_allowed_ssids"] == ["Office WiFi"]
+        raw["speakr_token"] = "must-not-be-saved"
+        # Model the GUI changing only curated visible fields before saving.
+        raw.update({"container": "mp4", "record_screen": False})
+        save_user_config(raw)
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["speakr_publication_mode"] == "automatic"
+        assert saved["speakr_allowed_ssids"] == ["Office WiFi"]
+        assert "speakr_token" not in saved
+
+    _with_user_config({"speakr_publication_mode": "automatic",
+                       "speakr_allowed_ssids": ["Office WiFi"]}, check)
 
 
 def test_legacy_capture_mode_loads_as_video_source_for_typed_and_raw_config():

@@ -44,14 +44,14 @@ The selected screen content for video capture: fullscreen, window, or area.
 _Avoid_: Capture mode, screen mode
 
 **Speakr publisher**:
-The optional, explicitly invoked component that uploads a Recording and its
-selected public metadata to Speakr. A visible matched Meeting supplies current
-title/details and scheduled start; a hidden matched Meeting supplies the
-current filename title and non-private scheduled start without private
-notes/participants; an unmatched Recording with a valid sidecar supplies the
-current filename title and capture start; without a valid sidecar, file mtime is
-the date fallback. The current path and sidecar are reread after transfer before
-the authoritative metadata PATCH.
+The optional component that uploads a Recording and its selected public metadata
+to Speakr, either for an explicit command or through the configured background
+publication policy. A visible matched Meeting supplies current title/details and
+scheduled start; a hidden matched Meeting supplies the current filename title and
+non-private scheduled start without private notes/participants; an unmatched
+Recording with a valid sidecar supplies the current filename title and capture
+start; without a valid sidecar, file mtime is the date fallback. The current path
+and sidecar are reread after transfer before the authoritative metadata PATCH.
 _Avoid_: Speakr plugin, Speakr connector
 
 **Publication job**:

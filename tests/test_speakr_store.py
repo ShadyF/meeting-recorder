@@ -55,6 +55,36 @@ def test_fresh_database_is_private_v2_without_command_lock_or_metadata() -> None
             assert connection.execute("SELECT wr, strict FROM pragma_table_list WHERE name = 'publications'").fetchone() == (1, 1)
 
 
+def test_indexless_v2_open_adds_exact_indexes_without_changing_rows() -> None:
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "publications.sqlite3"
+        store = PublicationStore(path, clock=lambda: 1_000)
+        first = store.create_or_reuse(_key(), b"/private/one")
+        second = store.create_or_reuse(_key("https://other.example"), b"/private/two")
+        before = store.list()
+        index_names = (
+            "idx_publications_origin_due",
+            "idx_publications_lease_expiry",
+            "idx_publications_private_media_identity",
+        )
+        with sqlite3.connect(path) as connection:
+            # Simulate the indexless v2 database produced by issue #23.
+            for name in index_names:
+                connection.execute(f"DROP INDEX {name}")
+            assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+
+        reopened = PublicationStore(path, clock=lambda: 1_000)
+        assert reopened.list() == before
+        with sqlite3.connect(path) as connection:
+            actual = {
+                row[1] for row in connection.execute("PRAGMA index_list(publications)")
+                if not row[1].startswith("sqlite_autoindex_")
+            }
+            assert actual == set(index_names)
+            assert reopened.get(first.job_id) == first
+            assert reopened.get(second.job_id) == second
+
+
 def test_v1_and_incompatible_existing_databases_are_rejected_without_deletion() -> None:
     with TemporaryDirectory() as directory:
         path = Path(directory) / "publications.sqlite3"
@@ -112,6 +142,68 @@ def test_claims_compete_transactionally_and_generation_is_monotonic() -> None:
         assert sum(value != "none" for value in results) == 1
         claimed = stores[0].get(key)
         assert claimed is not None and claimed.lease_generation == 1
+
+
+def test_due_ids_and_next_wake_use_state_deadlines_origin_and_stable_order() -> None:
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        queued_key = _key("https://due.example")
+        delayed_key = _key("https://due.example", "b" * 64)
+        other_key = _key("https://other.example", "c" * 64)
+        queued = store.create_or_reuse(queued_key, b"/private/queued", job_id="queued-due")
+        store.create_or_reuse(delayed_key, b"/private/delayed", job_id="delayed-due")
+        store.create_or_reuse(other_key, b"/private/other", job_id="other-due")
+        with sqlite3.connect(store.database_path) as connection:
+            # Exercise the exact boundary and keep another origin in the table.
+            connection.execute(
+                "UPDATE publications SET next_attempt_at_ms = ? WHERE job_id = ?",
+                (1_001, "delayed-due"),
+            )
+            connection.execute(
+                "UPDATE publications SET next_attempt_at_ms = ? WHERE job_id = ?",
+                (1_000, "other-due"),
+            )
+
+        assert store.due_job_ids("HTTPS://DUE.EXAMPLE:443/", now_ms=999) == ()
+        assert store.due_job_ids("https://due.example", now_ms=1_000) == (queued.job_id,)
+        assert store.next_wake_at_ms("https://due.example", now_ms=999) == 1_000
+        assert store.next_wake_at_ms("https://due.example", now_ms=1_500) == 1_500
+
+        # A transferring lease is due at expiry, not at its retry timestamp.
+        transfer_key = _key("https://due.example", "d" * 64)
+        transfer = store.create_or_reuse(transfer_key, b"/private/transferring", job_id="transfer-due")
+        claimed = store.claim_one("transfer", transfer_key, lease_ms=10, now_ms=1_000)
+        assert claimed is not None
+        store.transition(
+            transfer_key, PublicationState.TRANSFERRING,
+            owner="transfer", generation=claimed.lease_generation, now_ms=1_001,
+        )
+        assert transfer.job_id not in store.due_job_ids("https://due.example", now_ms=1_009)
+        assert transfer.job_id in store.due_job_ids("https://due.example", now_ms=1_010)
+
+
+def test_due_limit_and_terminal_or_wrong_origin_rows_are_excluded() -> None:
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        jobs = [
+            store.create_or_reuse(
+                _key("https://limit.example", format(index, "064x")),
+                b"/private/recording", job_id=f"limit-{index}",
+            )
+            for index in range(3)
+        ]
+        terminal_key = _key("https://limit.example", "f" * 64)
+        terminal = store.create_or_reuse(terminal_key, b"/private/terminal")
+        store.transition(terminal_key, PublicationState.UNCERTAIN, operation="none")
+        wrong_key = _key("https://wrong.example", "e" * 64)
+        store.create_or_reuse(wrong_key, b"/private/wrong")
+
+        assert store.due_job_ids("https://limit.example", now_ms=1_000, limit=2) == tuple(
+            sorted(job.job_id for job in jobs)[:2]
+        )
+        assert terminal.job_id not in store.due_job_ids("https://limit.example", now_ms=1_000)
+        _raises(store.due_job_ids, "https://limit.example", limit=0)
+        _raises(store.due_job_ids, "https://limit.example", limit=1_001)
 
 
 def test_claim_for_action_ignores_backoff_and_claims_all_eligible_phases() -> None:

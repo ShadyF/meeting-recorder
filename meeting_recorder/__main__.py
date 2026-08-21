@@ -29,8 +29,10 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from . import __version__
 from .config import (
-    Config, load_config, require_speakr_token, resolve_speakr_url, write_default_user_config,
+    Config, PublicationMode, load_config, require_speakr_token, resolve_speakr_url,
+    write_default_user_config,
 )
+from .domain import CompletedRecording
 from .speakr_domain import PublicationJob, PublicationResult
 from .utils import LOG, build_output_path, setup_logging
 
@@ -42,10 +44,16 @@ _SERVICE = "meeting-recorder.service"
 # button still has a process to call back into. Bounded: the file is already
 # safely written by this point, this is only about the button.
 _NOTIFICATION_LINGER_SECONDS = 180
+_SPEAKR_WAIT_CODE = 3
+_SPEAKR_DUE_LIMIT = 100
 
 
-def _publication_rename_tracker() -> Callable[[Path, Path], None]:
-    """Build a lazy, best-effort callback for app-managed media moves."""
+def _publication_rename_tracker(service: Any | None = None) -> Callable[[Path, Path], None]:
+    """Build a synchronous CLI tracker or a worker-backed daemon tracker."""
+    if service is not None:
+        return _daemon_publication_rename_tracker(service)
+
+    # The blocking correction command keeps this durable update synchronous.
     holder: dict[str, Any] = {}
 
     def track(old_path: Path, new_path: Path) -> None:
@@ -80,6 +88,29 @@ def _publication_rename_tracker() -> Callable[[Path, Path], None]:
     return track
 
 
+def _daemon_publication_rename_tracker(service: Any) -> Callable[[Path, Path], None]:
+    """Capture post-move identity on GLib and submit all store work to the worker."""
+
+    def track(old_path: Path, new_path: Path) -> None:
+        try:
+            from .speakr_domain import MediaIdentity
+
+            old_absolute = Path(os.path.abspath(os.fspath(old_path)))
+            new_absolute = Path(os.path.abspath(os.fspath(new_path)))
+            info = os.lstat(new_absolute)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                return
+            identity = MediaIdentity(
+                new_absolute, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            )
+            service.submit_rename(old_absolute, new_absolute, identity)
+        except Exception:
+            # Rename tracking must never affect a committed recording move.
+            LOG.debug("Publication rename tracking unavailable")
+
+    return track
+
+
 def _cmd_run(cfg) -> int:
     import gi
     gi.require_version("GLib", "2.0")
@@ -98,12 +129,120 @@ def _cmd_run(cfg) -> int:
     from .recording_enrichment import RecordingEnricher, cache_only_occurrence_provider
 
     notifier = Notifier()
+    publication_service = None
+    local_notice_pending = False
+
+    def _safe_notice_value(value: object, fallback: str = "unknown") -> str:
+        # Keep notification fields to short identifiers even if an injected seam misbehaves.
+        rendered = value if isinstance(value, str) else fallback
+        if not rendered or len(rendered) > 64 or any(
+            not (char.isascii() and (char.isalnum() or char in "._-"))
+            for char in rendered
+        ):
+            return fallback
+        return rendered
+
+    def _show_publication_notice(
+        action: str, job_id: str | None, error_code: str | None,
+    ) -> None:
+        # Marshal each service transition notice independently; the service owns deduplication.
+        safe_action = _safe_notice_value(action, "publication")
+        safe_job = _safe_notice_value(job_id, "") if job_id is not None else None
+        safe_error = _safe_notice_value(error_code, "unknown") if error_code else "unknown"
+
+        def show() -> bool:
+            # Notifier is GTK-backed, so this callback is deliberately GLib-owned.
+            try:
+                job_text = safe_job or "none"
+                notifier.info(
+                    "Speakr publication action required",
+                    f"action={safe_action} job={job_text} error={safe_error}",
+                    persistent=True,
+                )
+            except Exception:
+                LOG.warning("Could not show publication notice")
+            return False
+
+        try:
+            GLib.idle_add(show)
+        except Exception:
+            LOG.warning("Could not schedule publication notice")
+
+    def _show_local_publication_notice(error_code: str) -> None:
+        # Bound repeated queue failures without suppressing versioned worker notices.
+        nonlocal local_notice_pending
+        if local_notice_pending:
+            return
+        local_notice_pending = True
+
+        def show_local() -> bool:
+            nonlocal local_notice_pending
+            local_notice_pending = False
+            _show_publication_notice("publication", None, error_code)
+            return False
+
+        try:
+            GLib.idle_add(show_local)
+        except Exception:
+            local_notice_pending = False
+            LOG.warning("Could not schedule publication notice")
+
+    def _publication_notice_callback(notice: Any) -> None:
+        # Worker notices contain only the safe action, job ID, and error code.
+        _show_publication_notice(notice.action, notice.job_id, notice.error_code)
+
+    publication_service_class: Any | None = None
+    try:
+        from .speakr_service import PublicationService as publication_service_class
+    except Exception:
+        LOG.warning("Speakr publication service is unavailable")
+
+    # Optional publication setup must never prevent the recorder from starting.
+    # Config is always complete in production; the attribute check keeps older test
+    # and recovery configurations fail-closed without constructing D-Bus state.
+    if publication_service_class is not None and hasattr(cfg, "speakr_publication_mode"):
+        try:
+            publication_service = publication_service_class(
+                cfg, notice_callback=_publication_notice_callback,
+            )
+            publication_service.start()
+        except Exception:
+            LOG.warning("Speakr publication service is unavailable")
+            if publication_service is not None:
+                try:
+                    publication_service.stop(1)
+                except Exception:
+                    LOG.warning("Speakr publication service cleanup failed")
+            publication_service = None
+
     recorder = Recorder(cfg)
     enricher = RecordingEnricher(
         cache_only_occurrence_provider(),
-        on_media_renamed=_publication_rename_tracker(),
+        on_media_renamed=(
+            _publication_rename_tracker(publication_service)
+            if publication_service is not None else None
+        ),
     ).enrich
     controller = Controller(cfg, notifier, recorder, recording_enricher=enricher)
+
+    def _on_finished(completed: CompletedRecording | None) -> None:
+        # Completion callbacks only perform immutable queue admission on GLib.
+        if (completed is None or not isinstance(completed, CompletedRecording)
+                or publication_service is None):
+            return
+        try:
+            accepted = publication_service.submit_completed(completed)
+        except Exception:
+            _show_local_publication_notice("submission_failed")
+            return
+        try:
+            mode = PublicationMode.parse(getattr(cfg, "speakr_publication_mode", "disabled"))
+        except Exception:
+            mode = PublicationMode.DISABLED
+        if not accepted and mode is PublicationMode.AUTOMATIC:
+            _show_local_publication_notice("queue_full")
+
+    controller.on_finished = _on_finished
     detector = MeetingDetector(
         allowlist=cfg.allowlist,
         start_debounce=cfg.start_debounce_seconds,
@@ -158,6 +297,12 @@ def _cmd_run(cfg) -> int:
             controller.shutdown()
         except Exception:
             LOG.warning("Recorder controller cleanup failed", exc_info=True)
+        if publication_service is not None:
+            try:
+                if not publication_service.stop(2):
+                    LOG.warning("Speakr publication service did not stop before shutdown timeout")
+            except Exception:
+                LOG.warning("Speakr publication service cleanup failed")
     return 0
 
 
@@ -181,14 +326,17 @@ def _cmd_record(cfg) -> int:
     recorder = Recorder(cfg)
     enricher = RecordingEnricher(
         cache_only_occurrence_provider(),
-        on_media_renamed=_publication_rename_tracker(),
+        # The one-shot command enqueues the final path after GLib exits; it does
+        # not need to touch publication state while enriching the sidecar.
+        on_media_renamed=None,
     ).enrich
     controller = Controller(cfg, notifier, recorder, recording_enricher=enricher)
     loop = GLib.MainLoop()
-    result: dict = {}
+    result: dict[str, object] = {}
 
-    def _on_finished(completed):
-        result["completed"] = True
+    def _on_finished(completed: CompletedRecording | None) -> None:
+        # Preserve the immutable completion object until the GLib loop has ended.
+        result["completed"] = completed
         result["path"] = completed.path if completed else None
         print(f"Saved: {completed.path}" if completed else "No file was saved.")
         # Do not quit yet. The "saved" notification's Open Folder button is a
@@ -243,7 +391,33 @@ def _cmd_record(cfg) -> int:
     print("Recording — press Ctrl-C here, or use the tray icon, to stop.")
     loop.run()
 
-    return 0 if result.get("path") else 1
+    # Finish any detached finalization while the controller still owns its handles.
+    try:
+        controller.shutdown()
+    except Exception:
+        LOG.warning("Recorder controller cleanup failed", exc_info=True)
+
+    completed = result.get("completed")
+    if not isinstance(completed, CompletedRecording):
+        return 1
+
+    # Automatic one-shot publication is deliberately outside GLib and token-free.
+    try:
+        mode = PublicationMode.parse(getattr(cfg, "speakr_publication_mode", "disabled"))
+    except Exception:
+        mode = PublicationMode.DISABLED
+    if mode is PublicationMode.AUTOMATIC:
+        try:
+            origin = resolve_speakr_url(cfg)
+            publisher = _speakr_publisher()
+            publisher.enqueue(completed.path, origin)
+        except Exception:
+            print(
+                "WARNING: Speakr publication could not be queued; recording was saved.",
+                file=sys.stderr,
+            )
+
+    return 0
 
 
 # -- service control (wraps `systemctl --user` so callers don't have to) ----
@@ -348,19 +522,45 @@ def _print_speakr_status(job: PublicationJob) -> None:
     print(json.dumps(_speakr_status(job), sort_keys=True))
 
 
-def _speakr_credentials(cfg: Config) -> tuple[str, str | None] | None:
-    """Resolve network credentials only for operations that may contact Speakr."""
+def _speakr_origin(cfg: Config) -> str | None:
+    """Resolve the HTTPS origin without reading the bearer token."""
     try:
-        instance_url = resolve_speakr_url(cfg)
+        return resolve_speakr_url(cfg)
     except (TypeError, ValueError):
         print("Speakr: invalid instance URL configuration.", file=sys.stderr)
         return None
+
+
+def _speakr_token() -> str | None:
+    """Read the bearer token only after local admission and SSID checks."""
     try:
-        token = require_speakr_token()
+        return require_speakr_token()
     except (TypeError, ValueError):
         print("Speakr: bearer token is missing or invalid.", file=sys.stderr)
-        return instance_url, None
-    return instance_url, token
+        return None
+
+
+def _speakr_network_allowed(cfg: Config, force: bool) -> bool:
+    """Apply the one-shot SSID admission gate without exposing network identity."""
+    if force:
+        return True
+
+    # Missing and empty allowlists fail closed before constructing D-Bus state.
+    allowed = getattr(cfg, "speakr_allowed_ssid_bytes", None)
+    if not allowed:
+        print("Speakr: waiting for an allowed network.", file=sys.stderr)
+        return False
+    from .network_manager import NetworkManagerSSIDAdapter, NetworkSSIDStatus
+
+    try:
+        result = NetworkManagerSSIDAdapter(allowed).probe()
+        status = NetworkSSIDStatus(getattr(result, "status", result))
+    except Exception:
+        status = NetworkSSIDStatus.UNAVAILABLE
+    if status is NetworkSSIDStatus.ALLOWED:
+        return True
+    print("Speakr: waiting for an allowed network.", file=sys.stderr)
+    return False
 
 
 def _speakr_publisher() -> SpeakrPublisher:
@@ -396,6 +596,7 @@ def _cmd_speakr_upload(
     relink_job: str | None = None,
     relink_path: str | None = None,
     forget_job: str | None = None,
+    force: bool = False,
 ) -> int:
     """Run one explicit Speakr operation without exposing private values."""
     from .speakr_domain import PublicationState
@@ -414,6 +615,11 @@ def _cmd_speakr_upload(
         return 2
     if status_all and operation_count:
         print("Speakr: Speakr upload options are ambiguous.", file=sys.stderr)
+        return 2
+    if force and (status_all or status_job is not None or relink_job is not None
+                  or forget_job is not None):
+        print("Speakr: --force is allowed only with PATH, --all, or --retry JOB.",
+              file=sys.stderr)
         return 2
     if not any((path is not None, all_jobs, status_all, operation_count)):
         print("Speakr: upload requires PATH, --all, or one operation option.", file=sys.stderr)
@@ -435,19 +641,19 @@ def _cmd_speakr_upload(
                 _print_speakr_status(job)
             return 0
         assert status_job is not None
-        job = publisher.get(status_job)
-        if job is None:
+        status_result = publisher.get(status_job)
+        if status_result is None:
             print("Speakr: publication job was not found.", file=sys.stderr)
             return 2
-        _print_speakr_status(job)
+        _print_speakr_status(status_result)
         return 0
     if relink_job is not None:
         try:
-            job = publisher.relink(relink_job, relink_path or "")
+            relinked_job = publisher.relink(relink_job, relink_path or "")
         except Exception:
             print("Speakr: relink failed; the local job was not changed.", file=sys.stderr)
             return 1
-        _print_speakr_status(job)
+        _print_speakr_status(relinked_job)
         return 0
     if forget_job is not None:
         try:
@@ -461,31 +667,28 @@ def _cmd_speakr_upload(
         print(f"Speakr: forgot {forget_job}.")
         return 0
 
-    credentials = _speakr_credentials(cfg)
-    if credentials is None:
-        # A referenced job can still be fenced without guessing its origin.
-        if retry_job is not None:
-            try:
-                blocked = publisher.block_configuration(retry_job)
-            except Exception:
-                blocked = None
-            if blocked is None:
-                print("Speakr: publication job was not found or is unavailable.", file=sys.stderr)
-                return 2
-            _print_speakr_status(blocked)
-            return 1
-        return 2
-    instance_url, token = credentials
-    safe_token = token or ""
     try:
+        # Resolve origin before any token lookup, then keep all local validation local.
+        instance_url = _speakr_origin(cfg)
+        if instance_url is None:
+            return 2
         if retry_job is not None:
-            job = publisher.get(retry_job)
-            if job is None:
+            retry_result = publisher.get(retry_job)
+            if retry_result is None:
                 print("Speakr: publication job was not found.", file=sys.stderr)
                 return 2
-            if job.key.instance_url != instance_url:
+            if retry_result.key.instance_url != instance_url:
                 print("Speakr: publication job origin does not match configuration.", file=sys.stderr)
                 return 2
+            if (retry_result.state is PublicationState.UNCERTAIN
+                    and not retry_result.reconciliation_eligible):
+                print(
+                    "WARNING: explicit retry may create a duplicate Speakr recording.",
+                    file=sys.stderr,
+                )
+            if not _speakr_network_allowed(cfg, force):
+                return _SPEAKR_WAIT_CODE
+            token = _speakr_token()
             if token is None:
                 # Let the engine claim and block the current phase before any reset.
                 blocked = publisher.block_configuration(retry_job, instance_url=instance_url)
@@ -494,30 +697,46 @@ def _cmd_speakr_upload(
                     return 1
                 _print_speakr_status(blocked)
                 return 1
-            if job.state is PublicationState.UNCERTAIN and not job.reconciliation_eligible:
-                print(
-                    "WARNING: explicit retry may create a duplicate Speakr recording.",
-                    file=sys.stderr,
-                )
             reset = publisher.retry(retry_job)
-            result = publisher.run_one(instance_url, safe_token, reset.job_id)
+            result = publisher.run_one(instance_url, token, reset.job_id)
             if result is None:
                 print("Speakr: publication job is leased or not due.", file=sys.stderr)
                 return 1
             return _speakr_result_code(result)
         if all_jobs:
-            # The engine snapshots due IDs so zero-delay retries cannot starve later jobs.
-            results = publisher.run_all_due(instance_url, safe_token)
+            # Inspect a bounded local due snapshot before touching D-Bus or credentials.
+            due_job_ids = getattr(publisher, "due_job_ids", None)
+            if callable(due_job_ids):
+                if not due_job_ids(instance_url, limit=_SPEAKR_DUE_LIMIT):
+                    print("Speakr: no due publication jobs.")
+                    return 0
+            if not _speakr_network_allowed(cfg, force):
+                return _SPEAKR_WAIT_CODE
+            token = _speakr_token()
+            # The engine snapshots due IDs again to prevent zero-delay starvation.
+            results = publisher.run_all_due(instance_url, token or "")
             if not results:
                 print("Speakr: no due publication jobs.")
-                return 2 if token is None else 0
+                return 0
             result_codes = [_speakr_result_code(result) for result in results]
             return 0 if all(code == 0 for code in result_codes) else 1
         if path is None:
             print("Speakr: PATH is required.", file=sys.stderr)
             return 2
+        # PATH form persists or reuses the local job before network admission.
         job = publisher.enqueue(path, instance_url)
-        result = publisher.run_one(instance_url, safe_token, job.job_id)
+        if not _speakr_network_allowed(cfg, force):
+            return _SPEAKR_WAIT_CODE
+        token = _speakr_token()
+        if token is None:
+            # Let the engine claim and block the queued phase before any transfer attempt.
+            blocked = publisher.block_configuration(job.job_id, instance_url=instance_url)
+            if blocked is None:
+                print("Speakr: publication job is leased or not due.", file=sys.stderr)
+                return 1
+            _print_speakr_status(blocked)
+            return 1
+        result = publisher.run_one(instance_url, token or "", job.job_id)
         if result is None:
             print("Speakr: publication job is leased or not due.", file=sys.stderr)
             return 1
@@ -743,6 +962,8 @@ def build_parser() -> argparse.ArgumentParser:
     upload.add_argument("path", nargs="?", help="recording path for an explicit upload")
     upload.add_argument("--all", dest="all_jobs", action="store_true",
                         help="run all due jobs; combine with --status for --status --all")
+    upload.add_argument("--force", action="store_true",
+                        help="skip the allowed-SSID check for this explicit operation")
     upload.add_argument("--status", nargs="?", const="", default=None, metavar="JOB",
                         help="print one job status, or use --status --all")
     action_group = upload.add_mutually_exclusive_group()
@@ -802,6 +1023,7 @@ def main(argv: list[str] | None = None) -> int:
                 relink_job=relink_args[0],
                 relink_path=relink_args[1],
                 forget_job=args.forget_job,
+                force=args.force,
             )
         parser.error("unknown Speakr command")
     handler = {

@@ -11,9 +11,11 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 import unicodedata
+from urllib.parse import urlsplit
 
 from .domain import VideoSource
 from .speakr_domain import normalize_speakr_url
@@ -73,6 +75,27 @@ class AllowEntry:
     app: str
 
 
+class PublicationMode(str, Enum):
+    """The configured policy for publishing finalized recordings to Speakr."""
+
+    DISABLED = "disabled"
+    MANUAL = "manual"
+    AUTOMATIC = "automatic"
+
+    @classmethod
+    def parse(cls, value: object) -> "PublicationMode":
+        """Parse a config value, disabling publication when it is unknown."""
+        # Keep typed callers idempotent when they pass an already parsed mode.
+        if isinstance(value, cls):
+            return value
+
+        # Convert serialized values and fall back safely for unknown settings.
+        try:
+            return cls(str(value))
+        except ValueError:
+            return cls.DISABLED
+
+
 @dataclass
 class Config:
     output_dir: Path
@@ -101,7 +124,14 @@ class Config:
     google_calendar_client_id: str | None
     google_calendar_loopback_port: Any
     speakr_url: str | None
+    speakr_publication_mode: PublicationMode
+    speakr_allowed_ssids: tuple[str, ...]
     allowlist: list[AllowEntry] = field(default_factory=list)
+
+    @property
+    def speakr_allowed_ssid_bytes(self) -> tuple[bytes, ...]:
+        """Return the exact UTF-8 SSID bytes used by NetworkManager admission."""
+        return tuple(ssid.encode("utf-8") for ssid in self.speakr_allowed_ssids)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Config":
@@ -115,6 +145,16 @@ class Config:
         env_speakr_url = (os.environ["MEETING_RECORDER_SPEAKR_URL"]
                           if "MEETING_RECORDER_SPEAKR_URL" in os.environ else
                           configured_speakr_url)
+        # Parse optional publication policy independently so bad optional data
+        # cannot prevent the recorder from starting.
+        publication_mode = PublicationMode.parse(
+            data.get("speakr_publication_mode", "disabled"))
+        # Treat the entire allowlist as unavailable when one SSID is invalid.
+        try:
+            allowed_ssids = validate_speakr_allowed_ssids(
+                data.get("speakr_allowed_ssids", []))
+        except ValueError:
+            allowed_ssids = ()
         return cls(
             output_dir=expand_path(data["output_dir"]),
             record_screen=bool(data["record_screen"]),
@@ -146,6 +186,8 @@ class Config:
             google_calendar_loopback_port=data.get("google_calendar_loopback_port", 0),
             # Speakr validates this only when its explicit command resolves it.
             speakr_url=(str(env_speakr_url) if env_speakr_url is not None else None),
+            speakr_publication_mode=publication_mode,
+            speakr_allowed_ssids=allowed_ssids,
             allowlist=allow,
         )
 
@@ -185,10 +227,13 @@ def _normalize_user_overrides(user: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_speakr_url(config: Config, environ: Any | None = None) -> str:
-    """Resolve and validate the explicit Speakr instance URL."""
+    """Resolve the HTTPS Speakr instance URL for production network access."""
     values = os.environ if environ is None else environ
     value = values["MEETING_RECORDER_SPEAKR_URL"] if "MEETING_RECORDER_SPEAKR_URL" in values else config.speakr_url
-    return normalize_speakr_url(value)
+    normalized = normalize_speakr_url(value)
+    if urlsplit(normalized).scheme != "https":
+        raise ValueError("Speakr URL must use HTTPS")
+    return normalized
 
 
 def require_speakr_token(environ: Any | None = None) -> str:
@@ -205,6 +250,35 @@ def require_speakr_token(environ: Any | None = None) -> str:
     ):
         raise ValueError("Speakr token is invalid")
     return token
+
+
+def validate_speakr_allowed_ssids(value: object) -> tuple[str, ...]:
+    """Validate exact SSID text and return an immutable ordered selection."""
+    if not isinstance(value, list):
+        raise ValueError("speakr_allowed_ssids must be a list of strings")
+
+    # Keep the original text unchanged because NetworkManager compares raw
+    # UTF-8 SSID bytes, including spaces and letter case.
+    result: list[str] = []
+    seen: set[bytes] = set()
+    for ssid in value:
+        if not isinstance(ssid, str) or not ssid:
+            raise ValueError("speakr_allowed_ssids contains an invalid SSID")
+        if any(unicodedata.category(char).startswith("C") for char in ssid):
+            raise ValueError("speakr_allowed_ssids contains an unsafe SSID")
+
+        # Encode before checking length and exact-byte duplicates.
+        try:
+            encoded = ssid.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("speakr_allowed_ssids contains invalid UTF-8 text") from exc
+        if len(encoded) > 32:
+            raise ValueError("speakr_allowed_ssids contains an SSID over 32 UTF-8 bytes")
+        if encoded in seen:
+            raise ValueError("speakr_allowed_ssids contains duplicate SSIDs")
+        seen.add(encoded)
+        result.append(ssid)
+    return tuple(result)
 
 
 def _load_effective_config() -> dict[str, Any]:

@@ -19,7 +19,7 @@ import socket
 import stat
 from threading import Event, Thread, current_thread
 import time
-from typing import BinaryIO, Callable, Sequence, cast
+from typing import BinaryIO, Callable, List, Sequence, cast
 from uuid import uuid4
 
 from .meeting_sidecar import MeetingSidecar, load_sidecar, sidecar_path
@@ -332,6 +332,24 @@ class SpeakrPublisher:
         origin = self._origin(instance_url)
         return [job for job in jobs if job.key.instance_url == origin]
 
+    def due_job_ids(
+        self,
+        instance_url: str,
+        *,
+        now_ms: int | None = None,
+        limit: int = 100,
+    ) -> tuple[str, ...]:
+        """Return due IDs through the store using this publisher's clock."""
+        origin = self._origin(instance_url)
+        current = self._now() if now_ms is None else now_ms
+        return self.store.due_job_ids(origin, now_ms=current, limit=limit)
+
+    def next_wake_at_ms(self, instance_url: str, *, now_ms: int | None = None) -> int | None:
+        """Return the next due deadline through the store using this publisher's clock."""
+        origin = self._origin(instance_url)
+        current = self._now() if now_ms is None else now_ms
+        return self.store.next_wake_at_ms(origin, now_ms=current)
+
     def retry(
         self,
         reference: PublicationKey | PublicationJob | str,
@@ -405,12 +423,10 @@ class SpeakrPublisher:
                 raise ValueError("Speakr origin does not match the publication job")
         claimed: PublicationJob | None = None
         if reference is None:
-            # The store claim is origin agnostic, so filter before fencing any job.
-            for candidate in self.store.list():
-                if candidate.key.instance_url != origin or candidate.next_attempt_at_ms > self._now():
-                    continue
+            # Query the origin-filtered due index before fencing any job.
+            for candidate_id in self.due_job_ids(origin, now_ms=self._now(), limit=1):
                 claimed = self.store.claim_one(
-                    self.worker_id, candidate.job_id,
+                    self.worker_id, candidate_id,
                     lease_ms=self.lease_ms, now_ms=self._now(),
                 )
                 if claimed is not None:
@@ -448,49 +464,35 @@ class SpeakrPublisher:
         instance_url: str,
         token: str,
         limit: int = 100,
-    ) -> list[PublicationResult]:
+    ) -> List[PublicationResult]:
         """Claim and execute a bounded due batch without crossing origins."""
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("run limit is invalid")
         origin = self._origin(instance_url)
-        results: list[PublicationResult] = []
+        results: List[PublicationResult] = []
 
-        # PublicationStore's batch claim is intentionally origin agnostic.  A
-        # filtered claim-one loop keeps credentials from ever reaching another
-        # persisted origin while retaining the store's lease fencing.
-        for candidate in self.store.list():
+        # Snapshot bounded origin-filtered IDs before fencing any job.
+        snapshot_now = self._now()
+        snapshot_ids = self.due_job_ids(origin, now_ms=snapshot_now, limit=limit)
+        for candidate_id in snapshot_ids:
             if len(results) >= limit:
                 break
-            if candidate.key.instance_url != origin:
-                continue
-            if candidate.next_attempt_at_ms > self._now():
-                continue
             claimed = self.store.claim_one(
-                self.worker_id, candidate.job_id,
-                lease_ms=self.lease_ms, now_ms=self._now(),
+                self.worker_id, candidate_id,
+                lease_ms=self.lease_ms, now_ms=snapshot_now,
             )
             if claimed is None:
                 continue
             results.append(self._run_claimed(claimed, origin, token))
         return results
 
-    def run_all_due(self, instance_url: str, token: str) -> list[PublicationResult]:
+    def run_all_due(self, instance_url: str, token: str) -> List[PublicationResult]:
         """Execute each job due at command start at most once in stable order."""
         origin = self._origin(instance_url)
         snapshot_now = self._now()
-        snapshot_ids = [
-            candidate.job_id
-            for candidate in self.store.list()
-            if (
-                candidate.key.instance_url == origin
-                and candidate.next_attempt_at_ms <= snapshot_now
-                and (
-                    candidate.http_method in {"POST", "PATCH"}
-                    or candidate.reconciliation_eligible
-                )
-            )
-        ]
-        results: list[PublicationResult] = []
+        # Take one bounded database snapshot so zero-delay retries cannot re-enter this command.
+        snapshot_ids = self.due_job_ids(origin, now_ms=snapshot_now, limit=1_000)
+        results: List[PublicationResult] = []
 
         # Each stable ID belongs to the initial due snapshot, so retry timing
         # changes cannot make one job occupy another job's command slot.

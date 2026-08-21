@@ -45,6 +45,22 @@ _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_OWNER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ALLOWED_ERROR_CODES = _SAFE_ERROR_CODES
 _DEFAULT_LEASE_MS = 60_000
+_MAX_DUE_IDS = 1_000
+
+_INDEX_DEFINITIONS = (
+    (
+        "idx_publications_origin_due",
+        ("instance_url", "operation", "next_attempt_at_ms", "lease_expires_at_ms", "job_id"),
+    ),
+    (
+        "idx_publications_lease_expiry",
+        ("lease_expires_at_ms", "lease_owner", "state", "job_id"),
+    ),
+    (
+        "idx_publications_private_media_identity",
+        ("private_path", "media_device", "media_inode", "media_size", "source_mtime_ns", "lease_owner", "job_id"),
+    ),
+)
 
 _COLUMN_NAMES = (
     "job_id", "instance_url", "recording_sha256", "private_path", "media_device",
@@ -347,6 +363,7 @@ class PublicationStore:
             if version == 0 and not tables:
                 connection.execute(_schema_sql())
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                self._ensure_indexes(connection)
                 created_schema = True
             elif version != _SCHEMA_VERSION:
                 raise PublicationMigrationError(
@@ -354,6 +371,7 @@ class PublicationStore:
                 )
             else:
                 self._validate_schema(connection, tables)
+                self._ensure_indexes(connection)
             connection.commit()
         except Exception:
             try:
@@ -385,6 +403,32 @@ class PublicationStore:
         normalize = lambda value: re.sub(r"\s+", " ", value).strip().casefold()
         if not sql or normalize(sql[0]) != normalize(_schema_sql()):
             raise PublicationMigrationError("publication table definition is not version two")
+
+    @staticmethod
+    def _ensure_indexes(connection: sqlite3.Connection) -> None:
+        """Create and validate the bounded-query indexes without changing v2."""
+        for name, columns in _INDEX_DEFINITIONS:
+            expected_sql = f"CREATE INDEX {name} ON publications ({', '.join(columns)})"
+            index = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (name,),
+            ).fetchone()
+            if index is None:
+                connection.execute(expected_sql)
+                continue
+
+            # Existing named indexes must retain the exact definition expected by the store.
+            normalize = lambda value: re.sub(r"\s+", " ", value).strip().casefold()
+            details = connection.execute("PRAGMA index_list(publications)").fetchall()
+            detail = next((row for row in details if row[1] == name), None)
+            actual_columns = tuple(
+                row[2] for row in connection.execute(f"PRAGMA index_info({name})")
+            )
+            if (
+                detail is None or detail[2] != 0 or actual_columns != columns
+                or normalize(index[0]) != normalize(expected_sql)
+            ):
+                raise PublicationMigrationError(f"publication index {name} is invalid")
 
     @staticmethod
     def _row_to_job(row: sqlite3.Row | tuple[object, ...]) -> PublicationJob:
@@ -487,6 +531,81 @@ class PublicationStore:
                     normalized,
                 ).fetchall()
             return [self._row_to_job(row) for row in rows]
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _due_predicate() -> str:
+        """Return the SQL safety predicate shared by due IDs and wake times."""
+        return (
+            "((state = 'queued' AND operation = 'post' AND resume_intent = 'post' "
+            "AND remote_recording_id IS NULL) "
+            "OR (state = 'metadata_pending' AND operation = 'patch' AND resume_intent = 'patch' "
+            "AND remote_recording_id IS NOT NULL) "
+            "OR (state = 'uncertain' AND operation = 'reconcile' AND resume_intent = 'reconcile' "
+            "AND remote_recording_id IS NULL) "
+            "OR (state = 'transferring' AND operation = 'none' AND resume_intent = 'post' "
+            "AND remote_recording_id IS NULL))"
+        )
+
+    @staticmethod
+    def _effective_due_sql() -> str:
+        """Return the deadline expression that protects active leases."""
+        return (
+            "CASE WHEN lease_owner IS NOT NULL THEN lease_expires_at_ms "
+            "ELSE COALESCE(next_attempt_at_ms, 0) END"
+        )
+
+    def due_job_ids(
+        self,
+        instance_url: str,
+        *,
+        now_ms: int | None = None,
+        limit: int = 100,
+    ) -> tuple[str, ...]:
+        """Return a bounded, origin-filtered snapshot of due safe work IDs."""
+        if type(limit) is not int or not 1 <= limit <= _MAX_DUE_IDS:
+            raise ValueError("due limit is invalid")
+        origin = normalize_speakr_url(instance_url)
+        now = self._time_ms() if now_ms is None else _validate_nonnegative_int(now_ms, "publication clock")
+        effective_due = self._effective_due_sql()
+
+        # Select only rows whose operation and deadline permit a safe claim.
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT job_id FROM publications WHERE instance_url = ? "
+                f"AND {self._due_predicate()} "
+                "AND (((state != 'transferring') AND lease_owner IS NULL "
+                "AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)) "
+                "OR (lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL "
+                "AND lease_expires_at_ms <= ?)) "
+                f"ORDER BY {effective_due}, job_id LIMIT ?",
+                (origin, now, now, limit),
+            ).fetchall()
+            return tuple(row[0] for row in rows)
+        finally:
+            connection.close()
+
+    def next_wake_at_ms(self, instance_url: str, *, now_ms: int | None = None) -> int | None:
+        """Return the earliest eligible deadline, clamped to the supplied clock."""
+        origin = normalize_speakr_url(instance_url)
+        now = self._time_ms() if now_ms is None else _validate_nonnegative_int(now_ms, "publication clock")
+        effective_due = self._effective_due_sql()
+
+        # Clamp overdue work to now so callers never sleep past immediately runnable work.
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT MIN(CASE WHEN deadline <= ? THEN ? ELSE deadline END) FROM ("
+                f"SELECT {effective_due} AS deadline FROM publications WHERE instance_url = ? "
+                f"AND {self._due_predicate()} "
+                "AND (((state != 'transferring') AND lease_owner IS NULL) "
+                "OR (lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL))"
+                ")",
+                (now, now, origin),
+            ).fetchone()
+            return None if row is None or row[0] is None else int(row[0])
         finally:
             connection.close()
 
@@ -879,7 +998,16 @@ class PublicationStore:
                     updated_at_ms=max(now, old.created_at_ms),
                 )
             else:
-                new = replace(old, lease_owner=None, lease_expires_at_ms=None, updated_at_ms=max(now, old.created_at_ms))
+                # Lease expiry is the recovery deadline for eligible work, even when its retry backoff was later.
+                recovery_due = (
+                    min(old.next_attempt_at_ms, now)
+                    if old.http_method in {"POST", "PATCH"} or old.reconciliation_eligible
+                    else old.next_attempt_at_ms
+                )
+                new = replace(
+                    old, lease_owner=None, lease_expires_at_ms=None,
+                    next_attempt_at_ms=recovery_due, updated_at_ms=max(now, old.created_at_ms),
+                )
             self._update_job(connection, old, new)
 
     def renew(

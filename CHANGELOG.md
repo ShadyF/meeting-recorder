@@ -13,8 +13,12 @@ All notable changes to this project are documented here. Format follows
   background refresh independent from recording.
 - #21 adds cache-only recording enrichment, versioned `.meeting.json` sidecars,
   collision-safe Calendar naming, and `calendar correct` for offline corrections.
-- #22 adds explicit `speakr upload PATH` publication with public-only durable
-  Publication job state and environment-only Speakr token handling.
+- #22 adds the explicit `speakr upload PATH` command with public-only durable
+  publication progress, one protected private filesystem locator for operational
+  path state, and environment-only Speakr token handling.
+- #24 adds policy-controlled Speakr publication with disabled, manual, and
+  automatic modes, exact SSID admission, and an isolated background worker;
+  explicit commands remain available in every mode.
 
 ### Changed
 - Detected meetings now ask directly whether to record Video, Audio only, or
@@ -30,9 +34,19 @@ All notable changes to this project are documented here. Format follows
   matched visible meeting uses the scheduled local time and title for its name;
   hidden or unmatched recordings retain the fallback name. Later Calendar
   refreshes do not retroactively rename or rewrite earlier recordings.
-- Speakr publication is never automatic: media transfers are non-idempotent,
-  uncertain transfers are not resent, rejected transfers require an explicit
-  rerun, metadata-pending jobs retry only PATCH, and published reruns send nothing.
+- Speakr publication now follows the configured disabled/manual/automatic policy:
+  disabled makes no automatic jobs or daemon attempts, manual retries existing
+  explicit jobs, and automatic also enqueues newly completed daemon-detected
+  Recordings and `meeting-recorder record` outputs. Existing jobs survive mode
+  changes, and no historical directory scan creates jobs.
+- Normal Speakr `PATH`, `--all`, and `--retry` attempts require an exact allowed
+  active SSID; `--force` bypasses only that SSID gate. Status, relink, and forget
+  remain local operations. Unknown, unavailable, or nonmatching Wi-Fi waits, and
+  an SSID match does not authenticate Speakr.
+- Speakr publication work stays off the GLib loop and reports only action-required
+  states. Media transfers remain non-idempotent: uncertain transfers are not
+  automatically resent, rejected transfers require an explicit rerun,
+  metadata-pending jobs retry only PATCH, and published reruns send nothing.
 - Speakr publication now selects an explicit timezone-aware `meeting_date` from
   the visible or hidden Meeting's scheduled start, a valid unmatched sidecar's
   capture start, or file mtime as the final fallback.

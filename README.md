@@ -139,7 +139,13 @@ meeting-recorder run        # run the detector in the foreground
 meeting-recorder record     # record right now until Ctrl-C
 meeting-recorder config     # create/print the config file
 meeting-recorder calendar connect|status|disconnect  # manage Calendar credentials
-meeting-recorder speakr upload PATH                   # explicitly publish one Recording
+meeting-recorder speakr upload PATH [--force]         # publish one Recording
+meeting-recorder speakr upload --all [--force]       # attempt all due jobs
+meeting-recorder speakr upload --status JOB
+meeting-recorder speakr upload --status --all
+meeting-recorder speakr upload --retry JOB [--force]
+meeting-recorder speakr upload --relink JOB NEW_PATH
+meeting-recorder speakr upload --forget JOB
 ```
 
 `start`/`stop`/`restart`/`logs` wrap `systemctl --user`, so you never need to
@@ -225,20 +231,72 @@ failures leave the authoritative media in place.
 
 ### Optional Speakr publication
 
-Speakr publication is always explicit and on demand; the recorder never uploads a
-Recording automatically. Configure the public Speakr instance origin with
-`speakr_url`, then provide the bearer token only through
-`MEETING_RECORDER_SPEAKR_TOKEN` when invoking:
+Speakr publication is optional and policy-controlled. Set
+`speakr_publication_mode` to one of the following values; the shipped default is
+`disabled`:
+
+| Mode | Newly completed Recordings | Existing explicit jobs |
+|---|---|---|
+| `disabled` | Not enqueued automatically | No daemon attempts |
+| `manual` | Not enqueued automatically | The daemon retries due jobs |
+| `automatic` | The daemon and `meeting-recorder record` enqueue completed Recordings | The daemon retries due jobs |
+
+Explicit `meeting-recorder speakr upload ...` commands remain available in every
+mode. Changing the mode preserves existing Publication jobs, and the daemon never
+scans historical directories to create jobs. For `meeting-recorder record`, the
+automatic enqueue happens after its GLib loop exits; the daemon worker attempts the
+durable job later.
+
+Configure the production Speakr origin with `speakr_url`; it must use HTTPS. The
+bearer token remains available only through `MEETING_RECORDER_SPEAKR_TOKEN`:
 
 ```bash
 MEETING_RECORDER_SPEAKR_TOKEN='…' meeting-recorder speakr upload PATH
 ```
 
 The token is never accepted from the config file or CLI arguments and is never
-stored in SQLite. Publication state is public-only and lives at
+stored in SQLite. Durable publication progress fields are public-only. The
+database also stores one protected private filesystem locator for the current
+Recording path as operational state inside the protected 0700 state directory
+and 0600 SQLite boundary. The database contains no credentials or copied private
+Meeting title, notes, or participants. Publication state lives at
 `$XDG_STATE_HOME/meeting-recorder/publications.sqlite3` (or
 `~/.local/state/meeting-recorder/publications.sqlite3` when `XDG_STATE_HOME` is
-unset); it contains no credentials or private Meeting metadata.
+unset).
+
+Automatic and normal explicit network attempts are admitted only when
+NetworkManager reports an active Wi-Fi SSID that exactly matches an entry in
+`speakr_allowed_ssids`. Entries are case-sensitive strings compared as their raw
+UTF-8 bytes: they must be non-empty and at most 32 UTF-8 bytes, with no trimming,
+case folding, or Unicode normalization. For example:
+
+```json
+{
+  "speakr_publication_mode": "automatic",
+  "speakr_allowed_ssids": ["Office Wi-Fi"]
+}
+```
+
+Unknown, unavailable, or nonmatching Wi-Fi is not admission; the worker waits for
+a later check and does not contact Speakr. An SSID match is only an admission
+gate, not authentication. HTTPS, token authentication, recording-hash and file
+identity checks, lease fencing, reconciliation rules, and other file-safety checks
+still apply.
+
+The normal network forms are `upload PATH`, `upload --all`, and `upload --retry
+JOB`; each is SSID-gated. `--force` is accepted only with those three forms and
+bypasses only the SSID gate. The local forms `upload --status JOB`, `upload
+--status --all`, `upload --relink JOB NEW_PATH`, and `upload --forget JOB` do not
+perform network publication and do not use the SSID gate.
+
+The daemon's publication worker keeps hashing, SQLite access, token reads,
+NetworkManager D-Bus probes, and Speakr network I/O off the GLib loop. It reports
+only action-required publication states, and a publication failure never changes
+whether a Recording succeeded. Publication jobs retain the durable recovery
+semantics described below: uncertain media transfers are not automatically resent,
+`metadata_pending` retries only the metadata PATCH, and a `published` rerun sends
+nothing. Use explicit `--retry` when an action-required state requires operator
+authorization.
 
 For a matched visible Meeting, the publisher sends the current title, scheduled
 time, description/location notes, and participants. A hidden matched Meeting
@@ -259,8 +317,10 @@ rerun sends no requests.
 
 ## Configuration
 
-The GUI covers everything, but the config file is
+Recording settings are available in the GUI, but the config file is
 `~/.config/meeting-recorder/config.json` (it **overrides** the shipped defaults).
+Speakr publication policy is configured in this file rather than through the GUI;
+restart the service after changing these keys.
 
 | Key | Meaning |
 |-----|---------|
@@ -283,7 +343,9 @@ The GUI covers everything, but the config file is
 | `min_recording_seconds` | Discard recordings shorter than this |
 | `google_calendar_client_id` | Optional bare user-owned Google Desktop OAuth client ID; no secret or credential JSON |
 | `google_calendar_loopback_port` | OAuth loopback port: `0` for an OS-selected port (default), or `1`--`65535` |
-| `speakr_url` | Public Speakr HTTP(S) origin; the bearer token must come from `MEETING_RECORDER_SPEAKR_TOKEN` |
+| `speakr_url` | Public Speakr HTTPS origin in production; the bearer token must come from `MEETING_RECORDER_SPEAKR_TOKEN` |
+| `speakr_publication_mode` | `disabled` (default), `manual`, or `automatic`; controls automatic enqueueing and daemon attempts |
+| `speakr_allowed_ssids` | `[]` by default; exact, case-sensitive Wi-Fi SSID strings, each at most 32 UTF-8 bytes; no trimming or normalization |
 | `allowlist` | `{"match": "<substring>", "app": "<Display Name>"}` rules |
 
 To watch another app, add an allowlist entry matching its process name:
