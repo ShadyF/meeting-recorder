@@ -501,6 +501,85 @@ def _cmd_config(_cfg) -> int:
     return 0
 
 
+def _positive_cleanup_days(value: str) -> int:
+    """Parse the cleanup age threshold required by the CLI."""
+    # Convert only a complete integer value so malformed ages fail in argparse.
+    try:
+        days = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("DAYS must be an integer >= 1") from exc
+
+    # Reject zero and negative ages before any command dispatch can occur.
+    if days < 1:
+        raise argparse.ArgumentTypeError("DAYS must be an integer >= 1")
+    return days
+
+
+def _cleanup_result_payload(result: Any) -> dict[str, object]:
+    """Expose the cleanup engine's bounded result fields as JSON."""
+    # Convert enum values to stable strings without exposing engine internals.
+    status = getattr(result.status, "value", result.status)
+    reason = getattr(result.reason, "value", result.reason)
+
+    # Preserve the bounded result fields in the CLI's JSON shape.
+    return {
+        "path": result.path,
+        "job_ids": list(result.job_ids),
+        "recording_sha256": result.recording_sha256,
+        "age_days": result.age_days,
+        "age_source": result.age_source,
+        "status": status,
+        "reason": reason,
+    }
+
+
+def _cmd_cleanup(cfg: Config, older_than_days: int, delete: bool = False) -> int:
+    """Preview or explicitly delete old published recordings."""
+    mode = "delete" if delete else "preview"
+
+    # Keep direct handler callers subject to the same validation as argparse.
+    if (isinstance(older_than_days, bool) or not isinstance(older_than_days, int)
+            or older_than_days < 1):
+        print(json.dumps({
+            "command": "cleanup",
+            "error": "invalid_older_than",
+            "message": "DAYS must be an integer >= 1",
+            "mode": mode,
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+    # Construct the existing engine with configured local state and recording paths.
+    try:
+        from .speakr_cleanup import PublicationCleanup
+        from .speakr_store import PublicationStore
+
+        # Use the configured recording root and the existing private state store.
+        cleanup = PublicationCleanup(PublicationStore(), cfg.output_dir)
+        report = cleanup.delete(older_than_days) if delete else cleanup.preview(older_than_days)
+
+        # Preserve every engine result while making the operation mode explicit.
+        payload = {
+            "command": "cleanup",
+            "mode": mode,
+            "older_than_days": older_than_days,
+            "results": [_cleanup_result_payload(result) for result in report.results],
+        }
+        print(json.dumps(payload, sort_keys=True))
+        return 1 if any(
+            getattr(result.status, "value", result.status) == "incomplete"
+            for result in report.results
+        ) else 0
+    except Exception:
+        # Do not expose store paths or engine internals in CLI failure output.
+        print(json.dumps({
+            "command": "cleanup",
+            "error": "cleanup_failed",
+            "mode": mode,
+            "older_than_days": older_than_days,
+        }, sort_keys=True), file=sys.stderr)
+        return 1
+
+
 def _speakr_status(job: PublicationJob) -> dict[str, object]:
     """Return only bounded operational fields safe for terminal output."""
     return {
@@ -912,6 +991,7 @@ def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command parser separately so the Calendar surface is testable."""
     # -v/--verbose accepted before OR after the subcommand via a shared parent.
+    # Create one shared option parent so every top-level command parses verbosity consistently.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-v", "--verbose", action="store_true")
 
@@ -921,6 +1001,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command")
+    # Register service and configuration commands that do not need extra arguments.
     for name, help_text in (
         ("status", "service state + detected capture streams"),
         ("start", "start the background service"),
@@ -933,8 +1014,17 @@ def build_parser() -> argparse.ArgumentParser:
         ("config", "create/print the user config file"),
     ):
         sub.add_parser(name, parents=[common], help=help_text)
+    cleanup = sub.add_parser("cleanup", parents=[common],
+                             help="preview or delete old published recordings")
+    # Require the age policy at parse time and make deletion an explicit flag.
+    cleanup.add_argument("--older-than", dest="older_than_days", required=True,
+                         type=_positive_cleanup_days,
+                         metavar="DAYS", help="minimum recording age in days")
+    cleanup.add_argument("--delete", action="store_true",
+                         help="permanently delete eligible recordings")
     calendar = sub.add_parser("calendar", parents=[common],
                               help="manage Google Calendar credentials")
+    # Build the calendar command tree with required action selection.
     calendar_sub = calendar.add_subparsers(dest="calendar_command", required=True)
     for name, help_text in (
         ("connect", "authorize and securely store a Calendar refresh token"),
@@ -957,6 +1047,7 @@ def build_parser() -> argparse.ArgumentParser:
     correct_group.add_argument("--select", dest="selector")
     correct_group.add_argument("--clear", action="store_true")
     speakr = sub.add_parser("speakr", parents=[common], help="explicitly publish recordings to Speakr")
+    # Build the Speakr upload surface with mutually exclusive state-changing actions.
     speakr_sub = speakr.add_subparsers(dest="speakr_command", required=True)
     upload = speakr_sub.add_parser("upload", parents=[common], help="publish or inspect Speakr recordings")
     upload.add_argument("path", nargs="?", help="recording path for an explicit upload")
@@ -1036,6 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
         "stop": _cmd_stop,
         "restart": _cmd_restart,
         "logs": _cmd_logs,
+        "cleanup": lambda cfg: _cmd_cleanup(cfg, args.older_than_days, args.delete),
     }[command]
     return handler(cfg)
 

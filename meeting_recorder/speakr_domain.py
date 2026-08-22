@@ -47,6 +47,16 @@ class ResumeIntent(str, Enum):
     NONE = "none"
 
 
+class CleanupPhase(str, Enum):
+    """The durable phases of one explicit local cleanup intent."""
+
+    PREPARED = "prepared"
+    SIDECAR_QUARANTINED = "sidecar_quarantined"
+    MEDIA_QUARANTINED = "media_quarantined"
+    SIDECAR_UNLINKED = "sidecar_unlinked"
+    MEDIA_UNLINKED = "media_unlinked"
+
+
 def _is_control_or_whitespace(value: str) -> bool:
     return any(char.isspace() or unicodedata.category(char).startswith("C") for char in value)
 
@@ -218,6 +228,7 @@ _SAFE_ERROR_CODES = frozenset({
 _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SAFE_OWNER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_INTENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPERATIONS = frozenset(item.value for item in PublicationOperation)
 _RESUME_INTENTS = frozenset(item.value for item in ResumeIntent)
 
@@ -234,6 +245,129 @@ def _path_bytes(value: object, *, required: bool = True) -> bytes | None:
     if not path or b"\x00" in path or len(path) > 4096:
         raise ValueError("private media path is invalid")
     return path
+
+
+def _cleanup_basename(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 255:
+        raise ValueError(f"{name} is invalid")
+    if value in {".", ".."} or any(
+        char in "/\\" or char.isspace() or unicodedata.category(char).startswith("C")
+        for char in value
+    ):
+        raise ValueError(f"{name} is invalid")
+    return value
+
+
+@dataclass(frozen=True)
+class CleanupIntent:
+    """Protected, restartable data for one explicit namespace cleanup."""
+
+    intent_id: str
+    expected_private_path: bytes
+    expected_recording_sha256: str
+    media_device: int
+    media_inode: int
+    media_size: int
+    media_mtime_ns: int
+    sidecar_device: int | None = None
+    sidecar_inode: int | None = None
+    sidecar_size: int | None = None
+    sidecar_mtime_ns: int | None = None
+    quarantine_media_basename: str = "media"
+    quarantine_sidecar_basename: str | None = None
+    phase: CleanupPhase = CleanupPhase.PREPARED
+    created_at_ms: int = 0
+    updated_at_ms: int = 0
+    claimed_job_ids: tuple[str, ...] = ()
+    claimed_lease_generations: tuple[int, ...] = ()
+    media_nlink: int = 1
+    sidecar_nlink: int | None = None
+
+    def __post_init__(self) -> None:
+        # Validate and canonicalize the intent identity before checking dependent fields.
+        if not isinstance(self.intent_id, str) or _SAFE_INTENT_ID.fullmatch(self.intent_id) is None:
+            raise ValueError("cleanup intent ID is invalid")
+        path = _path_bytes(self.expected_private_path)
+        if path is None or not path.startswith(b"/"):
+            raise ValueError("cleanup expected path must be absolute")
+        object.__setattr__(self, "expected_private_path", path)
+        if (
+            not isinstance(self.expected_recording_sha256, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", self.expected_recording_sha256) is None
+        ):
+            raise ValueError("cleanup expected hash is invalid")
+        object.__setattr__(self, "expected_recording_sha256", self.expected_recording_sha256.casefold())
+        # Require complete nonnegative media and optional sidecar identities.
+        for value, name in (
+            (self.media_device, "media device"), (self.media_inode, "media inode"),
+            (self.media_size, "media size"), (self.media_mtime_ns, "media mtime"),
+        ):
+            _nonnegative_int(value, name)
+        sidecar_values = (
+            self.sidecar_device, self.sidecar_inode, self.sidecar_size, self.sidecar_mtime_ns,
+        )
+        if any(value is None for value in sidecar_values) and not all(value is None for value in sidecar_values):
+            raise ValueError("sidecar identity must be complete")
+        for value, name in zip(sidecar_values, ("sidecar device", "sidecar inode", "sidecar size", "sidecar mtime")):
+            if value is not None:
+                _nonnegative_int(value, name)
+        # Keep quarantine names private, bounded, and distinct.
+        _cleanup_basename(self.quarantine_media_basename, "media quarantine basename")
+        if self.quarantine_sidecar_basename is not None:
+            _cleanup_basename(self.quarantine_sidecar_basename, "sidecar quarantine basename")
+            if self.quarantine_sidecar_basename == self.quarantine_media_basename:
+                raise ValueError("cleanup quarantine basenames must be unique")
+        if not isinstance(self.phase, CleanupPhase):
+            raise ValueError("cleanup phase is invalid")
+        # Preserve monotonic journal timestamps and exact claimed membership.
+        _nonnegative_int(self.created_at_ms, "cleanup created time")
+        _nonnegative_int(self.updated_at_ms, "cleanup updated time")
+        if self.updated_at_ms < self.created_at_ms:
+            raise ValueError("cleanup timestamps are out of order")
+        if len(self.claimed_job_ids) != len(set(self.claimed_job_ids)):
+            raise ValueError("cleanup job IDs are duplicated")
+        if len(self.claimed_job_ids) != len(self.claimed_lease_generations):
+            raise ValueError("cleanup membership is incomplete")
+        for job_id in self.claimed_job_ids:
+            if _SAFE_JOB_ID.fullmatch(job_id) is None:
+                raise ValueError("cleanup job ID is invalid")
+        for generation in self.claimed_lease_generations:
+            if type(generation) is not int or generation < 0:
+                raise ValueError("cleanup lease generation is invalid")
+        # Journal only single-link source identities before quarantine begins.
+        if type(self.media_nlink) is not int or self.media_nlink != 1:
+            raise ValueError("cleanup media link count must be one")
+        if self.sidecar_device is None:
+            if self.sidecar_nlink is not None:
+                raise ValueError("cleanup sidecar link count requires a sidecar")
+        elif type(self.sidecar_nlink) is not int or self.sidecar_nlink != 1:
+            raise ValueError("cleanup sidecar link count must be one")
+
+
+@dataclass(frozen=True)
+class CleanupClaim:
+    """An invocation-owned cleanup lease fence that cannot be refreshed from storage."""
+
+    intent_id: str
+    owner: str
+    job_ids: tuple[str, ...]
+    lease_generations: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent_id, str) or _SAFE_INTENT_ID.fullmatch(self.intent_id) is None:
+            raise ValueError("cleanup claim intent ID is invalid")
+        if not isinstance(self.owner, str) or _SAFE_OWNER.fullmatch(self.owner) is None:
+            raise ValueError("cleanup claim owner is invalid")
+        if tuple(self.job_ids) != tuple(sorted(self.job_ids)) or len(self.job_ids) != len(set(self.job_ids)):
+            raise ValueError("cleanup claim job IDs must be sorted and unique")
+        if len(self.job_ids) != len(self.lease_generations) or not self.job_ids:
+            raise ValueError("cleanup claim membership is incomplete")
+        for job_id in self.job_ids:
+            if _SAFE_JOB_ID.fullmatch(job_id) is None:
+                raise ValueError("cleanup claim job ID is invalid")
+        for generation in self.lease_generations:
+            if type(generation) is not int or generation < 1:
+                raise ValueError("cleanup claim generation is invalid")
 
 
 @dataclass(frozen=True)
@@ -263,6 +397,9 @@ class PublicationJob:
     lease_owner: str | None = None
     lease_generation: int = 0
     lease_expires_at_ms: int | None = None
+    cleanup_lease_owner: str | None = None
+    cleanup_lease_generation: int = 0
+    cleanup_lease_expires_at_ms: int | None = None
     last_error_code: str | None = None
     last_http_status: int | None = None
     transfer_started_at_ms: int | None = None
@@ -289,6 +426,7 @@ class PublicationJob:
             (self.attempt_count, "publication attempt count"),
             (self.next_attempt_at_ms, "next attempt time"),
             (self.lease_generation, "lease generation"),
+            (self.cleanup_lease_generation, "cleanup lease generation"),
         ):
             _nonnegative_int(numeric_value, name)
         if self.operation not in _OPERATIONS:
@@ -307,6 +445,17 @@ class PublicationJob:
             raise ValueError("lease owner is invalid")
         if self.lease_expires_at_ms is not None:
             _nonnegative_int(self.lease_expires_at_ms, "lease expiry")
+        if self.cleanup_lease_owner is not None and (
+            not isinstance(self.cleanup_lease_owner, str)
+            or _SAFE_OWNER.fullmatch(self.cleanup_lease_owner) is None
+        ):
+            raise ValueError("cleanup lease owner is invalid")
+        if self.cleanup_lease_expires_at_ms is not None:
+            _nonnegative_int(self.cleanup_lease_expires_at_ms, "cleanup lease expiry")
+        if (self.cleanup_lease_owner is None) != (self.cleanup_lease_expires_at_ms is None):
+            raise ValueError("cleanup lease owner and expiry must be paired")
+        if self.cleanup_lease_owner is not None and self.cleanup_lease_generation < 1:
+            raise ValueError("cleanup lease generation is invalid")
         for timestamp_value, name in (
             (self.transfer_started_at_ms, "transfer start"),
             (self.accepted_at_ms, "accepted time"), (self.published_at_ms, "published time"),
@@ -375,6 +524,19 @@ class PublicationJob:
             raise ValueError("published jobs require an ordered publication time")
         if self.state is PublicationState.UNCERTAIN and self.reconciliation_token is None:
             raise ValueError("uncertain jobs require a reconciliation token")
+        if self.state is PublicationState.LOCAL_REMOVED:
+            if (
+                self.private_path is not None or self.reconciliation_token is not None
+                or self.lease_owner is not None or self.lease_expires_at_ms is not None
+                or self.cleanup_lease_owner is not None or self.cleanup_lease_expires_at_ms is not None
+                or self.next_attempt_at_ms != 0 or self.last_error_code is not None
+                or self.last_http_status is not None or self.remote_recording_id is None
+                or self.remote_recording_id <= 0 or self.transfer_started_at_ms is None
+                or self.accepted_at_ms is None or self.published_at_ms is None
+                or self.local_removed_at_ms is None
+                or not (self.transfer_started_at_ms <= self.accepted_at_ms <= self.published_at_ms <= self.local_removed_at_ms)
+            ):
+                raise ValueError("local removed jobs must retain only completed publication audit data")
 
     @property
     def reconciliation_eligible(self) -> bool:
@@ -471,7 +633,7 @@ def map_speakr_metadata(
 
 
 __all__ = [
-    "MediaIdentity", "PublicationJob", "PublicationKey", "PublicationOperation",
+    "CleanupClaim", "CleanupIntent", "CleanupPhase", "MediaIdentity", "PublicationJob", "PublicationKey", "PublicationOperation",
     "PublicationResult", "PublicationState", "ResumeIntent", "SpeakrMetadata",
     "map_speakr_metadata", "normalize_speakr_url",
 ]

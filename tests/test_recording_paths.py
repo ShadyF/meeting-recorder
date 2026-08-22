@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import meeting_recorder.recording_paths as paths
@@ -14,7 +15,8 @@ from meeting_recorder.calendar_domain import CalendarOccurrence, OccurrenceKey
 from meeting_recorder.meeting_sidecar import sidecar_path
 from meeting_recorder.recording_paths import (
     MoveCommittedError, MovePrecommitError, collision_safe_path,
-    is_live_reserved, move_regular_file_no_replace, recording_directory_lock,
+    fsync_recording_directory_fd, is_live_reserved, link_regular_file_no_replace_dirfd,
+    move_regular_file_no_replace, recording_directory_lock, unlink_verified_file_dirfd,
     reserve_recording_path, sanitize_title, truncate_utf8, visible_recording_filename,
 )
 
@@ -32,6 +34,65 @@ def test_unicode_nfc_whitespace_safe_runs_and_utf8_truncation() -> None:
     long_title = "é" * 100
     result = truncate_utf8(sanitize_title(long_title), 120)
     assert len(result.encode("utf-8")) <= 120 and result.encode("utf-8").decode("utf-8") == result
+
+
+def test_fd_no_replace_link_unlink_and_directory_fsync_preserve_identity() -> None:
+    # Link one regular file through directory descriptors without replacing names.
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "source"
+        destination = root / ".quarantine"
+        source.write_bytes(b"fd seam")
+        source_info = os.stat(source)
+        descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            # Preserve inode identity across link, fsync, and verified unlink.
+            link_regular_file_no_replace_dirfd(descriptor, source.name, descriptor, destination.name)
+            assert os.stat(destination).st_ino == source_info.st_ino
+            fsync_recording_directory_fd(descriptor)
+            unlink_verified_file_dirfd(descriptor, source.name, source_info.st_dev, source_info.st_ino, source_info.st_size, source_info.st_mtime_ns, 2)
+            fsync_recording_directory_fd(descriptor)
+            assert not source.exists() and destination.exists()
+        finally:
+            os.close(descriptor)
+
+
+def test_no_replace_validation_failure_leaves_replaced_destination_untouched() -> None:
+    # Replace the destination during identity validation to model a namespace race.
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "source"
+        destination = root / ".quarantine"
+        source.write_bytes(b"source")
+        descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        original_stat = paths.os.stat
+        replaced = False
+
+        def replace_after_link(path: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal replaced
+            result = original_stat(path, *args, **kwargs)
+            if path == destination.name and not replaced:
+                replaced = True
+                os.unlink(destination)
+                destination.write_bytes(b"replacement")
+                return original_stat(path, *args, **kwargs)
+            return result
+
+        # Install the race seam only for the duration of the operation.
+        paths.os.stat = replace_after_link
+        try:
+            try:
+                # The validation failure must not remove the replacement.
+                link_regular_file_no_replace_dirfd(descriptor, source.name, descriptor, destination.name)
+                assert False, "replacement must fail identity validation"
+            except OSError:
+                pass
+        finally:
+            paths.os.stat = original_stat
+            os.close(descriptor)
+        # Both the replacement destination and authoritative source must survive.
+        assert destination.read_bytes() == b"replacement"
+        assert source.read_bytes() == b"source"
 
 
 def test_visible_filename_uses_injected_local_time_at_event_instant() -> None:
@@ -289,7 +350,8 @@ def test_probe_release_reacquire_interleaving_keeps_one_marker_identity() -> Non
                 os.environ["XDG_CACHE_HOME"] = original
 
 
-def test_move_rolls_back_verified_hardlink_when_source_unlink_fails() -> None:
+def test_move_keeps_verified_hardlink_when_source_unlink_fails() -> None:
+    # Inject a source unlink failure after the destination hardlink is verified.
     with TemporaryDirectory() as directory:
         root = Path(directory)
         source, destination = root / "source.mkv", root / "destination.mkv"
@@ -297,12 +359,13 @@ def test_move_rolls_back_verified_hardlink_when_source_unlink_fails() -> None:
         original_unlink = paths.os.unlink
         calls = []
 
-        def fail_source(path, *args, **kwargs):
+        def fail_source(path: Any, *args: Any, **kwargs: Any) -> Any:
             calls.append(path)
             if Path(path) == source:
                 raise OSError(errno.EIO, "simulated source unlink failure")
             return original_unlink(path, *args, **kwargs)
 
+        # Keep the injected failure local to this move operation.
         paths.os.unlink = fail_source
         try:
             try:
@@ -312,10 +375,13 @@ def test_move_rolls_back_verified_hardlink_when_source_unlink_fails() -> None:
                 pass
         finally:
             paths.os.unlink = original_unlink
-        assert source.exists() and not destination.exists()
+        # Both names must remain and point at the same verified inode.
+        assert source.exists() and destination.exists()
+        assert os.stat(source).st_ino == os.stat(destination).st_ino
 
 
 def test_move_errors_identify_precommit_and_committed_namespace_states() -> None:
+    # A post-move directory sync failure reports a committed destination.
     with TemporaryDirectory() as directory:
         root = Path(directory)
         source, destination = root / "source.mkv", root / "destination.mkv"
@@ -332,10 +398,11 @@ def test_move_errors_identify_precommit_and_committed_namespace_states() -> None
             paths._fsync_directory = original_sync
         assert destination.read_bytes() == b"authoritative" and not source.exists()
 
+        # A source unlink failure reports a precommit state for the second move.
         source.write_bytes(b"again")
         original_unlink = paths.os.unlink
         paths.os.unlink = lambda path, *args, **kwargs: (
-            (_ for _ in ()).throw(OSError("unlink")) if Path(path) == source
+            (_ for _ in ()).throw(OSError("unlink")) if Path(os.fsdecode(path)) == source
             else original_unlink(path, *args, **kwargs))
         try:
             try:

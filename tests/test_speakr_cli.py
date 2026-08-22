@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from meeting_recorder.__main__ import (
-    _cmd_speakr_upload, _publication_rename_tracker, build_parser, main,
+    _cmd_cleanup, _cmd_speakr_upload, _publication_rename_tracker, build_parser, main,
 )
 from meeting_recorder.speakr_domain import MediaIdentity, PublicationKey, PublicationState
 from meeting_recorder.speakr_store import PublicationStore
@@ -161,6 +161,86 @@ def test_speakr_parser_exposes_all_decision_forms_and_rejects_credential_flags()
             pass
         else:
             raise AssertionError(f"forbidden Speakr option accepted: {option}")
+
+
+def test_cleanup_parser_defaults_to_preview_and_accepts_explicit_delete() -> None:
+    # The cleanup command requires a positive age and leaves deletion opt-in.
+    parser = build_parser()
+
+    # Parse the default preview and explicit permanent-deletion forms.
+    preview = parser.parse_args(["cleanup", "--older-than", "7"])
+    deletion = parser.parse_args(["cleanup", "--older-than", "7", "--delete"])
+
+    # Confirm both forms select cleanup and preserve their deletion mode.
+    assert preview.command == "cleanup" and preview.older_than_days == 7
+    assert not preview.delete
+    assert deletion.command == "cleanup" and deletion.delete
+
+
+def test_cleanup_parser_rejects_invalid_threshold_without_dispatch() -> None:
+    # Argparse must reject invalid values before configuration or cleanup setup.
+    parser = build_parser()
+
+    # Exercise zero, negative, and non-integer thresholds.
+    for value in ("0", "-2", "not-a-number"):
+        try:
+            parser.parse_args(["cleanup", "--older-than", value])
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError("invalid cleanup threshold was accepted")
+
+
+def test_cleanup_preview_and_delete_emit_mode_and_engine_results() -> None:
+    # Use a bounded engine-shaped result so output checks do not touch the filesystem.
+    result = SimpleNamespace(
+        path="recording.mkv", job_ids=("job-1",), recording_sha256="a" * 64,
+        age_days=7, age_source="sidecar", status="eligible", reason="eligible",
+    )
+    report = SimpleNamespace(results=(result,))
+    cfg = SimpleNamespace(output_dir=Path("/configured/recordings"))
+
+    # Route both CLI modes to the fake cleanup engine.
+    with patch("meeting_recorder.speakr_store.PublicationStore"), \
+            patch("meeting_recorder.speakr_cleanup.PublicationCleanup") as cleanup_class:
+        cleanup_class.return_value.preview.return_value = report
+        cleanup_class.return_value.delete.return_value = report
+        preview_code, preview_output = _output(_cmd_cleanup, cfg, 7)
+        delete_code, delete_output = _output(_cmd_cleanup, cfg, 7, True)
+
+    # Preview and delete must emit distinct stable modes and engine details.
+    assert preview_code == 0 and '"mode": "preview"' in preview_output
+    assert delete_code == 0 and '"mode": "delete"' in delete_output
+    cleanup_class.return_value.preview.assert_called_once_with(7)
+    cleanup_class.return_value.delete.assert_called_once_with(7)
+    assert '"status": "eligible"' in preview_output
+
+
+def test_cleanup_engine_failure_is_json_error_and_nonzero() -> None:
+    # Engine exceptions are reduced to a stable public error without private details.
+    cfg = SimpleNamespace(output_dir=Path("/configured/recordings"))
+
+    # Make the preview operation fail without constructing a real store.
+    with patch("meeting_recorder.speakr_store.PublicationStore"), \
+            patch("meeting_recorder.speakr_cleanup.PublicationCleanup") as cleanup_class:
+        cleanup_class.return_value.preview.side_effect = RuntimeError("private failure")
+        result, output = _output(_cmd_cleanup, cfg, 3)
+
+    # Report one stable error and never expose the injected exception text.
+    assert result == 1
+    assert '"error": "cleanup_failed"' in output
+    assert "private failure" not in output
+
+
+def test_existing_command_dispatch_remains_unchanged() -> None:
+    # Adding cleanup must not alter dispatch for an existing top-level command.
+    cfg = SimpleNamespace()
+
+    # Route the existing status command through its original handler.
+    with patch("meeting_recorder.__main__.load_config", return_value=cfg), \
+            patch("meeting_recorder.__main__._cmd_status", return_value=17) as handler:
+        assert main(["status"]) == 17
+    handler.assert_called_once_with(cfg)
 
 
 def test_status_and_status_all_are_local_and_secret_free() -> None:

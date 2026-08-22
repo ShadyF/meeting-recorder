@@ -7,9 +7,10 @@ from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
 
-from meeting_recorder.speakr_domain import MediaIdentity, PublicationKey, PublicationState
+from meeting_recorder.speakr_domain import CleanupIntent, CleanupPhase, MediaIdentity, PublicationJob, PublicationKey, PublicationState
 from meeting_recorder.speakr_store import (
-    PublicationMigrationError, PublicationStore, PublicationStoreSecurityError,
+    PublicationMigrationError, PublicationStore, PublicationStoreError, PublicationStoreSecurityError,
+    _V2_COLUMN_NAMES, _expected_v2_publication_sql,
     PublicationTransitionError,
 )
 
@@ -28,14 +29,27 @@ def _store(directory: str, *, clock=None) -> PublicationStore:
 
 
 def _raises(callable_object, *args, **kwargs) -> None:
+    # Treat all public validation and persistence failures as expected test outcomes.
     try:
         callable_object(*args, **kwargs)
-    except (TypeError, ValueError, PublicationTransitionError, PublicationMigrationError, PublicationStoreSecurityError):
+    except (TypeError, ValueError, sqlite3.IntegrityError, PublicationStoreError, PublicationTransitionError, PublicationMigrationError, PublicationStoreSecurityError):
         return
     raise AssertionError("expected validation failure")
 
 
-def test_fresh_database_is_private_v2_without_command_lock_or_metadata() -> None:
+def _published(store: PublicationStore, key: PublicationKey, path: bytes, *, job_id: str) -> PublicationJob:
+    # Register and claim a job before advancing it through publication.
+    store.create_or_reuse(key, path, job_id=job_id)
+    claim = store.claim_one("publisher", key, now_ms=1_000)
+    assert claim is not None
+
+    # Return the fully published row used by cleanup persistence tests.
+    store.transition(key, PublicationState.TRANSFERRING, owner="publisher", generation=claim.lease_generation, now_ms=1_000)
+    store.transition(key, PublicationState.METADATA_PENDING, owner="publisher", generation=claim.lease_generation, remote_recording_id=9, now_ms=1_001)
+    return store.transition(key, PublicationState.PUBLISHED, remote_recording_id=9, now_ms=1_002)
+
+
+def test_fresh_database_is_private_v3_without_command_lock_or_metadata() -> None:
     with TemporaryDirectory() as directory:
         store = _store(directory)
         assert store.state_directory.stat().st_mode & 0o777 == 0o700
@@ -47,15 +61,19 @@ def test_fresh_database_is_private_v2_without_command_lock_or_metadata() -> None
         assert not hasattr(store, "begin_transfer")
         assert not (store.state_directory / "publications.lock").exists()
         with sqlite3.connect(store.database_path) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+            assert connection.execute("PRAGMA user_version").fetchone() == (3,)
             columns = [row[1] for row in connection.execute("PRAGMA table_info(publications)")]
             assert "job_id" in columns and "private_path" in columns and "reconciliation_token" in columns
             assert "max_attempts" not in columns
             assert not set(columns).intersection({"title", "meeting_date", "notes", "participants", "token", "headers"})
             assert connection.execute("SELECT wr, strict FROM pragma_table_list WHERE name = 'publications'").fetchone() == (1, 1)
+            # The fresh schema must include the durable cleanup journal tables.
+            assert {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")} >= {
+                "publications", "cleanup_intents", "cleanup_intent_members",
+            }
 
 
-def test_indexless_v2_open_adds_exact_indexes_without_changing_rows() -> None:
+def test_indexless_v3_open_adds_exact_indexes_without_changing_rows() -> None:
     with TemporaryDirectory() as directory:
         path = Path(directory) / "publications.sqlite3"
         store = PublicationStore(path, clock=lambda: 1_000)
@@ -66,12 +84,13 @@ def test_indexless_v2_open_adds_exact_indexes_without_changing_rows() -> None:
             "idx_publications_origin_due",
             "idx_publications_lease_expiry",
             "idx_publications_private_media_identity",
+            "idx_publications_cleanup_candidates",
         )
         with sqlite3.connect(path) as connection:
-            # Simulate the indexless v2 database produced by issue #23.
+            # Simulate an indexless v3 database and preserve its rows on reopen.
             for name in index_names:
                 connection.execute(f"DROP INDEX {name}")
-            assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+            assert connection.execute("PRAGMA user_version").fetchone() == (3,)
 
         reopened = PublicationStore(path, clock=lambda: 1_000)
         assert reopened.list() == before
@@ -80,7 +99,7 @@ def test_indexless_v2_open_adds_exact_indexes_without_changing_rows() -> None:
                 row[1] for row in connection.execute("PRAGMA index_list(publications)")
                 if not row[1].startswith("sqlite_autoindex_")
             }
-            assert actual == set(index_names)
+            assert actual == set(index_names) | {"idx_publications_cleanup_path"}
             assert reopened.get(first.job_id) == first
             assert reopened.get(second.job_id) == second
 
@@ -96,6 +115,35 @@ def test_v1_and_incompatible_existing_databases_are_rejected_without_deletion() 
         _raises(PublicationStore, path)
         assert path.exists() and path.read_bytes() == before
 
+
+def test_v2_local_removed_without_audit_chain_rejects_atomically() -> None:
+    # Build a legacy local-removed row with its audit chain intentionally incomplete.
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "publications.sqlite3"
+        values: dict[str, object] = {
+            name: None for name in _V2_COLUMN_NAMES
+        }
+        values.update(
+            job_id="legacy-removed", instance_url="https://legacy.example", recording_sha256=HASH,
+            media_device=0, media_inode=0, media_size=0, source_mtime_ns=0,
+            file_last_modified_ms=0, state="local_removed", operation="none", resume_intent="none",
+            attempt_count=0, next_attempt_at_ms=0, lease_generation=0, created_at_ms=0, updated_at_ms=0,
+        )
+        with sqlite3.connect(path) as connection:
+            connection.execute(_expected_v2_publication_sql())
+            connection.execute(
+                f"INSERT INTO publications ({', '.join(_V2_COLUMN_NAMES)}) VALUES ({', '.join('?' for _ in _V2_COLUMN_NAMES)})",
+                tuple(values[name] for name in _V2_COLUMN_NAMES),
+            )
+            connection.execute("PRAGMA user_version = 2")
+        os.chmod(path, 0o600)
+        before = path.read_bytes()
+
+        # Reject the invalid migration without changing the database bytes.
+        _raises(PublicationStore, path)
+        assert path.read_bytes() == before
+
+        # Preserve rejection of unknown schema versions.
         path.unlink()
         with sqlite3.connect(path) as connection:
             connection.execute("PRAGMA user_version = 99")
@@ -103,6 +151,7 @@ def test_v1_and_incompatible_existing_databases_are_rejected_without_deletion() 
         _raises(PublicationStore, path)
         assert path.exists()
 
+        # Preserve rejection of incompatible legacy table shapes.
         path.unlink()
         with sqlite3.connect(path) as connection:
             connection.execute("CREATE TABLE publications (legacy TEXT)")
@@ -111,6 +160,105 @@ def test_v1_and_incompatible_existing_databases_are_rejected_without_deletion() 
         before = path.read_bytes()
         _raises(PublicationStore, path)
         assert path.exists() and path.read_bytes() == before
+
+
+def test_valid_v2_database_migrates_rows_and_adds_v3_cleanup_schema() -> None:
+    # Create a valid published v2 row for migration.
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "publications.sqlite3"
+        values: dict[str, object] = {name: None for name in _V2_COLUMN_NAMES}
+        values.update(
+            job_id="legacy-published", instance_url="https://legacy.example", recording_sha256=HASH,
+            private_path=b"/private/legacy.mkv", media_device=1, media_inode=2, media_size=3,
+            source_mtime_ns=4, file_last_modified_ms=5, state="published", operation="none",
+            resume_intent="none", remote_recording_id=7, attempt_count=0, next_attempt_at_ms=0,
+            lease_generation=0, transfer_started_at_ms=6, accepted_at_ms=7, published_at_ms=8,
+            created_at_ms=1, updated_at_ms=8,
+        )
+        with sqlite3.connect(path) as connection:
+            connection.execute(_expected_v2_publication_sql())
+            connection.execute(
+                f"INSERT INTO publications ({', '.join(_V2_COLUMN_NAMES)}) VALUES ({', '.join('?' for _ in _V2_COLUMN_NAMES)})",
+                tuple(values[name] for name in _V2_COLUMN_NAMES),
+            )
+            connection.execute("PRAGMA user_version = 2")
+        os.chmod(path, 0o600)
+
+        # Migrate the row and create the v3 cleanup schema.
+        migrated = PublicationStore(path, clock=lambda: 1_000)
+
+        # Preserve the legacy row while creating the new cleanup tables and indexes.
+        row = migrated.get("legacy-published")
+        assert row is not None
+        assert row.private_path == b"/private/legacy.mkv"
+        with sqlite3.connect(path) as connection:
+            assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+            assert {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")} >= {
+                "publications", "cleanup_intents", "cleanup_intent_members",
+            }
+
+
+def test_valid_v2_local_removed_row_preserves_complete_audit_chain() -> None:
+    # Create a valid local-removed v2 row with a complete positive audit chain.
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "publications.sqlite3"
+        values: dict[str, object] = {name: None for name in _V2_COLUMN_NAMES}
+        values.update(
+            job_id="legacy-removed-valid", instance_url="https://legacy.example", recording_sha256=HASH,
+            media_device=1, media_inode=2, media_size=3, source_mtime_ns=4,
+            file_last_modified_ms=5, state="local_removed", operation="none", resume_intent="none",
+            remote_recording_id=7, attempt_count=0, next_attempt_at_ms=0, lease_generation=0,
+            transfer_started_at_ms=6, accepted_at_ms=7, published_at_ms=8, local_removed_at_ms=9,
+            created_at_ms=1, updated_at_ms=9,
+        )
+        with sqlite3.connect(path) as connection:
+            connection.execute(_expected_v2_publication_sql())
+            connection.execute(
+                f"INSERT INTO publications ({', '.join(_V2_COLUMN_NAMES)}) VALUES ({', '.join('?' for _ in _V2_COLUMN_NAMES)})",
+                tuple(values[name] for name in _V2_COLUMN_NAMES),
+            )
+            connection.execute("PRAGMA user_version = 2")
+        os.chmod(path, 0o600)
+
+        # Migrate the row without dropping its public audit history.
+        migrated = PublicationStore(path, clock=lambda: 1_000)
+
+        # Preserve the audit timestamps and local-removed state through the rebuild.
+        row = migrated.get("legacy-removed-valid")
+        assert row is not None
+        assert row.state is PublicationState.LOCAL_REMOVED
+        assert row.private_path is None and row.remote_recording_id == 7
+        assert row.transfer_started_at_ms == 6 and row.accepted_at_ms == 7
+        assert row.published_at_ms == 8 and row.local_removed_at_ms == 9
+
+
+def test_v3_cleanup_table_and_index_tampering_is_rejected_without_writes() -> None:
+    # Check each protected cleanup table and index against a tampered definition.
+    tampering = (
+        ("cleanup_intents", "CHECK(length(intent_id) BETWEEN 1 AND 128)", "CHECK(length(intent_id) BETWEEN 1 AND 127)"),
+        ("cleanup_intent_members", "UNIQUE(job_id)", "UNIQUE(job_id, intent_id)"),
+        ("idx_cleanup_intents_phase", "(phase, updated_at_ms, intent_id)", "(phase)"),
+        ("idx_cleanup_members_job", "(job_id, intent_id)", "(job_id)"),
+    )
+    for object_name, original, replacement in tampering:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "publications.sqlite3"
+            # Create the valid schema before changing one protected object.
+            PublicationStore(path, clock=lambda: 1_000)
+            with sqlite3.connect(path) as connection:
+                connection.execute("PRAGMA writable_schema = ON")
+                connection.execute(
+                    "UPDATE sqlite_master SET sql = replace(sql, ?, ?) WHERE name = ?",
+                    (original, replacement, object_name),
+                )
+                connection.execute("PRAGMA writable_schema = OFF")
+            before = path.read_bytes()
+
+            # Reject tampering before repair or index creation can write anything.
+            _raises(PublicationStore, path)
+
+            # Schema validation must fail before any repair or index creation changes the file.
+            assert path.read_bytes() == before
 
 
 def test_create_reuse_keeps_job_id_and_normalized_url_sha_identity() -> None:
@@ -378,7 +526,9 @@ def test_future_local_removed_rows_remain_readable_without_cleanup_transition() 
             # Model the structurally valid row that the cleanup issue will write later.
             connection.execute(
                 "UPDATE publications SET state = 'local_removed', operation = 'none', "
-                "resume_intent = 'none', private_path = NULL, local_removed_at_ms = 1001 "
+                "resume_intent = 'none', remote_recording_id = 1, private_path = NULL, "
+                "transfer_started_at_ms = 800, accepted_at_ms = 900, published_at_ms = 1000, "
+                "next_attempt_at_ms = 0, local_removed_at_ms = 1001 "
                 "WHERE instance_url = ? AND recording_sha256 = ?",
                 (key.instance_url, key.recording_sha256),
             )
@@ -538,3 +688,210 @@ def test_security_rejects_database_and_directory_symlinks() -> None:
         target.touch(mode=0o600)
         os.symlink(target, state / "publications.sqlite3")
         _raises(PublicationStore, state / "publications.sqlite3")
+
+
+def test_cleanup_intent_claim_renew_release_and_complete_preserves_public_audit() -> None:
+    # Publish one recording before preparing its durable cleanup intent.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        key = _key()
+        store.create_or_reuse(key, b"/private/published")
+        claimed = store.claim_one("publisher", key, now_ms=1_000)
+        assert claimed is not None
+
+        # Complete the publication audit chain before creating cleanup state.
+        store.transition(key, PublicationState.TRANSFERRING, owner="publisher", generation=claimed.lease_generation, now_ms=1_000)
+        store.transition(key, PublicationState.METADATA_PENDING, owner="publisher", generation=claimed.lease_generation, remote_recording_id=7, now_ms=1_001)
+        published = store.transition(key, PublicationState.PUBLISHED, remote_recording_id=7, now_ms=1_002)
+        intent = CleanupIntent("cleanup-1", b"/private/published", HASH, 1, 2, 3, 4, created_at_ms=1_003, updated_at_ms=1_003)
+
+        # Prepare, claim, renew, and advance the intent through every phase.
+        prepared = store.prepare_cleanup_intent(intent)
+        assert prepared.phase is CleanupPhase.PREPARED
+        assert prepared.claimed_job_ids == (published.job_id,)
+        assert prepared.claimed_lease_generations == (0,)
+        active = store.claim_cleanup_group("cleanup-1", "cleaner", 100, now_ms=1_004)
+        assert active.lease_generations == (1,)
+        store.renew_cleanup_group("cleanup-1", active, 100, now_ms=1_005)
+        for expected, next_phase in zip(CleanupPhase, tuple(CleanupPhase)[1:]):
+            store.advance_cleanup_intent("cleanup-1", active, expected, next_phase, now_ms=1_006)
+        completed = store.complete_cleanup_group("cleanup-1", active, removed_at_ms=1_010)
+
+        # Completion must preserve the remote publication audit while removing the path.
+        assert completed[0].state is PublicationState.LOCAL_REMOVED
+        assert completed[0].private_path is None
+        assert completed[0].remote_recording_id == published.remote_recording_id
+        assert completed[0].published_at_ms == published.published_at_ms
+
+
+def test_cleanup_claim_conflicts_with_publication_claim_and_stale_completion() -> None:
+    # A queued publication cannot be prepared for cleanup.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        key = _key()
+        store.create_or_reuse(key, b"/private/queued")
+
+        # A queued row cannot satisfy the published cleanup precondition.
+        intent = CleanupIntent("cleanup-2", b"/private/queued", HASH, 1, 2, 3, 4, created_at_ms=1_000, updated_at_ms=1_000)
+        _raises(store.prepare_cleanup_intent, intent)
+
+
+def test_cleanup_candidate_keyset_and_exact_path_group_discovery_are_distinct() -> None:
+    # Seed published and queued rows with distinct paths and stable ordering.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        _published(store, _key("https://candidate.example"), b"/private/one", job_id="candidate-1")
+        _published(store, _key("https://candidate.example", "b" * 64), b"/private/two", job_id="candidate-2")
+        store.create_or_reuse(_key("https://candidate.example", "c" * 64), b"/private/queued", job_id="candidate-3")
+
+        # Candidate pagination follows the indexed creation and job order.
+        first = store.list_cleanup_candidates(limit=1)
+        assert [job.job_id for job in first] == ["candidate-1"]
+        second = store.list_cleanup_candidates(
+            after_created_at_ms=first[0].created_at_ms, after_job_id=first[0].job_id, limit=10,
+        )
+        assert [job.job_id for job in second] == ["candidate-2"]
+        # Exact-path lookup is independent from candidate pagination.
+        exact = store.list_cleanup_group(b"/private/queued")
+        assert [job.job_id for job in exact] == ["candidate-3"]
+
+
+def test_cleanup_exact_path_sibling_blocks_preparation_and_claim() -> None:
+    # A sibling publication at the same private path must block preparation.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        published = _published(store, _key(), b"/private/shared", job_id="published-shared")
+        store.create_or_reuse(_key("https://other.example"), b"/private/shared", job_id="queued-shared")
+
+        # The sibling row must block cleanup preparation for the shared path.
+        intent = CleanupIntent("cleanup-sibling", b"/private/shared", HASH, 1, 2, 3, 4, created_at_ms=1_003, updated_at_ms=1_003)
+        _raises(store.prepare_cleanup_intent, intent, (published.job_id,))
+
+
+def test_cleanup_exact_path_group_over_limit_fails_closed() -> None:
+    # Build more members than the bounded exact-path group limit permits.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        path = b"/private/oversized"
+        jobs = [
+            store.create_or_reuse(_key("https://over.example", f"{index:064x}"), path, job_id=f"over-{index}")
+            for index in range(101)
+        ]
+
+        # Both listing and preparation must fail closed at the limit.
+        _raises(store.list_cleanup_group, path)
+        intent = CleanupIntent("cleanup-over", path, HASH, 1, 2, 3, 4, created_at_ms=1_000, updated_at_ms=1_000)
+        _raises(store.prepare_cleanup_intent, intent, (jobs[0].job_id,))
+
+
+def test_cleanup_journal_is_one_step_fenced_and_abort_is_pre_mutation_only() -> None:
+    # Verify phase fencing and pre-mutation abort behavior for one intent.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        published = _published(store, _key(), b"/private/journal", job_id="journal-job")
+        intent = CleanupIntent("cleanup-journal", b"/private/journal", HASH, 1, 2, 3, 4, created_at_ms=1_003, updated_at_ms=1_003)
+
+        # Mutate the journal once, then reject stale or skipped operations.
+        store.prepare_cleanup_intent(intent)
+        journal_claim = store.claim_cleanup_group("cleanup-journal", "cleaner", 1_000, now_ms=1_004)
+        # Reject skipped phases and release or abort attempts after mutation begins.
+        _raises(store.complete_cleanup_group, "cleanup-journal", journal_claim, removed_at_ms=1_005)
+        _raises(store.advance_cleanup_intent, "cleanup-journal", journal_claim, CleanupPhase.PREPARED, CleanupPhase.MEDIA_QUARANTINED, now_ms=1_005)
+        store.advance_cleanup_intent("cleanup-journal", journal_claim, CleanupPhase.PREPARED, CleanupPhase.SIDECAR_QUARANTINED, now_ms=1_005)
+        _raises(store.release_cleanup_group, "cleanup-journal", journal_claim, now_ms=1_006)
+        _raises(store.abort_cleanup_intent, "cleanup-journal", journal_claim, now_ms=1_006)
+        # The mutated claim remains active and fenced to its owner.
+        active = store.get(published.job_id)
+        assert active is not None and active.cleanup_lease_owner == "cleaner"
+
+        # A separately prepared, untouched intent may still be aborted safely.
+        _published(store, _key("https://abort.example"), b"/private/abort", job_id="abort-job")
+        prepared = CleanupIntent("cleanup-abort", b"/private/abort", HASH, 1, 2, 3, 4, created_at_ms=1_007, updated_at_ms=1_007)
+        store.prepare_cleanup_intent(prepared)
+        abort_claim = store.claim_cleanup_group("cleanup-abort", "cleaner", 1_000, now_ms=1_008)
+        store.abort_cleanup_intent("cleanup-abort", abort_claim, now_ms=1_009)
+        _raises(store.load_cleanup_intent, "cleanup-abort")
+
+
+def test_cleanup_expired_reclaim_preserves_phase_and_membership() -> None:
+    # Reclaim an expired cleanup lease without changing its durable phase.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        _published(store, _key(), b"/private/reclaim", job_id="reclaim-job")
+        intent = CleanupIntent("cleanup-reclaim", b"/private/reclaim", HASH, 1, 2, 3, 4, created_at_ms=1_003, updated_at_ms=1_003)
+
+        # Advance one phase before allowing the first lease to expire.
+        store.prepare_cleanup_intent(intent)
+        first_claim = store.claim_cleanup_group("cleanup-reclaim", "first", 10, now_ms=1_004)
+        store.advance_cleanup_intent("cleanup-reclaim", first_claim, CleanupPhase.PREPARED, CleanupPhase.SIDECAR_QUARANTINED, now_ms=1_005)
+        # A new owner receives a new generation and the same member set.
+        reclaimed = store.claim_cleanup_group("cleanup-reclaim", "second", 100, now_ms=1_014)
+        assert reclaimed.owner == "second"
+        loaded = store.load_cleanup_intent("cleanup-reclaim")
+        assert loaded.phase is CleanupPhase.SIDECAR_QUARANTINED
+        assert loaded.claimed_job_ids == ("reclaim-job",)
+        assert loaded.claimed_lease_generations == (2,)
+
+
+def test_reclaimed_cleanup_token_cannot_mutate_with_newer_generation() -> None:
+    # Fence every stale operation after an intent lease is reclaimed.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        _published(store, _key(), b"/private/token", job_id="token-job")
+        intent = CleanupIntent("cleanup-token", b"/private/token", HASH, 1, 2, 3, 4, created_at_ms=1_003, updated_at_ms=1_003)
+
+        # Replace the first owner so every stale operation uses an old fence.
+        store.prepare_cleanup_intent(intent)
+        old_claim = store.claim_cleanup_group("cleanup-token", "old-owner", 10, now_ms=1_004)
+        new_claim = store.claim_cleanup_group("cleanup-token", "new-owner", 100, now_ms=1_014)
+        # The old claim must fail renewal, phase changes, completion, release, and abort.
+        for operation in (
+            lambda: store.renew_cleanup_group("cleanup-token", old_claim, 100, now_ms=1_015),
+            lambda: store.advance_cleanup_intent("cleanup-token", old_claim, CleanupPhase.PREPARED, CleanupPhase.SIDECAR_QUARANTINED, now_ms=1_015),
+            lambda: store.complete_cleanup_group("cleanup-token", old_claim, removed_at_ms=1_015),
+            lambda: store.release_cleanup_group("cleanup-token", old_claim, now_ms=1_015),
+            lambda: store.abort_cleanup_intent("cleanup-token", old_claim, now_ms=1_015),
+        ):
+            _raises(operation)
+        assert new_claim.owner == "new-owner"
+
+
+def test_cleanup_lease_fences_path_updates_and_forget() -> None:
+    # Hold a cleanup lease while testing rename and forget fencing.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        identity = MediaIdentity(Path("/private/fenced"), 0, 0, 0, 0)
+        key = _key()
+        _published(store, key, b"/private/fenced", job_id="fenced-job")
+        intent = CleanupIntent("cleanup-fence", b"/private/fenced", HASH, 1, 2, 3, 4, created_at_ms=1_003, updated_at_ms=1_003)
+
+        # Claim the path before checking rename and forget fencing.
+        store.prepare_cleanup_intent(intent)
+        store.claim_cleanup_group("cleanup-fence", "cleaner", 100, now_ms=1_004)
+        # Leased rows must reject path updates and forgetting.
+        assert store.update_path(b"/private/fenced", b"/private/new", identity) == 0
+        _raises(store.forget, key)
+
+
+def test_local_removed_sql_constraint_requires_ordered_publication_audit() -> None:
+    # Exercise each invalid ordering rejected by the local-removed SQL constraint.
+    with TemporaryDirectory() as directory:
+        store = _store(directory)
+        key = _key()
+        job = store.create_or_reuse(key, b"/private/sql")
+        with sqlite3.connect(store.database_path) as connection:
+
+            # Every malformed audit tuple must fail without relaxing the constraint.
+            for values in (
+                (None, 800, 900, 1_000, 1_001),
+                (1, 900, 800, 1_000, 1_001),
+                (1, 800, 900, 1_000, 999),
+            ):
+                _raises(
+                    connection.execute,
+                    "UPDATE publications SET state = 'local_removed', operation = 'none', resume_intent = 'none', "
+                    "remote_recording_id = ?, private_path = NULL, next_attempt_at_ms = 0, "
+                    "transfer_started_at_ms = ?, accepted_at_ms = ?, published_at_ms = ?, local_removed_at_ms = ? "
+                    "WHERE job_id = ?",
+                    (*values, job.job_id),
+                )

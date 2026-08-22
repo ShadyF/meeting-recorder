@@ -15,7 +15,7 @@ from typing import Callable, Iterator, List, Sequence
 from uuid import uuid4
 
 from .speakr_domain import (
-    MediaIdentity, PublicationJob, PublicationKey, PublicationOperation,
+    CleanupClaim, CleanupIntent, CleanupPhase, MediaIdentity, PublicationJob, PublicationKey, PublicationOperation,
     PublicationResult, PublicationState, ResumeIntent, _SAFE_ERROR_CODES,
     normalize_speakr_url,
 )
@@ -37,7 +37,7 @@ class PublicationStoreSecurityError(PublicationStoreError, ValueError):
     """A state-store path or file does not meet the private-file contract."""
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _DATABASE_NAME = "publications.sqlite3"
 _PRIVATE_DIR_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
@@ -46,6 +46,15 @@ _SAFE_OWNER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ALLOWED_ERROR_CODES = _SAFE_ERROR_CODES
 _DEFAULT_LEASE_MS = 60_000
 _MAX_DUE_IDS = 1_000
+_MAX_CLEANUP_GROUP = 100
+_MAX_CLEANUP_INTENTS = 100
+_CLEANUP_PHASE_ORDER = (
+    CleanupPhase.PREPARED,
+    CleanupPhase.SIDECAR_QUARANTINED,
+    CleanupPhase.MEDIA_QUARANTINED,
+    CleanupPhase.SIDECAR_UNLINKED,
+    CleanupPhase.MEDIA_UNLINKED,
+)
 
 _INDEX_DEFINITIONS = (
     (
@@ -60,6 +69,19 @@ _INDEX_DEFINITIONS = (
         "idx_publications_private_media_identity",
         ("private_path", "media_device", "media_inode", "media_size", "source_mtime_ns", "lease_owner", "job_id"),
     ),
+    (
+        "idx_publications_cleanup_path",
+        ("private_path", "state", "cleanup_lease_owner", "job_id"),
+    ),
+    (
+        "idx_publications_cleanup_candidates",
+        ("state", "private_path", "created_at_ms", "job_id"),
+    ),
+)
+
+_CLEANUP_INDEX_DEFINITIONS = (
+    ("idx_cleanup_intents_phase", ("phase", "updated_at_ms", "intent_id")),
+    ("idx_cleanup_members_job", ("job_id", "intent_id")),
 )
 
 _COLUMN_NAMES = (
@@ -70,17 +92,19 @@ _COLUMN_NAMES = (
     "lease_generation", "lease_expires_at_ms", "last_error_code", "last_http_status",
     "transfer_started_at_ms", "accepted_at_ms", "published_at_ms", "uncertain_at_ms",
     "blocked_at_ms", "missing_at_ms", "local_removed_at_ms", "created_at_ms", "updated_at_ms",
+    "cleanup_lease_owner", "cleanup_lease_generation", "cleanup_lease_expires_at_ms",
 )
+_V2_COLUMN_NAMES = _COLUMN_NAMES[:-3]
 _SELECT_COLUMNS = ", ".join(_COLUMN_NAMES)
 
 
-def _schema_sql() -> str:
+def _schema_sql(table_name: str = "publications") -> str:
     states = ", ".join(f"'{state.value}'" for state in PublicationState)
     operations = ", ".join(f"'{operation.value}'" for operation in PublicationOperation)
     intents = ", ".join(f"'{intent.value}'" for intent in ResumeIntent)
     errors = ", ".join(f"'{code}'" for code in sorted(_ALLOWED_ERROR_CODES))
     return f"""
-        CREATE TABLE publications (
+        CREATE TABLE {table_name} (
             job_id TEXT PRIMARY KEY,
             instance_url TEXT NOT NULL,
             recording_sha256 TEXT NOT NULL,
@@ -111,10 +135,16 @@ def _schema_sql() -> str:
             local_removed_at_ms INTEGER CHECK(local_removed_at_ms IS NULL OR local_removed_at_ms >= 0),
             created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
             updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+            cleanup_lease_owner TEXT,
+            cleanup_lease_generation INTEGER NOT NULL CHECK(cleanup_lease_generation >= 0),
+            cleanup_lease_expires_at_ms INTEGER CHECK(cleanup_lease_expires_at_ms IS NULL OR cleanup_lease_expires_at_ms >= 0),
             UNIQUE (instance_url, recording_sha256),
             CHECK(length(recording_sha256) = 64 AND recording_sha256 NOT GLOB '*[^0-9a-f]*'),
             CHECK((lease_owner IS NULL AND lease_expires_at_ms IS NULL)
                 OR (lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL)),
+            CHECK((cleanup_lease_owner IS NULL AND cleanup_lease_expires_at_ms IS NULL)
+                OR (cleanup_lease_owner IS NOT NULL AND cleanup_lease_expires_at_ms IS NOT NULL
+                    AND state = 'published')),
             CHECK(private_path IS NOT NULL OR state IN ('missing', 'local_removed')),
             CHECK(
                 (state = 'queued' AND remote_recording_id IS NULL AND operation = 'post'
@@ -140,10 +170,93 @@ def _schema_sql() -> str:
                         OR (resume_intent = 'patch' AND remote_recording_id > 0)
                         OR resume_intent = 'none'))
                 OR
-                (state = 'local_removed' AND operation = 'none' AND resume_intent = 'none')
+                (state = 'local_removed' AND operation = 'none' AND resume_intent = 'none'
+                    AND private_path IS NULL AND reconciliation_token IS NULL
+                    AND lease_owner IS NULL AND lease_expires_at_ms IS NULL
+                    AND cleanup_lease_owner IS NULL AND cleanup_lease_expires_at_ms IS NULL
+                    AND cleanup_lease_generation = 0 AND next_attempt_at_ms = 0
+                    AND last_error_code IS NULL AND last_http_status IS NULL
+                    AND remote_recording_id IS NOT NULL AND remote_recording_id > 0
+                    AND transfer_started_at_ms IS NOT NULL AND accepted_at_ms IS NOT NULL
+                    AND published_at_ms IS NOT NULL AND local_removed_at_ms IS NOT NULL
+                    AND transfer_started_at_ms <= accepted_at_ms
+                    AND accepted_at_ms <= published_at_ms
+                    AND published_at_ms <= local_removed_at_ms)
             )
+        ) STRICT, WITHOUT ROWID;
+
+        CREATE TABLE cleanup_intents (
+            intent_id TEXT PRIMARY KEY CHECK(length(intent_id) BETWEEN 1 AND 128),
+            expected_private_path BLOB NOT NULL CHECK(length(expected_private_path) BETWEEN 1 AND 4096
+                AND substr(expected_private_path, 1, 1) = X'2F'),
+            expected_recording_sha256 TEXT NOT NULL CHECK(length(expected_recording_sha256) = 64
+                AND expected_recording_sha256 NOT GLOB '*[^0-9a-f]*'),
+            media_device INTEGER NOT NULL CHECK(media_device >= 0),
+            media_inode INTEGER NOT NULL CHECK(media_inode >= 0),
+            media_size INTEGER NOT NULL CHECK(media_size >= 0),
+            media_mtime_ns INTEGER NOT NULL CHECK(media_mtime_ns >= 0),
+            sidecar_device INTEGER CHECK(sidecar_device IS NULL OR sidecar_device >= 0),
+            sidecar_inode INTEGER CHECK(sidecar_inode IS NULL OR sidecar_inode >= 0),
+            sidecar_size INTEGER CHECK(sidecar_size IS NULL OR sidecar_size >= 0),
+            sidecar_mtime_ns INTEGER CHECK(sidecar_mtime_ns IS NULL OR sidecar_mtime_ns >= 0),
+            quarantine_media_basename TEXT NOT NULL CHECK(length(quarantine_media_basename) BETWEEN 1 AND 255),
+            quarantine_sidecar_basename TEXT CHECK(quarantine_sidecar_basename IS NULL
+                OR length(quarantine_sidecar_basename) BETWEEN 1 AND 255),
+            phase TEXT NOT NULL CHECK(phase IN ('prepared', 'sidecar_quarantined', 'media_quarantined', 'sidecar_unlinked', 'media_unlinked')),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+            media_nlink INTEGER NOT NULL CHECK(media_nlink = 1),
+            sidecar_nlink INTEGER CHECK(sidecar_nlink IS NULL OR sidecar_nlink = 1),
+            CHECK((sidecar_device IS NULL AND sidecar_inode IS NULL AND sidecar_size IS NULL AND sidecar_mtime_ns IS NULL)
+                OR (sidecar_device IS NOT NULL AND sidecar_inode IS NOT NULL AND sidecar_size IS NOT NULL AND sidecar_mtime_ns IS NOT NULL
+                    AND sidecar_nlink = 1)),
+            CHECK(quarantine_sidecar_basename IS NULL OR quarantine_sidecar_basename != quarantine_media_basename)
+        ) STRICT, WITHOUT ROWID;
+
+        CREATE TABLE cleanup_intent_members (
+            intent_id TEXT NOT NULL REFERENCES cleanup_intents(intent_id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL REFERENCES publications(job_id) ON DELETE RESTRICT,
+            lease_generation INTEGER NOT NULL CHECK(lease_generation >= 0),
+            PRIMARY KEY(intent_id, job_id),
+            UNIQUE(job_id)
         ) STRICT, WITHOUT ROWID
     """
+
+
+def _normalized_sql(value: str) -> str:
+    """Normalize only harmless SQL whitespace for exact schema-definition comparison."""
+    return re.sub(r"\s+", " ", value).strip().rstrip(";").casefold()
+
+
+def _table_statement(schema: str, table_name: str) -> str:
+    """Extract one generated CREATE TABLE statement for schema validation."""
+    for statement in schema.split(";"):
+        if re.search(rf"\bCREATE TABLE {re.escape(table_name)}\b", statement, re.IGNORECASE):
+            return statement
+    raise PublicationMigrationError(f"generated schema is missing table {table_name}")
+
+
+def _expected_v2_publication_sql() -> str:
+    """Derive the unchanged v2 publication definition without weakening its SQL checks."""
+    statement = _table_statement(_schema_sql(), "publications")
+    statement = re.sub(
+        r"\s+cleanup_lease_owner TEXT,\s+cleanup_lease_generation INTEGER NOT NULL CHECK\(cleanup_lease_generation >= 0\),\s+cleanup_lease_expires_at_ms INTEGER CHECK\(cleanup_lease_expires_at_ms IS NULL OR cleanup_lease_expires_at_ms >= 0\),",
+        "",
+        statement,
+    )
+    statement = re.sub(
+        r"\s+CHECK\(\(cleanup_lease_owner IS NULL AND cleanup_lease_expires_at_ms IS NULL\)\s+OR \(cleanup_lease_owner IS NOT NULL AND cleanup_lease_expires_at_ms IS NOT NULL\s+AND state = 'published'\)\),",
+        "",
+        statement,
+    )
+    statement = re.sub(
+        r"\s+\(state = 'local_removed'.*?published_at_ms <= local_removed_at_ms\)",
+        "\n                (state = 'local_removed' AND operation = 'none' AND resume_intent = 'none')",
+        statement,
+        count=1,
+        flags=re.DOTALL,
+    )
+    return statement
 
 
 def _now_ms() -> int:
@@ -317,6 +430,10 @@ class PublicationStore:
     def _time_ms(self) -> int:
         return _validate_nonnegative_int(self._clock(), "publication clock")
 
+    def current_time_ms(self) -> int:
+        """Return the store's injected durable clock for coordinated journal timestamps."""
+        return self._time_ms()
+
     def _connect(self) -> sqlite3.Connection:
         _verify_private_parent(self.state_directory)
         descriptor = -1
@@ -351,7 +468,7 @@ class PublicationStore:
                     pass
 
     def migrate(self) -> None:
-        """Create only a fresh v2 database; v1 and every other schema are rejected."""
+        """Create v3 or perform the one supported v2-to-v3 migration."""
         connection = self._connect()
         created_schema = False
         try:
@@ -361,16 +478,28 @@ class PublicationStore:
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
             if version == 0 and not tables:
-                connection.execute(_schema_sql())
+                for statement in _schema_sql().split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 self._ensure_indexes(connection)
                 created_schema = True
+            elif version == 2:
+                self._validate_schema(connection, tables, expected_version=2)
+                try:
+                    self._migrate_v2_to_v3(connection)
+                except PublicationMigrationError:
+                    raise
+                except Exception as exc:
+                    raise PublicationMigrationError("v2 publication rows failed the v3 audit invariants") from exc
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                self._ensure_indexes(connection)
             elif version != _SCHEMA_VERSION:
                 raise PublicationMigrationError(
-                    f"publication database schema version {version} is unsupported; expected v2"
+                    f"publication database schema version {version} is unsupported; expected v3"
                 )
             else:
-                self._validate_schema(connection, tables)
+                self._validate_schema(connection, tables, expected_version=3)
                 self._ensure_indexes(connection)
             connection.commit()
         except Exception:
@@ -386,27 +515,75 @@ class PublicationStore:
             self._database_created_and_unsynced = False
 
     @staticmethod
-    def _validate_schema(connection: sqlite3.Connection, tables: Sequence[tuple[str]]) -> None:
-        if tuple(name for (name,) in tables) != ("publications",):
-            raise PublicationMigrationError("publication database schema is not version two")
+    def _validate_schema(
+        connection: sqlite3.Connection,
+        tables: Sequence[tuple[str]],
+        *,
+        expected_version: int,
+    ) -> None:
+        expected_tables = (
+            (("publications",),) if expected_version == 2 else
+            (("cleanup_intent_members",), ("cleanup_intents",), ("publications",))
+        )
+        if tuple(sorted(tables)) != tuple(sorted(expected_tables)):
+            raise PublicationMigrationError("publication database tables are incompatible")
         columns = tuple(row[1] for row in connection.execute("PRAGMA table_info(publications)"))
-        if columns != _COLUMN_NAMES:
-            raise PublicationMigrationError("publication database columns are not version two")
+        expected_columns = _V2_COLUMN_NAMES if expected_version == 2 else _COLUMN_NAMES
+        if columns != expected_columns:
+            raise PublicationMigrationError("publication database columns are incompatible")
         table_list = connection.execute(
             "SELECT wr, strict FROM pragma_table_list WHERE name = 'publications'"
         ).fetchone()
         if table_list != (1, 1):
             raise PublicationMigrationError("publication table is not strict and without rowid")
-        sql = connection.execute(
+        expected_publication_sql = (
+            _expected_v2_publication_sql() if expected_version == 2 else _table_statement(_schema_sql(), "publications")
+        )
+        actual_publication_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'publications'"
         ).fetchone()
-        normalize = lambda value: re.sub(r"\s+", " ", value).strip().casefold()
-        if not sql or normalize(sql[0]) != normalize(_schema_sql()):
-            raise PublicationMigrationError("publication table definition is not version two")
+        if not actual_publication_sql or _normalized_sql(actual_publication_sql[0]) != _normalized_sql(expected_publication_sql):
+            raise PublicationMigrationError("publication table definition is incompatible")
+        if expected_version == 3:
+            for table_name in ("cleanup_intents", "cleanup_intent_members"):
+                table_list = connection.execute(
+                    "SELECT wr, strict FROM pragma_table_list WHERE name = ?", (table_name,)
+                ).fetchone()
+                if table_list != (1, 1):
+                    raise PublicationMigrationError("cleanup tables are not strict and without rowid")
+                actual_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
+                ).fetchone()
+                expected_sql = _table_statement(_schema_sql(), table_name)
+                if not actual_sql or _normalized_sql(actual_sql[0]) != _normalized_sql(expected_sql):
+                    raise PublicationMigrationError(f"{table_name} definition is incompatible")
+
+    @staticmethod
+    def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+        # Rebuild the single publication table so v3 constraints apply atomically to preserved rows.
+        publication_schema = _schema_sql("publications_v3")
+        cleanup_start = publication_schema.index("CREATE TABLE cleanup_intents")
+        connection.execute(publication_schema[:cleanup_start])
+        old_columns = ", ".join(_V2_COLUMN_NAMES)
+        new_columns = ", ".join(_V2_COLUMN_NAMES + (
+            "cleanup_lease_owner", "cleanup_lease_generation", "cleanup_lease_expires_at_ms",
+        ))
+        connection.execute(
+            f"INSERT INTO publications_v3 ({new_columns}) SELECT {old_columns}, NULL, 0, NULL FROM publications"
+        )
+        connection.execute("DROP TABLE publications")
+        connection.execute("ALTER TABLE publications_v3 RENAME TO publications")
+
+        # Add the cleanup tables only after every publication row has been copied successfully.
+        schema = _schema_sql()
+        cleanup_sql = schema[schema.index("CREATE TABLE cleanup_intents"):]
+        for statement in cleanup_sql.split(";"):
+            if statement.strip():
+                connection.execute(statement)
 
     @staticmethod
     def _ensure_indexes(connection: sqlite3.Connection) -> None:
-        """Create and validate the bounded-query indexes without changing v2."""
+        """Create and validate the bounded-query indexes without changing rows."""
         for name, columns in _INDEX_DEFINITIONS:
             expected_sql = f"CREATE INDEX {name} ON publications ({', '.join(columns)})"
             index = connection.execute(
@@ -428,6 +605,20 @@ class PublicationStore:
                 detail is None or detail[2] != 0 or actual_columns != columns
                 or normalize(index[0]) != normalize(expected_sql)
             ):
+                raise PublicationMigrationError(f"publication index {name} is invalid")
+        for name, columns in _CLEANUP_INDEX_DEFINITIONS:
+            table = "cleanup_intents" if name == "idx_cleanup_intents_phase" else "cleanup_intent_members"
+            expected_sql = f"CREATE INDEX {name} ON {table} ({', '.join(columns)})"
+            index = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (name,)
+            ).fetchone()
+            if index is None:
+                connection.execute(expected_sql)
+                continue
+            actual_columns = tuple(
+                row[2] for row in connection.execute(f"PRAGMA index_info({name})")
+            )
+            if actual_columns != columns or _normalized_sql(index[0]) != _normalized_sql(expected_sql):
                 raise PublicationMigrationError(f"publication index {name} is invalid")
 
     @staticmethod
@@ -454,6 +645,9 @@ class PublicationStore:
                 uncertain_at_ms=values["uncertain_at_ms"], blocked_at_ms=values["blocked_at_ms"],
                 missing_at_ms=values["missing_at_ms"], local_removed_at_ms=values["local_removed_at_ms"],
                 created_at_ms=values["created_at_ms"], updated_at_ms=values["updated_at_ms"],
+                cleanup_lease_owner=values["cleanup_lease_owner"],
+                cleanup_lease_generation=values["cleanup_lease_generation"],
+                cleanup_lease_expires_at_ms=values["cleanup_lease_expires_at_ms"],
             )
         except (TypeError, ValueError, KeyError, OverflowError) as exc:
             raise PublicationStoreError("publication row failed public validation") from exc
@@ -535,17 +729,471 @@ class PublicationStore:
             connection.close()
 
     @staticmethod
+    def _cleanup_intent_row(connection: sqlite3.Connection, intent_id: str) -> CleanupIntent:
+        row = connection.execute(
+            "SELECT intent_id, expected_private_path, expected_recording_sha256, media_device, media_inode, "
+            "media_size, media_mtime_ns, sidecar_device, sidecar_inode, sidecar_size, sidecar_mtime_ns, "
+            "quarantine_media_basename, quarantine_sidecar_basename, phase, created_at_ms, updated_at_ms "
+            ", media_nlink, sidecar_nlink "
+            "FROM cleanup_intents WHERE intent_id = ?", (intent_id,),
+        ).fetchone()
+        if row is None:
+            raise PublicationStoreError("cleanup intent does not exist")
+        members = connection.execute(
+            "SELECT job_id, lease_generation FROM cleanup_intent_members "
+            "WHERE intent_id = ? ORDER BY job_id", (intent_id,),
+        ).fetchall()
+        return CleanupIntent(
+            *row[:13],
+            phase=CleanupPhase(row[13]), created_at_ms=row[14], updated_at_ms=row[15],
+            claimed_job_ids=tuple(member[0] for member in members),
+            claimed_lease_generations=tuple(member[1] for member in members),
+            media_nlink=row[16], sidecar_nlink=row[17],
+        )
+
+    @staticmethod
+    def _exact_cleanup_member_ids(connection: sqlite3.Connection, path: bytes) -> tuple[str, ...]:
+        # Read one extra row so an oversized same-path group fails closed.
+        rows = connection.execute(
+            "SELECT job_id FROM publications WHERE private_path = ? ORDER BY job_id LIMIT ?",
+            (path, _MAX_CLEANUP_GROUP + 1),
+        ).fetchall()
+        if len(rows) > _MAX_CLEANUP_GROUP:
+            raise PublicationTransitionError("cleanup path group exceeds the bounded limit")
+        return tuple(row[0] for row in rows)
+
+    def list_cleanup_candidates(
+        self,
+        *,
+        after_created_at_ms: int | None = None,
+        after_job_id: str | None = None,
+        limit: int = _MAX_CLEANUP_GROUP,
+    ) -> list[PublicationJob]:
+        """Enumerate published rows with private paths using a stable keyset page."""
+        # Validate the page size and require both cursor fields together.
+        if type(limit) is not int or not 1 <= limit <= _MAX_CLEANUP_GROUP:
+            raise ValueError("cleanup candidate limit is invalid")
+        if (after_created_at_ms is None) != (after_job_id is None):
+            raise ValueError("cleanup candidate cursor is incomplete")
+
+        # Open one connection and build the stable cursor parameters.
+        connection = self._connect()
+        try:
+            params: tuple[object, ...]
+            cursor_sql = ""
+            if after_created_at_ms is not None and after_job_id is not None:
+                after_created_at_ms = _validate_nonnegative_int(after_created_at_ms, "cleanup candidate cursor")
+                if not isinstance(after_job_id, str):
+                    raise ValueError("cleanup candidate cursor is invalid")
+                cursor_sql = "AND (created_at_ms > ? OR (created_at_ms = ? AND job_id > ?)) "
+                params = (after_created_at_ms, after_created_at_ms, after_job_id, limit)
+            else:
+                params = (limit,)
+
+            # Select only published rows with private paths in deterministic key order.
+            rows = connection.execute(
+                f"SELECT {_SELECT_COLUMNS} FROM publications WHERE state = 'published' "
+                "AND private_path IS NOT NULL " + cursor_sql +
+                "ORDER BY created_at_ms, job_id LIMIT ?", params,
+            ).fetchall()
+
+            # Decode the bounded rows before closing the connection.
+            return [self._row_to_job(row) for row in rows]
+        finally:
+            connection.close()
+
+    def list_cleanup_group(
+        self,
+        expected_private_path: bytes | str | os.PathLike[str],
+        *,
+        limit: int = _MAX_CLEANUP_GROUP,
+    ) -> list[PublicationJob]:
+        """Return every row currently using one exact private path."""
+        # Validate the path and result bound before opening the database.
+        path = _path_bytes(expected_private_path)
+        if path is None or not path.startswith(b"/"):
+            raise ValueError("cleanup path must be absolute")
+        if type(limit) is not int or not 1 <= limit <= _MAX_CLEANUP_GROUP:
+            raise ValueError("cleanup group limit is invalid")
+
+        # Read the exact path group through one connection so its bound is consistent.
+        connection = self._connect()
+        try:
+            member_ids = self._exact_cleanup_member_ids(connection, path)
+            if len(member_ids) > limit:
+                raise self._transition_error("cleanup path group exceeds the requested limit")
+
+            # Decode the exact group while the connection still holds its snapshot.
+            return [self._job(connection, job_id) for job_id in member_ids]
+        finally:
+            connection.close()
+
+    def prepare_cleanup_intent(
+        self,
+        intent: CleanupIntent,
+        references: Sequence[PublicationKey | PublicationJob | str] | None = None,
+    ) -> CleanupIntent:
+        """Durably register one explicit cleanup intent and its exact current group."""
+        # Validate the intent phase and reference bound before entering the transaction.
+        if not isinstance(intent, CleanupIntent):
+            raise TypeError("cleanup intent is invalid")
+        if intent.phase is not CleanupPhase.PREPARED:
+            raise ValueError("new cleanup intents must be prepared")
+        refs = tuple(references) if references is not None else tuple(intent.claimed_job_ids)
+        if len(refs) > _MAX_CLEANUP_GROUP:
+            raise ValueError("cleanup group is too large")
+
+        def prepare(connection: sqlite3.Connection) -> CleanupIntent:
+            # Insert the protected intent before resolving its exact member set.
+            connection.execute(
+                "INSERT INTO cleanup_intents (intent_id, expected_private_path, expected_recording_sha256, "
+                "media_device, media_inode, media_size, media_mtime_ns, sidecar_device, sidecar_inode, "
+                "sidecar_size, sidecar_mtime_ns, quarantine_media_basename, quarantine_sidecar_basename, "
+                "phase, created_at_ms, updated_at_ms, media_nlink, sidecar_nlink) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (intent.intent_id, intent.expected_private_path, intent.expected_recording_sha256,
+                 intent.media_device, intent.media_inode, intent.media_size, intent.media_mtime_ns,
+                 intent.sidecar_device, intent.sidecar_inode, intent.sidecar_size, intent.sidecar_mtime_ns,
+                 intent.quarantine_media_basename, intent.quarantine_sidecar_basename,
+                 intent.phase.value, intent.created_at_ms, intent.updated_at_ms,
+                 intent.media_nlink, intent.sidecar_nlink),
+            )
+
+            # Derive members from the path when callers supplied no references.
+            selected_refs = refs
+            if references is None and not selected_refs:
+                # Derive an empty intent's members from its exact private path.
+                selected_refs = self._exact_cleanup_member_ids(connection, intent.expected_private_path)
+            if not selected_refs:
+                raise self._transition_error("cleanup intent has no matching private-path members")
+            proposed_ids_list: list[str] = []
+
+            # Resolve references before checking exact group coverage.
+            for reference in selected_refs:
+                row = self._fetch_ref(connection, reference)
+                if row is None:
+                    raise self._transition_error("cleanup member does not exist")
+                proposed_ids_list.append(self._row_to_job(row).job_id)
+            proposed_ids = tuple(sorted(proposed_ids_list))
+            exact_ids = self._exact_cleanup_member_ids(connection, intent.expected_private_path)
+            if proposed_ids != exact_ids:
+                raise self._transition_error("cleanup members do not cover the exact private-path group")
+            selected: list[str] = []
+
+            # Recheck publication state and install zero-generation members atomically.
+            for reference in selected_refs:
+                row = self._fetch_ref(connection, reference)
+                if row is None:
+                    raise self._transition_error("cleanup member does not exist")
+                job = self._row_to_job(row)
+                if (job.state is not PublicationState.PUBLISHED
+                        or job.private_path != intent.expected_private_path
+                        or job.key.recording_sha256 != intent.expected_recording_sha256
+                        or job.lease_owner is not None or job.cleanup_lease_owner is not None):
+                    raise self._transition_error("cleanup member no longer matches its intent")
+                connection.execute(
+                    "INSERT INTO cleanup_intent_members (intent_id, job_id, lease_generation) VALUES (?, ?, 0)",
+                    (intent.intent_id, job.job_id),
+                )
+                selected.append(job.job_id)
+            return self._cleanup_intent_row(connection, intent.intent_id)
+
+        return self._write(prepare)  # type: ignore[return-value]
+
+    def load_cleanup_intent(self, intent_id: str) -> CleanupIntent:
+        """Load one intent with only successfully claimed member generations."""
+        connection = self._connect()
+        try:
+            return self._cleanup_intent_row(connection, intent_id)
+        finally:
+            connection.close()
+
+    def list_cleanup_intents(
+        self, phase: CleanupPhase | None = None, *, limit: int = _MAX_CLEANUP_INTENTS,
+    ) -> list[CleanupIntent]:
+        """List bounded intents so an explicit cleanup command can resume after restart."""
+        if phase is not None and not isinstance(phase, CleanupPhase):
+            raise TypeError("cleanup phase is invalid")
+        if type(limit) is not int or not 1 <= limit <= _MAX_CLEANUP_INTENTS:
+            raise ValueError("cleanup intent limit is invalid")
+        # Read only bounded intent IDs before decoding each protected row.
+        connection = self._connect()
+        try:
+            if phase is None:
+                rows = connection.execute(
+                    "SELECT intent_id FROM cleanup_intents ORDER BY updated_at_ms, intent_id LIMIT ?", (limit,)
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT intent_id FROM cleanup_intents WHERE phase = ? "
+                    "ORDER BY updated_at_ms, intent_id LIMIT ?", (phase.value, limit)
+                ).fetchall()
+            return [self._cleanup_intent_row(connection, row[0]) for row in rows]
+        finally:
+            connection.close()
+
+    def claim_cleanup_group(
+        self, intent_id: str, owner: str, lease_ttl_ms: int, *, now_ms: int | None = None,
+    ) -> CleanupClaim:
+        """Claim the complete exact-path group without advancing its journal phase."""
+        validated_owner, _ = self._owner_generation(owner, 1)
+        if validated_owner is None or type(lease_ttl_ms) is not int or not 1 <= lease_ttl_ms <= 86_400_000:
+            raise ValueError("cleanup lease is invalid")
+        now = self._time_ms() if now_ms is None else _validate_nonnegative_int(now_ms, "cleanup clock")
+
+        def claim(connection: sqlite3.Connection) -> CleanupClaim:
+            # Recover stale claims by refusing a mixed or changed group rather than guessing.
+            intent = self._cleanup_intent_row(connection, intent_id)
+            if intent.phase not in _CLEANUP_PHASE_ORDER:
+                raise self._transition_error("cleanup intent is not claimable")
+            member_rows = connection.execute(
+                "SELECT job_id FROM cleanup_intent_members WHERE intent_id = ? ORDER BY job_id", (intent_id,)
+            ).fetchall()
+            if not member_rows:
+                raise self._transition_error("cleanup intent has no members")
+            exact_ids = self._exact_cleanup_member_ids(connection, intent.expected_private_path)
+            member_ids = tuple(row[0] for row in member_rows)
+            if member_ids != exact_ids:
+                raise self._transition_error("cleanup group membership changed")
+            jobs: list[PublicationJob] = []
+            # Validate every member before changing any lease generation.
+            for (job_id,) in member_rows:
+                row = self._fetch_id(connection, job_id)
+                if row is None:
+                    raise self._transition_error("cleanup member disappeared")
+                job = self._row_to_job(row)
+                if (job.state is not PublicationState.PUBLISHED or job.private_path != intent.expected_private_path
+                        or job.key.recording_sha256 != intent.expected_recording_sha256
+                        or job.lease_owner is not None
+                        or (job.cleanup_lease_owner is not None
+                            and (job.cleanup_lease_expires_at_ms or 0) > now)):
+                    raise self._transition_error("cleanup group is no longer claimable")
+                jobs.append(job)
+            # Fence the complete group with one owner and one new generation per job.
+            for job in jobs:
+                generation = job.cleanup_lease_generation + 1
+                connection.execute(
+                    "UPDATE publications SET cleanup_lease_owner = ?, cleanup_lease_generation = ?, "
+                    "cleanup_lease_expires_at_ms = ?, updated_at_ms = ? WHERE job_id = ?",
+                    (validated_owner, generation, now + lease_ttl_ms, max(now, job.created_at_ms), job.job_id),
+                )
+                connection.execute(
+                    "UPDATE cleanup_intent_members SET lease_generation = ? WHERE intent_id = ? AND job_id = ?",
+                    (generation, intent_id, job.job_id),
+                )
+            generations = tuple(job.cleanup_lease_generation + 1 for job in jobs)
+            return CleanupClaim(intent_id, validated_owner, member_ids, generations)
+
+        return self._write(claim)  # type: ignore[return-value]
+
+    def _cleanup_claim_jobs(
+        self,
+        connection: sqlite3.Connection,
+        intent: CleanupIntent,
+        claim: CleanupClaim,
+        now: int,
+    ) -> list[PublicationJob]:
+        # Compare the caller-held immutable fence with both durable membership and every job row.
+        if claim.intent_id != intent.intent_id or tuple(intent.claimed_job_ids) != claim.job_ids:
+            raise self._transition_error("cleanup claim membership is stale")
+        if tuple(intent.claimed_lease_generations) != claim.lease_generations:
+            raise self._transition_error("cleanup claim generation is stale")
+        if claim.job_ids != self._exact_cleanup_member_ids(connection, intent.expected_private_path):
+            raise self._transition_error("cleanup group membership changed")
+        jobs = [self._job(connection, job_id) for job_id in claim.job_ids]
+        # Confirm every durable fence before allowing a caller-owned mutation.
+        for job, generation in zip(jobs, claim.lease_generations):
+            if (
+                job.state is not PublicationState.PUBLISHED
+                or job.private_path != intent.expected_private_path
+                or job.key.recording_sha256 != intent.expected_recording_sha256
+                or job.lease_owner is not None
+                or job.cleanup_lease_owner != claim.owner
+                or job.cleanup_lease_generation != generation
+                or job.cleanup_lease_expires_at_ms is None
+                or job.cleanup_lease_expires_at_ms <= now
+            ):
+                raise self._transition_error("cleanup claim is stale")
+        return jobs
+
+    def advance_cleanup_intent(
+        self,
+        intent_id: str,
+        claim: CleanupClaim,
+        expected_phase: CleanupPhase,
+        next_phase: CleanupPhase,
+        *,
+        now_ms: int | None = None,
+    ) -> CleanupIntent:
+        """Record exactly one fenced namespace-mutation checkpoint."""
+        if not isinstance(claim, CleanupClaim) or not isinstance(expected_phase, CleanupPhase) or not isinstance(next_phase, CleanupPhase):
+            raise ValueError("cleanup claim or phase is invalid")
+        try:
+            is_next = _CLEANUP_PHASE_ORDER[_CLEANUP_PHASE_ORDER.index(expected_phase) + 1] is next_phase
+        except IndexError:
+            is_next = False
+        if not is_next:
+            raise ValueError("cleanup phase must advance by one step")
+        now = self._time_ms() if now_ms is None else _validate_nonnegative_int(now_ms, "cleanup clock")
+
+        def advance(connection: sqlite3.Connection) -> CleanupIntent:
+            # Require the complete exact-path group and every current cleanup fence before recording progress.
+            intent = self._cleanup_intent_row(connection, intent_id)
+            if intent.phase is not expected_phase:
+                raise self._transition_error("cleanup intent phase or claim is stale")
+            self._cleanup_claim_jobs(connection, intent, claim, now)
+            connection.execute(
+                "UPDATE cleanup_intents SET phase = ?, updated_at_ms = ? WHERE intent_id = ? AND phase = ?",
+                (next_phase.value, now, intent_id, expected_phase.value),
+            )
+            return self._cleanup_intent_row(connection, intent_id)
+
+        return self._write(advance)  # type: ignore[return-value]
+
+    def renew_cleanup_group(
+        self, intent_id: str, claim: CleanupClaim, lease_ttl_ms: int, *, now_ms: int | None = None,
+    ) -> CleanupClaim:
+        """Extend every cleanup lease only when the whole group fence is current."""
+        if not isinstance(claim, CleanupClaim) or type(lease_ttl_ms) is not int or not 1 <= lease_ttl_ms <= 86_400_000:
+            raise ValueError("cleanup lease is invalid")
+        now = self._time_ms() if now_ms is None else _validate_nonnegative_int(now_ms, "cleanup clock")
+
+        def renew(connection: sqlite3.Connection) -> CleanupClaim:
+            # Validate the current claim before extending any member lease.
+            intent = self._cleanup_intent_row(connection, intent_id)
+            if intent.phase not in _CLEANUP_PHASE_ORDER:
+                raise self._transition_error("cleanup intent is not actively claimed")
+            jobs = self._cleanup_claim_jobs(connection, intent, claim, now)
+            # Extend every member together so a group cannot become partially live.
+            for job in jobs:
+                connection.execute(
+                    "UPDATE publications SET cleanup_lease_expires_at_ms = ?, updated_at_ms = ? "
+                    "WHERE job_id = ? AND cleanup_lease_owner = ? AND cleanup_lease_generation = ?",
+                    (now + lease_ttl_ms, max(now, job.created_at_ms), job.job_id, claim.owner, job.cleanup_lease_generation),
+                )
+            connection.execute("UPDATE cleanup_intents SET updated_at_ms = ? WHERE intent_id = ?", (now, intent_id))
+            return claim
+
+        return self._write(renew)  # type: ignore[return-value]
+
+    def release_cleanup_group(
+        self, intent_id: str, claim: CleanupClaim, *, now_ms: int | None = None,
+    ) -> CleanupIntent:
+        """Release a current cleanup claim without changing publication state."""
+        if not isinstance(claim, CleanupClaim):
+            raise ValueError("cleanup claim is invalid")
+        now = self._time_ms() if now_ms is None else _validate_nonnegative_int(now_ms, "cleanup clock")
+
+        def release(connection: sqlite3.Connection) -> CleanupIntent:
+            # Require the prepared phase before releasing an untouched group.
+            intent = self._cleanup_intent_row(connection, intent_id)
+            if intent.phase is not CleanupPhase.PREPARED:
+                raise self._transition_error("cleanup intent is not actively claimed")
+            jobs = self._cleanup_claim_jobs(connection, intent, claim, now)
+            # Clear every member lease and reset its intent generation in one transaction.
+            for job in jobs:
+                connection.execute(
+                    "UPDATE publications SET cleanup_lease_owner = NULL, cleanup_lease_expires_at_ms = NULL, "
+                    "updated_at_ms = ? WHERE job_id = ? AND cleanup_lease_owner = ? AND cleanup_lease_generation = ?",
+                    (max(now, job.created_at_ms), job.job_id, claim.owner, job.cleanup_lease_generation),
+                )
+            connection.execute(
+                "UPDATE cleanup_intent_members SET lease_generation = 0 WHERE intent_id = ?", (intent_id,)
+            )
+            connection.execute(
+                "UPDATE cleanup_intents SET updated_at_ms = ? WHERE intent_id = ?", (now, intent_id)
+            )
+            return self._cleanup_intent_row(connection, intent_id)
+
+        return self._write(release)  # type: ignore[return-value]
+
+    def complete_cleanup_group(
+        self, intent_id: str, claim: CleanupClaim, *, removed_at_ms: int | None = None,
+    ) -> list[PublicationJob]:
+        """Atomically complete only a fully fenced MEDIA_UNLINKED group."""
+        if not isinstance(claim, CleanupClaim):
+            raise ValueError("cleanup claim is invalid")
+        removed_at = self._time_ms() if removed_at_ms is None else _validate_nonnegative_int(removed_at_ms, "cleanup clock")
+
+        def complete(connection: sqlite3.Connection) -> list[PublicationJob]:
+            # Require the final durable phase and current claim before changing publication state.
+            intent = self._cleanup_intent_row(connection, intent_id)
+            if intent.phase is not CleanupPhase.MEDIA_UNLINKED:
+                raise self._transition_error("cleanup intent is not actively claimed")
+            jobs = self._cleanup_claim_jobs(connection, intent, claim, removed_at)
+            if any(job.cleanup_lease_expires_at_ms is None or job.cleanup_lease_expires_at_ms <= removed_at for job in jobs):
+                raise self._transition_error("cleanup lease is stale, expired, or state changed")
+            for job in jobs:
+                if (job.private_path != intent.expected_private_path
+                        or job.key.recording_sha256 != intent.expected_recording_sha256
+                        or job.lease_owner is not None):
+                    raise self._transition_error("cleanup member changed")
+            completed: list[PublicationJob] = []
+            # Mark every exact group member local-removed before deleting the intent record.
+            for job in jobs:
+                new = replace(
+                    job, state=PublicationState.LOCAL_REMOVED,
+                    operation=PublicationOperation.NONE.value, resume_intent=ResumeIntent.NONE.value,
+                    private_path=None, reconciliation_token=None, lease_owner=None,
+                    lease_expires_at_ms=None, cleanup_lease_owner=None,
+                    cleanup_lease_generation=0, cleanup_lease_expires_at_ms=None,
+                    next_attempt_at_ms=0, last_error_code=None, last_http_status=None,
+                    local_removed_at_ms=max(removed_at, job.published_at_ms or removed_at),
+                    updated_at_ms=max(removed_at, job.created_at_ms),
+                )
+                completed.append(self._update_job(connection, job, new))
+            connection.execute("DELETE FROM cleanup_intents WHERE intent_id = ?", (intent_id,))
+            return completed
+
+        return self._write(complete)  # type: ignore[return-value]
+
+    def abort_cleanup_intent(
+        self, intent_id: str, claim: CleanupClaim | None = None, *, now_ms: int | None = None,
+    ) -> CleanupIntent:
+        """Delete a prepared intent and release its group atomically before mutation."""
+        if claim is not None and not isinstance(claim, CleanupClaim):
+            raise ValueError("cleanup claim is invalid")
+        now = self._time_ms() if now_ms is None else _validate_nonnegative_int(now_ms, "cleanup clock")
+
+        def abort(connection: sqlite3.Connection) -> CleanupIntent:
+            # A post-quarantine journal is never rewound or implicitly released.
+            intent = self._cleanup_intent_row(connection, intent_id)
+            if intent.phase is not CleanupPhase.PREPARED:
+                raise self._transition_error("mutated cleanup intents cannot be aborted")
+            exact_ids = self._exact_cleanup_member_ids(connection, intent.expected_private_path)
+            if tuple(intent.claimed_job_ids) != exact_ids:
+                raise self._transition_error("cleanup group membership changed")
+            jobs = [self._job(connection, job_id) for job_id in intent.claimed_job_ids]
+            if claim is None:
+                if any(generation != 0 or job.cleanup_lease_owner is not None for job, generation in zip(jobs, intent.claimed_lease_generations)):
+                    raise self._transition_error("cleanup claim is required to release leases")
+            else:
+                self._cleanup_claim_jobs(connection, intent, claim, now)
+            # Release only the caller's current leases before deleting the prepared intent.
+            for job in jobs:
+                if claim is not None and job.cleanup_lease_owner == claim.owner:
+                    connection.execute(
+                        "UPDATE publications SET cleanup_lease_owner = NULL, cleanup_lease_expires_at_ms = NULL, "
+                        "updated_at_ms = ? WHERE job_id = ? AND cleanup_lease_owner = ?",
+                        (max(now, job.created_at_ms), job.job_id, claim.owner),
+                    )
+            connection.execute("DELETE FROM cleanup_intents WHERE intent_id = ?", (intent_id,))
+            return intent
+
+        return self._write(abort)  # type: ignore[return-value]
+
+    @staticmethod
     def _due_predicate() -> str:
         """Return the SQL safety predicate shared by due IDs and wake times."""
         return (
-            "((state = 'queued' AND operation = 'post' AND resume_intent = 'post' "
+            "(cleanup_lease_owner IS NULL AND ((state = 'queued' AND operation = 'post' AND resume_intent = 'post' "
             "AND remote_recording_id IS NULL) "
             "OR (state = 'metadata_pending' AND operation = 'patch' AND resume_intent = 'patch' "
             "AND remote_recording_id IS NOT NULL) "
             "OR (state = 'uncertain' AND operation = 'reconcile' AND resume_intent = 'reconcile' "
             "AND remote_recording_id IS NULL) "
             "OR (state = 'transferring' AND operation = 'none' AND resume_intent = 'post' "
-            "AND remote_recording_id IS NULL))"
+            "AND remote_recording_id IS NULL)))"
         )
 
     @staticmethod
@@ -639,6 +1287,7 @@ class PublicationStore:
             PublicationState.QUEUED.value, PublicationOperation.POST.value, ResumeIntent.POST.value,
             None, None, 0, now, None, 0, None, None, None,
             None, None, None, None, None, None, None, now, now,
+            None, 0, None,
         )
 
         def insert(connection: sqlite3.Connection) -> PublicationJob:
@@ -665,6 +1314,8 @@ class PublicationStore:
         return owner, generation
 
     def _fence(self, job: PublicationJob, owner: str | None, generation: int | None, now: int) -> None:
+        if job.cleanup_lease_owner is not None:
+            raise self._transition_error("cleanup lease is active")
         owner, generation = self._owner_generation(owner, generation)
         if owner is None:
             if job.lease_owner is not None:
@@ -867,7 +1518,7 @@ class PublicationStore:
                     "WHERE ((state = 'queued' AND operation = 'post' AND resume_intent = 'post' AND remote_recording_id IS NULL) "
                     "OR (state = 'metadata_pending' AND operation = 'patch' AND resume_intent = 'patch' AND remote_recording_id IS NOT NULL) "
                     "OR (state = 'uncertain' AND operation = 'reconcile' AND resume_intent = 'reconcile' AND remote_recording_id IS NULL)) "
-                    "AND lease_owner IS NULL AND next_attempt_at_ms <= ? "
+                    "AND lease_owner IS NULL AND cleanup_lease_owner IS NULL AND next_attempt_at_ms <= ? "
                     "ORDER BY next_attempt_at_ms, created_at_ms, job_id LIMIT 1", (now,),
                 ).fetchone()
             else:
@@ -878,7 +1529,9 @@ class PublicationStore:
                         candidate.http_method in {"POST", "PATCH"}
                         or candidate.reconciliation_eligible
                     )
-                    if not eligible or candidate.lease_owner is not None or candidate.next_attempt_at_ms > now:
+                    if (not eligible or candidate.lease_owner is not None
+                            or candidate.cleanup_lease_owner is not None
+                            or candidate.next_attempt_at_ms > now):
                         row = None
             if row is None:
                 return None
@@ -927,7 +1580,8 @@ class PublicationStore:
             if origin is not None and candidate.key.instance_url != origin:
                 return None
             eligible = candidate.http_method in {"POST", "PATCH"} or candidate.reconciliation_eligible
-            if not eligible or candidate.lease_owner is not None:
+            if (not eligible or candidate.lease_owner is not None
+                    or candidate.cleanup_lease_owner is not None):
                 return None
             # Increment the informational attempt and fence the new lease generation.
             new = replace(
@@ -962,7 +1616,7 @@ class PublicationStore:
                 "WHERE ((state = 'queued' AND operation = 'post' AND resume_intent = 'post' AND remote_recording_id IS NULL) "
                 "OR (state = 'metadata_pending' AND operation = 'patch' AND resume_intent = 'patch' AND remote_recording_id IS NOT NULL) "
                 "OR (state = 'uncertain' AND operation = 'reconcile' AND resume_intent = 'reconcile' AND remote_recording_id IS NULL)) "
-                "AND lease_owner IS NULL AND next_attempt_at_ms <= ? "
+                "AND lease_owner IS NULL AND cleanup_lease_owner IS NULL AND next_attempt_at_ms <= ? "
                 "ORDER BY next_attempt_at_ms, created_at_ms, job_id LIMIT ?", (now, limit),
             ).fetchall()
             jobs: List[PublicationJob] = []
@@ -1206,7 +1860,7 @@ class PublicationStore:
             rows = connection.execute(
                 "SELECT job_id FROM publications WHERE private_path = ? "
                 "AND media_device = ? AND media_inode = ? AND media_size = ? AND source_mtime_ns = ? "
-                "AND lease_owner IS NULL ORDER BY job_id LIMIT ?",
+                "AND lease_owner IS NULL AND cleanup_lease_owner IS NULL ORDER BY job_id LIMIT ?",
                 (old_path, identity.device, identity.inode, identity.size, identity.mtime_ns, limit),
             ).fetchall()
             changed = 0
@@ -1214,7 +1868,8 @@ class PublicationStore:
                 cursor = connection.execute(
                     "UPDATE publications SET private_path = ? WHERE job_id = ? "
                     "AND private_path = ? AND media_device = ? AND media_inode = ? "
-                    "AND media_size = ? AND source_mtime_ns = ? AND lease_owner IS NULL",
+                    "AND media_size = ? AND source_mtime_ns = ? "
+                    "AND lease_owner IS NULL AND cleanup_lease_owner IS NULL",
                     (new_path, job_id, old_path, identity.device, identity.inode, identity.size, identity.mtime_ns),
                 )
                 changed += cursor.rowcount
@@ -1226,7 +1881,7 @@ class PublicationStore:
         """Delete only the local row after explicit operator authorization."""
         def delete(connection: sqlite3.Connection) -> None:
             old = self._job_from_reference(connection, reference)
-            if old.lease_owner is not None:
+            if old.lease_owner is not None or old.cleanup_lease_owner is not None:
                 raise self._transition_error("leased publication jobs cannot be forgotten")
             connection.execute("DELETE FROM publications WHERE job_id = ?", (old.job_id,))
 

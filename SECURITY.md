@@ -62,3 +62,27 @@ please pay particular attention to:
   private Meeting title, notes, or participants.
 - Detection reads audio-stream metadata via `pactl`; it never reads audio content
   to decide whether to record.
+
+### Explicit local publication cleanup
+
+`meeting-recorder cleanup --older-than DAYS` is a preview. `DAYS` must be at
+least `1`; only `--delete` performs irreversible local deletion. Cleanup is
+CLI-only and is not started by the daemon, publication automation, a token or
+SSID check, D-Bus, HTTP, or any other publication path.
+
+Deletion is limited to an old Recording path whose complete same-path group has
+only `published`, unleased jobs with one matching Recording SHA-256. Cleanup
+hashes the media again and checks the exact adjacent
+`<media filename>.meeting.json` sidecar when one exists. It fails closed for
+unsafe or malformed entries, identity or hash mismatches, symlinks, hardlinks,
+out-of-root paths, and changes detected during the operation, stopping with an
+incomplete result rather than trusting those entries. It removes only the media
+and that exact sidecar, not unrelated neighboring files.
+
+The destructive path first records a durable intent, uses private quarantine
+names, and fsyncs namespace changes before advancing its journal phase. A crash
+can leave an intent or quarantine entry; only a later explicit `--delete` may
+resume it, after the recorded group and file identities still validate. There
+is no Trash or user recovery mechanism. A completed cleanup retains each
+publication job as `local_removed` with its publication history, while removing
+the local path from the job.

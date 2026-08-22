@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 import meeting_recorder.meeting_sidecar as sidecars
 from meeting_recorder.calendar_domain import CalendarOccurrence, OccurrenceKey, meeting_snapshot
 from meeting_recorder.meeting_sidecar import (
-    MeetingSidecar, decode_sidecar, encode_sidecar, load_sidecar, remove_sidecar,
+    MeetingSidecar, decode_sidecar, encode_sidecar, load_sidecar, load_sidecar_fd, remove_sidecar,
     sidecar_path, write_sidecar,
 )
 
@@ -79,6 +79,26 @@ def test_sidecar_atomic_write_is_mode_0600_and_cleans_failed_temp() -> None:
         finally:
             sidecars.os.replace = original_replace
         assert not list(root.glob(".*.tmp"))
+
+
+def test_sidecar_fd_loader_is_bounded_and_does_not_reopen_the_path() -> None:
+    # Write one sidecar, then load it through an already-open descriptor.
+    with TemporaryDirectory() as directory:
+        destination = sidecar_path(Path(directory) / "capture.mkv")
+        write_sidecar(destination, _sidecar())
+        descriptor = os.open(destination, os.O_RDONLY)
+        try:
+            # The descriptor-backed loader must decode the complete sidecar.
+            assert load_sidecar_fd(descriptor) == _sidecar()
+
+            # A small byte limit must reject the same content without reopening it.
+            try:
+                load_sidecar_fd(descriptor, max_bytes=1)
+                assert False, "bounded FD decode must reject oversized content"
+            except ValueError:
+                pass
+        finally:
+            os.close(descriptor)
 
 
 def test_sidecar_directory_fsync_errors_propagate_except_unsupported() -> None:

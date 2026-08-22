@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
 from .calendar_domain import CalendarOccurrence
-from .utils import LOG
 
 
 def sanitize_title(title: object) -> str:
@@ -276,6 +275,7 @@ def is_live_reserved(path: Path | str) -> bool:
 
 
 def _fsync_directory(directory: Path) -> None:
+    # Open the directory itself so its namespace changes can be made durable.
     try:
         descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
@@ -283,6 +283,7 @@ def _fsync_directory(directory: Path) -> None:
         finally:
             os.close(descriptor)
     except OSError as exc:
+        # Treat filesystems that cannot sync directories as an explicit supported limitation.
         if exc.errno in {errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
             return
         raise
@@ -293,8 +294,85 @@ def fsync_recording_directory(directory: Path | str) -> None:
     _fsync_directory(Path(directory))
 
 
+def fsync_recording_directory_fd(descriptor: int) -> None:
+    """Durably publish a namespace change through an already-open directory FD."""
+    if type(descriptor) is not int or descriptor < 0:
+        raise ValueError("directory descriptor is invalid")
+    # Sync the already-held directory descriptor without reopening a pathname.
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        # Preserve the same supported-filesystem behavior as path-based syncing.
+        if exc.errno not in {errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
+            raise
+
+
+def link_regular_file_no_replace_dirfd(
+    source_directory_fd: int,
+    source_name: str | bytes,
+    destination_directory_fd: int,
+    destination_name: str | bytes,
+    *,
+    expected_link_count: int = 2,
+) -> None:
+    """Create a verified same-filesystem hard link without replacing a destination."""
+    # Validate the source before creating any namespace entry.
+    if type(expected_link_count) is not int or expected_link_count < 2:
+        raise ValueError("expected link count is invalid")
+    source_info = os.stat(source_name, dir_fd=source_directory_fd, follow_symlinks=False)
+    if not stat.S_ISREG(source_info.st_mode) or source_info.st_nlink != 1:
+        raise ValueError("source must be a single regular file")
+    # Create the unique destination without allowing replacement semantics.
+    os.link(
+        source_name, destination_name,
+        src_dir_fd=source_directory_fd, dst_dir_fd=destination_directory_fd,
+        follow_symlinks=False,
+    )
+    # Make the unique destination durable before validating or reporting an ambiguous result.
+    fsync_recording_directory_fd(destination_directory_fd)
+    try:
+        # Verify that the durable destination still names the source identity and link count.
+        destination_info = os.stat(destination_name, dir_fd=destination_directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(destination_info.st_mode)
+            or destination_info.st_dev != source_info.st_dev
+            or destination_info.st_ino != source_info.st_ino
+            or destination_info.st_nlink != expected_link_count
+        ):
+            raise OSError(errno.EIO, "linked destination identity changed")
+    except Exception:
+        # Leave the unique entry for the durable cleanup intent to inspect and recover.
+        raise
+
+
+def unlink_verified_file_dirfd(
+    directory_fd: int,
+    name: str | bytes,
+    expected_device: int,
+    expected_inode: int,
+    expected_size: int,
+    expected_mtime_ns: int,
+    expected_nlink: int,
+) -> None:
+    """Unlink only a regular entry whose identity still matches the expected file."""
+    # Check the final directory entry immediately before removing its exact identity.
+    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_dev != expected_device
+        or info.st_ino != expected_inode
+        or info.st_size != expected_size
+        or info.st_mtime_ns != expected_mtime_ns
+        or info.st_nlink != expected_nlink
+    ):
+        raise OSError(errno.EIO, "file identity changed before unlink")
+    # Remove only after the identity and expected link count pass validation.
+    os.unlink(name, dir_fd=directory_fd)
+
+
 def move_regular_file_no_replace(source: Path | str, destination: Path | str) -> Path:
     """Move one regular file atomically without overwriting either destination or source."""
+    # Validate canonical parents, source identity, and device placement before linking.
     source_path, destination_path = Path(source), Path(destination)
     if os.path.realpath(source_path.parent) != os.path.realpath(destination_path.parent):
         raise ValueError("source and destination must share a canonical parent")
@@ -311,49 +389,30 @@ def move_regular_file_no_replace(source: Path | str, destination: Path | str) ->
         raise OSError(errno.EXDEV, "source and destination are on different devices")
 
     try:
+        # Create the destination hard link without replacing an existing name.
         os.link(source_path, destination_path, follow_symlinks=False)
     except OSError as exc:
         raise MovePrecommitError(source_path, destination_path) from exc
-    linked = False
-    source_removed = False
     try:
+        # Confirm the destination still names the source before removing the source name.
         destination_info = os.lstat(destination_path)
-        linked = (stat.S_ISREG(destination_info.st_mode)
-                  and destination_info.st_dev == source_info.st_dev
-                  and destination_info.st_ino == source_info.st_ino)
-        if not linked:
+        if not (stat.S_ISREG(destination_info.st_mode)
+                and destination_info.st_dev == source_info.st_dev
+                and destination_info.st_ino == source_info.st_ino):
             raise MovePrecommitError(source_path, destination_path)
         try:
+            # Remove the source only after the destination identity is verified.
             os.unlink(source_path)
-            source_removed = True
         except Exception as exc:
-            # Roll back only a destination still verified to be our hard link.
-            try:
-                rollback = os.lstat(destination_path)
-                if (stat.S_ISREG(rollback.st_mode)
-                        and rollback.st_dev == source_info.st_dev
-                        and rollback.st_ino == source_info.st_ino):
-                    os.unlink(destination_path)
-                    _fsync_directory(source_path.parent)
-            except Exception as rollback_error:
-                LOG.error("Could not roll back recording move: %s", type(rollback_error).__name__)
             raise MovePrecommitError(source_path, destination_path) from exc
         try:
+            # Publish the committed two-name-to-one-name transition durably.
             _fsync_directory(source_path.parent)
         except Exception as exc:
             raise MoveCommittedError(destination_path) from exc
         return destination_path
     except Exception:
-        if linked and not source_removed and os.path.lexists(destination_path):
-            try:
-                rollback = os.lstat(destination_path)
-                if (stat.S_ISREG(rollback.st_mode)
-                        and rollback.st_dev == source_info.st_dev
-                        and rollback.st_ino == source_info.st_ino):
-                    os.unlink(destination_path)
-            except Exception as rollback_error:
-                LOG.error("Could not clean up failed recording move: %s",
-                          type(rollback_error).__name__)
+        # Keep the linked destination when source removal or durability is ambiguous.
         raise
 
 
@@ -381,10 +440,12 @@ def recording_directory_lock(directory: Path | str) -> Iterator[None]:
     cache_home = Path(os.path.expanduser(os.environ.get("XDG_CACHE_HOME") or "~/.cache"))
     lock_root = cache_home / "meeting-recorder" / "recording-directory-locks"
     lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Derive one private lock path from the canonical recording directory.
     key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     lock_path = lock_root / f"{key}.lock"
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
+        # Hold the lock across the complete metadata and namespace transaction.
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
     finally:

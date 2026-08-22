@@ -151,6 +151,35 @@ def decode_sidecar(value: object) -> MeetingSidecar:
     )
 
 
+def load_sidecar_fd(descriptor: int, *, max_bytes: int = 1_048_576) -> MeetingSidecar:
+    """Decode one bounded sidecar from an already-open descriptor without reopening its path."""
+    if type(descriptor) is not int or descriptor < 0:
+        raise ValueError("sidecar descriptor is invalid")
+    if type(max_bytes) is not int or not 1 <= max_bytes <= 16 * 1024 * 1024:
+        raise ValueError("sidecar size limit is invalid")
+    # Validate the held descriptor before reading any metadata bytes.
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError("sidecar is not a single regular file")
+    chunks: list[bytes] = []
+    total = 0
+    # Read bounded chunks at fixed offsets so the path is never reopened.
+    while True:
+        chunk = os.pread(descriptor, min(65_536, max_bytes - total + 1), total)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError("sidecar is too large")
+        chunks.append(chunk)
+    try:
+        # Decode only after the complete bounded byte stream has been collected.
+        value = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("sidecar JSON is malformed") from exc
+    return decode_sidecar(value)
+
+
 def load_sidecar(path: Path | str) -> MeetingSidecar:
     """Load and strictly validate one regular, non-symlink sidecar file."""
     sidecar = Path(path)
@@ -207,6 +236,7 @@ def write_sidecar(path: Path | str, sidecar: MeetingSidecar) -> None:
     descriptor = -1
     temporary = ""
     try:
+        # Write and sync a private temporary file before publishing its final name.
         descriptor, temporary = tempfile.mkstemp(
             prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
         os.fchmod(descriptor, 0o600)
@@ -217,6 +247,7 @@ def write_sidecar(path: Path | str, sidecar: MeetingSidecar) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
         temporary = ""
+        # Sync the directory so the replacement name survives a crash.
         _fsync_directory(destination.parent)
     finally:
         if descriptor != -1:
@@ -237,6 +268,7 @@ def remove_sidecar(path: Path | str) -> bool:
         return False
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise ValueError("refusing to remove non-regular sidecar")
+    # Remove the validated regular sidecar and publish the namespace change.
     os.unlink(target)
     _fsync_directory(target.parent)
     return True

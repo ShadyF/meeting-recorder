@@ -10,7 +10,7 @@ from meeting_recorder.calendar_domain import (
 )
 from meeting_recorder.meeting_sidecar import MeetingSidecar
 from meeting_recorder.speakr_domain import (
-    MediaIdentity, PublicationJob, PublicationKey, PublicationOperation, PublicationResult,
+    CleanupClaim, CleanupIntent, CleanupPhase, MediaIdentity, PublicationJob, PublicationKey, PublicationOperation, PublicationResult,
     PublicationState, ResumeIntent, SpeakrMetadata, map_speakr_metadata, normalize_speakr_url,
 )
 
@@ -60,8 +60,14 @@ def _job(state=PublicationState.QUEUED, **changes) -> PublicationJob:
                       reconciliation_token="token-1", uncertain_at_ms=2_000, updated_at_ms=2_000)
     elif state in {PublicationState.BLOCKED, PublicationState.MISSING, PublicationState.LOCAL_REMOVED}:
         values.update(operation="none", resume_intent="none")
+
+        # Supply the complete publication audit chain for local removal fixtures.
         if state is PublicationState.LOCAL_REMOVED:
-            values["private_path"] = None
+            values.update(
+                private_path=None, remote_recording_id=9, next_attempt_at_ms=0,
+                transfer_started_at_ms=1_000, accepted_at_ms=2_000,
+                published_at_ms=3_000, local_removed_at_ms=4_000, updated_at_ms=4_000,
+            )
     values.update(changes)
     return PublicationJob(**values)
 
@@ -143,3 +149,43 @@ def test_visible_metadata_is_sanitized_and_utc() -> None:
     result = map_speakr_metadata(Path("current-name.mkv"), 4_000_000_000, _sidecar(meeting))
     assert result == SpeakrMetadata("Design review", NOW, "First line\nSecond line\n\nLocation: Room 7", "Alice, Bob Smith")
     _raises(SpeakrMetadata, "Title", datetime.now(), "", "")
+
+
+def test_cleanup_intent_is_bounded_and_requires_complete_sidecar_identity() -> None:
+    # Build one complete intent to establish the accepted cleanup shape.
+    intent = CleanupIntent(
+        "cleanup-1", b"/private/recording", HASH, 1, 2, 3, 4,
+        quarantine_media_basename="media.tmp", phase=CleanupPhase.PREPARED,
+        created_at_ms=1_000, updated_at_ms=1_000,
+    )
+
+    # Confirm the public fields retain their bounded path and digest values.
+    assert intent.expected_private_path == b"/private/recording"
+    assert intent.expected_recording_sha256 == HASH
+
+    # Reject unsafe IDs, relative paths, incomplete sidecar identity, and nlink data.
+    _raises(CleanupIntent, "cleanup/unsafe", b"/private/recording", HASH, 1, 2, 3, 4)
+    _raises(CleanupIntent, "cleanup-2", b"relative", HASH, 1, 2, 3, 4)
+    _raises(CleanupIntent, "cleanup-3", b"/private/recording", HASH, 1, 2, 3, 4, sidecar_device=1)
+    _raises(CleanupIntent, "cleanup-4", b"/private/recording", HASH, 1, 2, 3, 4, claimed_job_ids=("job",), claimed_lease_generations=())
+    _raises(CleanupIntent, "cleanup-5", b"/private/recording", HASH, 1, 2, 3, 4, media_nlink=2)
+
+
+def test_local_removed_requires_complete_positive_remote_audit_chain() -> None:
+    # Reject removal rows missing any required audit timestamp or remote ID.
+    _raises(_job, PublicationState.LOCAL_REMOVED, remote_recording_id=None)
+    _raises(_job, PublicationState.LOCAL_REMOVED, transfer_started_at_ms=None)
+    _raises(_job, PublicationState.LOCAL_REMOVED, accepted_at_ms=900)
+    _raises(_job, PublicationState.LOCAL_REMOVED, published_at_ms=1_500)
+    # Preserve the valid complete audit chain as the control case.
+    assert _job(PublicationState.LOCAL_REMOVED).remote_recording_id == 9
+
+
+def test_cleanup_claim_is_immutable_and_exactly_fenced() -> None:
+    # Build a claim whose job IDs and lease generations align exactly.
+    claim = CleanupClaim("cleanup-1", "owner-1", ("job-1", "job-2"), (1, 2))
+    assert claim.job_ids == ("job-1", "job-2")
+
+    # Reject reordered, missing, or zero-generation claim members.
+    _raises(CleanupClaim, "cleanup-1", "owner-1", ("job-2", "job-1"), (1, 2))
+    _raises(CleanupClaim, "cleanup-1", "owner-1", ("job-1",), (0,))

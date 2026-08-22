@@ -146,6 +146,7 @@ meeting-recorder speakr upload --status --all
 meeting-recorder speakr upload --retry JOB [--force]
 meeting-recorder speakr upload --relink JOB NEW_PATH
 meeting-recorder speakr upload --forget JOB
+meeting-recorder cleanup --older-than DAYS [--delete]
 ```
 
 `start`/`stop`/`restart`/`logs` wrap `systemctl --user`, so you never need to
@@ -314,6 +315,43 @@ The media POST is non-idempotent: `transfer_unknown` is never automatically
 resent. A rejected transfer may be retried only by explicitly rerunning the
 command. `metadata_pending` retries only the metadata PATCH, while a `published`
 rerun sends no requests.
+
+### Explicit cleanup of published Recordings
+
+Cleanup is a local, explicit operation for removing old Recordings after Speakr
+publication:
+
+```bash
+meeting-recorder cleanup --older-than 30
+meeting-recorder cleanup --older-than 30 --delete
+```
+
+`DAYS` must be an integer of at least `1`. Without `--delete`, the command only
+previews its decisions and does not change the publication database or the
+recordings directory. `--delete` performs irreversible deletion. It removes the
+Recording and, when present, its exact adjacent
+`<media filename>.meeting.json` sidecar; unrelated neighboring files are not
+part of the cleanup. There is no Trash or application recovery path, so keep a
+separate copy if you may need the local files later.
+
+Cleanup considers only a complete same-path publication group whose every job is
+`published`, has no active publication or cleanup lease, and records the same
+Recording SHA-256. The Recording must be older than the requested cutoff. Age is
+taken from a valid adjacent sidecar's capture end time, or from the durable
+source mtime when no sidecar exists; a malformed or mismatched sidecar does not
+fall back to the mtime. Before deletion, cleanup rechecks the media hash and
+exact file identities. Unsafe, malformed, mismatched, symlinked, hardlinked,
+out-of-root, or changed media and sidecar entries, or unsafe path components,
+are refused and reported incomplete rather than trusted or removed.
+
+Deletion records a durable cleanup intent and advances through hidden quarantine
+names and filesystem durability checkpoints. If the process stops after a
+mutation, the intent and quarantine state remain for inspection and safe
+resumption. Only a later explicit `meeting-recorder cleanup --older-than DAYS
+--delete` may resume it; preview, the daemon, publication automation, tokens,
+SSID checks, D-Bus, and HTTP never start or resume cleanup. After successful
+completion, the publication jobs remain in the database as `local_removed` so
+publication history is retained, while the local path is no longer retained.
 
 ## Configuration
 

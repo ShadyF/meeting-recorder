@@ -65,3 +65,43 @@ Meeting sidecar at attempt time. Uncertain media transfers are not
 automatically resent, metadata-pending jobs retry PATCH only, and published
 reruns send nothing.
 _Avoid_: Upload record, queue item
+
+**Publication cleanup**:
+An explicit CLI-only operation that previews or irreversibly removes a local
+Recording and, when present, its exact adjacent Meeting sidecar after the
+complete same-path publication group is confirmed: every job is `published`,
+unleased, and records the same Recording SHA-256, and the Recording is older
+than the requested cutoff. It does not run from the daemon, publication
+automation, token or SSID admission, D-Bus, HTTP, or any other publication
+path. Successful removal retains the group's publication history as
+`local_removed`.
+
+**Cleanup intent**:
+The durable, restartable record of one explicit cleanup operation. It binds the
+exact private path, Recording SHA-256, media identity, optional exact adjacent
+Meeting sidecar identity, complete publication-job membership, and private
+quarantine names to an ordered cleanup phase. It is not a Trash record and does
+not provide local-file recovery.
+
+## Publication cleanup invariants
+
+The private publication store uses schema v3. Its cleanup journal contains one
+`cleanup_intents` record and exact `cleanup_intent_members` for each in-progress
+operation; publication rows also carry the cleanup lease fence.
+The journal is bounded to a complete same-path group, and the member set cannot
+be replaced by a partial or newly added group while cleanup is in progress.
+
+Only jobs in `published` may be claimed. Once claimed, every member must keep
+the same private path and Recording SHA-256, have no publication lease, and hold
+the cleanup lease and generation recorded for that intent. The intent stores the
+media identity and, when present, the exact adjacent sidecar identity; a media
+or sidecar identity, hash, path, or group change invalidates further cleanup.
+
+The durable phases are ordered: `prepared`, `sidecar_quarantined`,
+`media_quarantined`, `sidecar_unlinked`, and `media_unlinked`. Filesystem
+namespace changes are checkpointed with directory durability before the journal
+advances. An interrupted intent remains incomplete until a later explicit
+`--delete` can validate and resume it. Completion changes every claimed job to
+`local_removed`, clears its private path and leases, and retains the completed
+publication audit chain, including the remote publication identity and ordered
+publication timestamps.

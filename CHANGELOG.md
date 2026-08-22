@@ -19,6 +19,10 @@ All notable changes to this project are documented here. Format follows
 - #24 adds policy-controlled Speakr publication with disabled, manual, and
   automatic modes, exact SSID admission, and an isolated background worker;
   explicit commands remain available in every mode.
+- #25 adds explicit CLI-only cleanup for old fully published Recording groups:
+  preview by default, irreversible `--delete`, strict media/sidecar/path checks,
+  durable intent and quarantine resumption, and retained `local_removed`
+  publication history.
 
 ### Changed
 - Detected meetings now ask directly whether to record Video, Audio only, or
