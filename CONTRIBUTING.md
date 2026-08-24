@@ -41,6 +41,37 @@ It deliberately has no desktop integration, capture runtime, host sockets, or cr
 `.deb` build and support are outside this development baseline; inherited Debian packaging files
 remain available for their separate workflows.
 
+## Runtime image
+
+The runtime image is a separate path from the headless devcontainer. The root
+`Containerfile` targets Ubuntu 24.04 on `linux/amd64`, copies the source to
+`/opt/meeting-recorder`, and executes the module directly. It is the image
+contract for local runtime smoke checks, not a deployment or production-
+readiness claim.
+
+Run the repository's build and smoke check from the checkout root:
+
+```bash
+./scripts/test-runtime-image.sh
+```
+
+The equivalent manual local Buildx build is:
+
+```bash
+docker buildx build -f Containerfile --platform linux/amd64 --load \
+  -t meeting-recorder:runtime .
+```
+
+The image has no fixed user. Its `/config`, `/state`, `/cache`, and configured
+Recording paths must be made writable and persistent as needed by the runtime.
+The compositor, portal backend, PipeWire/Pulse server, buses, NetworkManager,
+keyring, and browser remain host-side; do not assume a raw PipeWire socket.
+
+GHCR and versioned image publishing are issue #27. Quadlet deployment,
+confinement, secrets, socket and mount policy, SELinux choices, and lifecycle
+are issue #28. Real Bluefin host validation is issue #29. Keep those concerns
+out of this local image smoke path.
+
 ## Tests
 
 ```bash

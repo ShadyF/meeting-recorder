@@ -1,0 +1,49 @@
+#!/bin/sh
+set -e
+
+# Run the local admission check through the fixed image path.
+run_preflight() {
+    /usr/bin/python3 -B /opt/meeting-recorder/preflight.py
+}
+
+# Admit the default daemon command, including argparse's leading verbosity forms.
+if [ "$#" -eq 0 ]; then
+    run_preflight
+    set -- run
+else
+    first_command=""
+    has_help=0
+
+    # Help and version requests must remain local and never require desktop resources.
+    for argument in "$@"; do
+        case "$argument" in
+            -h|--help|--version)
+                has_help=1
+                ;;
+        esac
+    done
+
+    # Find the command after any common verbosity options without changing arguments.
+    if [ "$has_help" -eq 0 ]; then
+        for argument in "$@"; do
+            case "$argument" in
+                -v|--verbose)
+                    ;;
+                *)
+                    first_command=$argument
+                    break
+                    ;;
+            esac
+        done
+    fi
+
+    # A missing command defaults to run; every other command bypasses preflight.
+    if [ "$has_help" -eq 0 ] && {
+        [ -z "$first_command" ] || [ "$first_command" = "run" ]
+    }; then
+        run_preflight
+    fi
+fi
+
+# Preserve the exact command arguments while replacing the launcher process.
+exec /usr/bin/python3 -B -m meeting_recorder "$@"

@@ -105,3 +105,40 @@ advances. An interrupted intent remains incomplete until a later explicit
 `local_removed`, clears its private path and leases, and retains the completed
 publication audit chain, including the remote publication identity and ordered
 publication timestamps.
+
+**Runtime image**:
+The Ubuntu 24.04 `linux/amd64` image built from the repository-root
+`Containerfile`. It copies the source to `/opt/meeting-recorder`, executes the
+application directly as `python3 -m meeting_recorder`, and supplies client-side
+GTK/PyGObject, ffmpeg/GStreamer, portal, PulseAudio, D-Bus, and Secret Service
+tooling. It is not the headless development container and does not install a
+Debian package or Python packages with `pip`.
+
+**Runtime host contract**:
+The host-side services and runtime resources that the image does not provide:
+the compositor, portal backend, PipeWire/Pulse server, buses, NetworkManager,
+Secret Service keyring, browser, valid `TZ`, Wayland and Pulse sockets, session
+bus, and writable XDG/Recording paths. Wayland capture receives the portal
+connection; it does not require a raw PipeWire socket.
+
+## Runtime image invariants
+
+The image defaults `XDG_CONFIG_HOME` to `/config`, `XDG_STATE_HOME` to `/state`,
+`XDG_CACHE_HOME` to `/cache`, and its source/work directory to
+`/opt/meeting-recorder`. The `/usr/local/bin/meeting-recorder` launcher is the
+entrypoint and its no-argument default is the `run` subcommand. It selects no
+fixed user; ownership, persistence, and writable mounts are runtime concerns.
+
+Daemon startup requires a valid `TZ`, Wayland socket, PulseAudio socket, and
+session bus. Headless administrative commands remain available without
+starting the daemon. Missing optional system bus access, Secret Service, Speakr
+token, or Calendar OAuth configuration disables only the dependent optional
+behavior; it does not redefine the base capture or administrative contract.
+
+The image contract supports read-only roots, private temporary filesystems, and
+arbitrary host-compatible UIDs, but it does not itself enforce deployment
+confinement. No-new-privileges, capability drops, no devices or privileged mode,
+no host networking, exact sockets and mounts, secret handling, SELinux choices,
+and lifecycle are deployment invariants owned by #28 Quadlet. Registry and
+versioned publishing are owned by #27, while real Bluefin validation is owned by
+#29; this context does not claim production readiness or live capture validation.

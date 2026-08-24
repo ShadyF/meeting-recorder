@@ -80,6 +80,61 @@ The background service is enabled for you and starts at your next login. To star
 systemctl --user start meeting-recorder
 ```
 
+## Runtime image
+
+The repository-root `Containerfile` defines a separate runtime-image path for
+Ubuntu 24.04 on `linux/amd64`. It copies the application source to
+`/opt/meeting-recorder` and directly executes `python3 -m meeting_recorder ...`.
+The image includes the client-side GTK/PyGObject,
+ffmpeg/GStreamer, xdg-desktop-portal, PulseAudio, D-Bus, and Secret Service
+tooling needed by the application. It does not install a Debian package or use
+`pip`.
+
+This is not the headless development container. The `.devcontainer` image is
+kept for source checks and ordinary development; it deliberately does not
+provide desktop capture or host integration.
+
+Use the repository smoke path from the checkout root:
+
+```bash
+./scripts/test-runtime-image.sh
+```
+
+For a manual local Buildx build, use the same file and architecture explicitly:
+
+```bash
+docker buildx build -f Containerfile --platform linux/amd64 --load \
+  -t meeting-recorder:runtime .
+```
+
+The image defaults are `XDG_CONFIG_HOME=/config`, `XDG_STATE_HOME=/state`,
+`XDG_CACHE_HOME=/cache`, and `/opt/meeting-recorder` as the source/work
+directory. Its launcher is the image entrypoint; with no explicit command, it
+invokes `python3 -m meeting_recorder run`. The launcher is
+`/usr/local/bin/meeting-recorder`; the image does not select a fixed user.
+Writable XDG directories and the configured Recording directory, including
+their ownership and persistence, are runtime responsibilities rather than image
+defaults.
+
+Before starting the daemon, the runtime must provide a valid `TZ`, the
+Wayland display socket, the PulseAudio socket, and the session bus. Headless
+administrative commands can run without starting the daemon. A missing system
+bus, Secret Service, Speakr token, or Calendar OAuth configuration disables only
+the related optional behavior;
+it does not turn that missing integration into a capture requirement.
+
+The image contains clients, not the desktop services. The compositor, portal
+backend, PipeWire/Pulse server, session and system buses, NetworkManager,
+Secret Service keyring, and browser remain host-side services. Wayland capture
+uses the portal contract; the image does not assume or require a raw PipeWire
+socket mount.
+
+This issue defines an image and local-smoke contract, not a deployment recipe or
+a production-readiness claim. GHCR and versioned publishing belong to #27,
+Quadlet confinement and lifecycle belong to #28, and real Bluefin host
+validation belongs to #29. Live capture has not been validated by this image
+contract.
+
 <details>
 <summary>Optional: better noise cancellation</summary>
 

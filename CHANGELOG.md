@@ -23,6 +23,9 @@ All notable changes to this project are documented here. Format follows
   preview by default, irreversible `--delete`, strict media/sidecar/path checks,
   durable intent and quarantine resumption, and retained `local_removed`
   publication history.
+- #26 adds the Ubuntu 24.04 amd64 runtime-image contract, direct source
+  execution, local build/smoke guidance, and explicit boundaries for host
+  services, deployment, publishing, and live validation.
 
 ### Changed
 - Detected meetings now ask directly whether to record Video, Audio only, or

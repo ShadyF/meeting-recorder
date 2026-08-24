@@ -86,3 +86,30 @@ resume it, after the recorded group and file identities still validate. There
 is no Trash or user recovery mechanism. A completed cleanup retains each
 publication job as `local_removed` with its publication history, while removing
 the local path from the job.
+
+## Runtime image boundary
+
+The runtime image is built from the repository-root `Containerfile` for Ubuntu
+24.04 `linux/amd64`. It is designed to tolerate a read-only root filesystem,
+private temporary filesystems, and an arbitrary host-compatible UID when the
+runtime supplies the writable paths and required sockets. These are image
+compatibility properties, not deployment guarantees.
+
+The image does not by itself establish the security boundary for a deployment.
+Issue #28 Quadlet owns the actual `no-new-privileges` setting, capability
+drops, absence of devices and privileged mode, absence of host networking,
+exact socket and mount exposure, secret injection, SELinux trade-offs, and
+service lifecycle. This documentation intentionally does not provide that
+deployment recipe. Issue #29 owns real Bluefin validation; this image contract
+does not claim production readiness or live capture validation.
+
+The compositor, portal backend, PipeWire/Pulse server, buses, NetworkManager,
+Secret Service keyring, browser, and other desktop services remain host-side.
+The image uses client tooling and does not assume a raw PipeWire socket. A
+runtime that exposes more sockets, devices, mounts, or credentials than the
+application needs is outside this contract.
+
+Daemon preflight still requires a valid `TZ`, Wayland socket, PulseAudio
+socket, and session bus; headless administrative commands do not require the
+daemon to start. Missing the system bus, Secret Service, Speakr token, or
+Calendar OAuth configuration disables only the dependent optional behavior.
