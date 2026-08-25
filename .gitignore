@@ -8,9 +8,6 @@ dist/
 .venv/
 venv/
 
-# Packaging staging output
-/build/deb/
-
 # Editors / OS
 .vscode/
 .idea/
