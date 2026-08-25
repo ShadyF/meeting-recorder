@@ -113,3 +113,24 @@ Daemon preflight still requires a valid `TZ`, Wayland socket, PulseAudio
 socket, and session bus; headless administrative commands do not require the
 daemon to start. Missing the system bus, Secret Service, Speakr token, or
 Calendar OAuth configuration disables only the dependent optional behavior.
+
+## Container image publication
+
+Issue #27 defines a separate, least-privilege GHCR workflow for the intended
+`ghcr.io/shadyf/meeting-recorder` image. It accepts protected, manually managed
+release tags and pins every GitHub Action by full commit SHA. Releases attach
+BuildKit maximum provenance and an SBOM to the image digest. The base Ubuntu
+image is pinned, but live APT inputs mean these attestations support source and
+provenance reproducibility, not a guarantee of byte-for-byte rebuilt images.
+
+Version and full-commit-SHA tags are immutable: same-digest reruns do nothing,
+while a conflicting tag fails. Stable `latest` is monotonic and never rolls
+back; it is a convenience reference, not a deployment pin. Consume a verified
+release by digest. The detailed release, visibility, and consumption policy is
+in [Container images](docs/CONTAINER-IMAGES.md).
+
+The first GHCR package defaults to private. The owner must make it public and
+rerun the complete workflow; #27 remains incomplete until an anonymous digest
+pull and hardened smoke pass. That smoke verifies a release artifact only. It
+does not deploy, install, update, or validate graphical capture, and no workflow
+or sample automatically pulls or updates installations.

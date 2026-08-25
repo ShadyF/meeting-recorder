@@ -130,8 +130,10 @@ uses the portal contract; the image does not assume or require a raw PipeWire
 socket mount.
 
 This issue defines an image and local-smoke contract, not a deployment recipe or
-a production-readiness claim. GHCR and versioned publishing belong to #27,
-Quadlet confinement and lifecycle belong to #28, and real Bluefin host
+a production-readiness claim. Issue #27 defines the intended GHCR release
+behavior; see [Container images](docs/CONTAINER-IMAGES.md). Do not infer that a
+public image already exists until its first publish and anonymous digest smoke
+succeed. Quadlet confinement and lifecycle belong to #28, and real Bluefin host
 validation belongs to #29. Live capture has not been validated by this image
 contract.
 

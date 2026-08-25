@@ -25,14 +25,41 @@ ROOT="$(cd -- "$ROOT" && pwd -P)"
 IMAGE_TAG="${IMAGE_TAG:-meeting-recorder:runtime-acceptance}"
 KEEP_IMAGE="${KEEP_IMAGE:-0}"
 POSITIONAL_TAG=0
+EXISTING_IMAGE="${EXISTING_IMAGE:-}"
+EXPECTED_VERSION="${EXPECTED_OCI_VERSION:-}"
+EXPECTED_REVISION="${EXPECTED_OCI_REVISION:-}"
+EXPECTED_SOURCE="${EXPECTED_OCI_SOURCE:-}"
 while (($#)); do
     case "$1" in
+        --existing-image)
+            shift
+            (($#)) || die "--existing-image requires an image reference"
+            [[ -z "$EXISTING_IMAGE" ]] || die "existing image was supplied more than once"
+            EXISTING_IMAGE="$1"
+            ;;
+        --expected-version)
+            shift
+            (($#)) || die "--expected-version requires a value"
+            EXPECTED_VERSION="$1"
+            ;;
+        --expected-revision)
+            shift
+            (($#)) || die "--expected-revision requires a value"
+            EXPECTED_REVISION="$1"
+            ;;
+        --expected-source)
+            shift
+            (($#)) || die "--expected-source requires a value"
+            EXPECTED_SOURCE="$1"
+            ;;
         --keep-image)
             KEEP_IMAGE=1
             ;;
         --help|-h)
             printf 'Usage: %s [--keep-image] [IMAGE_TAG]\n' "${BASH_SOURCE[0]}"
+            printf '       %s --existing-image IMAGE --expected-version VERSION --expected-revision REVISION --expected-source SOURCE\n' "${BASH_SOURCE[0]}"
             printf 'Environment: DOCKER_BIN, IMAGE_TAG, KEEP_IMAGE, RUNTIME_IMAGE_UID_GID\n'
+            printf '             EXISTING_IMAGE, EXPECTED_OCI_VERSION, EXPECTED_OCI_REVISION, EXPECTED_OCI_SOURCE\n'
             exit 0
             ;;
         --)
@@ -55,20 +82,95 @@ while (($#)); do
 done
 [[ -n "$IMAGE_TAG" && "$IMAGE_TAG" != *[[:space:]]* ]] || die "image tag must be non-empty and contain no whitespace"
 
+# Keep existing-image inputs bounded before they are passed to Docker or the metadata check.
+if [[ -n "$EXISTING_IMAGE" ]]; then
+    [[ "$POSITIONAL_TAG" == 0 ]] || die "IMAGE_TAG cannot be used with --existing-image"
+
+    # Reject local-build cleanup controls because existing images always remain caller-owned.
+    [[ "$KEEP_IMAGE" != 1 ]] || die "--keep-image and KEEP_IMAGE=1 cannot be used with --existing-image"
+
+    [[ "$EXISTING_IMAGE" != *[[:space:]]* && ${#EXISTING_IMAGE} -le 512 ]] \
+        || die "existing image must contain no whitespace and be at most 512 characters"
+    [[ -n "$EXPECTED_VERSION" && "$EXPECTED_VERSION" != *[[:space:]]* && ${#EXPECTED_VERSION} -le 256 ]] \
+        || die "existing-image mode requires a non-empty expected version of at most 256 non-whitespace characters"
+    [[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] \
+        || die "existing-image mode requires an expected full 40-character lowercase hexadecimal revision"
+    [[ -n "$EXPECTED_SOURCE" && "$EXPECTED_SOURCE" != *[[:space:]]* && ${#EXPECTED_SOURCE} -le 2048 ]] \
+        || die "existing-image mode requires a non-empty expected source of at most 2048 non-whitespace characters"
+elif [[ -n "$EXPECTED_VERSION$EXPECTED_REVISION$EXPECTED_SOURCE" ]]; then
+    die "expected OCI metadata options are only valid with --existing-image"
+fi
+
 # Use a numeric identity so every filesystem assertion exercises the non-root path.
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 RUN_UID_GID="${RUNTIME_IMAGE_UID_GID:-65532:65532}"
 [[ "$RUN_UID_GID" =~ ^[0-9]+:[0-9]+$ ]] || die "RUNTIME_IMAGE_UID_GID must be numeric UID:GID"
 command -v "$DOCKER_BIN" >/dev/null 2>&1 || die "Docker executable not found: $DOCKER_BIN"
 
-# Derive stable OCI metadata without exposing repository configuration.
-if ! REVISION="$(git -C "$ROOT" rev-parse HEAD)"; then
-    die "could not read the git revision"
+# Read build metadata locally or use the caller-supplied contract for an existing image.
+if [[ -n "$EXISTING_IMAGE" ]]; then
+    IMAGE_REF="$EXISTING_IMAGE"
+    VERSION="$EXPECTED_VERSION"
+    REVISION="$EXPECTED_REVISION"
+    SOURCE="$EXPECTED_SOURCE"
+else
+    # Read the exact revision used by the local build.
+    if ! REVISION="$(git -C "$ROOT" rev-parse HEAD)"; then
+        die "could not read the git revision"
+    fi
+
+    # Compare both package declarations so the build label uses the authoritative release version.
+    if ! VERSION="$(python3 - "$ROOT/meeting_recorder/__init__.py" "$ROOT/pyproject.toml" <<'PY'
+import ast
+import sys
+import tomllib
+
+init_path, pyproject_path = sys.argv[1:]
+
+# Read the package version without importing project code.
+with open(init_path, encoding="utf-8") as stream:
+    module = ast.parse(stream.read(), filename=init_path)
+
+# Locate the literal package version declaration.
+init_version = None
+for statement in module.body:
+    if (
+        isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id == "__version__"
+        and isinstance(statement.value, ast.Constant)
+        and isinstance(statement.value.value, str)
+    ):
+        init_version = statement.value.value
+        break
+
+# Read the project version from the standard TOML metadata.
+with open(pyproject_path, "rb") as stream:
+    project_version = tomllib.load(stream).get("project", {}).get("version")
+
+# Reject missing or divergent declarations before passing metadata to the build.
+if not init_version or not isinstance(project_version, str) or init_version != project_version:
+    raise SystemExit("package and project versions must be non-empty and identical")
+
+print(init_version)
+PY
+    )"; then
+        die "could not derive the authoritative package version"
+    fi
+
+    # Use the public source URL defined by the image contract.
+    SOURCE="https://github.com/ShadyF/meeting-recorder"
+    IMAGE_REF="$IMAGE_TAG"
 fi
 
-VERSION="$(git -C "$ROOT" describe --tags --always 2>/dev/null || true)"
-[[ -n "$VERSION" ]] || VERSION="$REVISION"
-SOURCE="https://github.com/ShadyF/meeting-recorder"
+# Validate every metadata value before it is passed to the build or comparison command.
+[[ -n "$VERSION" && "$VERSION" != *[[:space:]]* && ${#VERSION} -le 256 ]] \
+    || die "OCI version must be non-empty and at most 256 non-whitespace characters"
+[[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] \
+    || die "OCI revision must be a full 40-character lowercase hexadecimal revision"
+[[ -n "$SOURCE" && "$SOURCE" != *[[:space:]]* && ${#SOURCE} -le 2048 ]] \
+    || die "OCI source must be non-empty and at most 2048 non-whitespace characters"
 
 # Keep a temporary host-side file for jq-free image inspection and clean it on every exit.
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/meeting-recorder-runtime.XXXXXXXX")"
@@ -92,7 +194,7 @@ cleanup() {
             printf 'ERROR: could not remove disposable image ID %s\n' "$BUILT_IMAGE_ID" >&2
             final_status=1
         fi
-    elif [[ "$KEEP_IMAGE" == 1 ]]; then
+    elif [[ "$KEEP_IMAGE" == 1 && -z "$EXISTING_IMAGE" ]]; then
         # Preserve the image when the caller requests post-run inspection.
         printf 'Keeping image: %s\n' "$IMAGE_TAG"
     fi
@@ -105,27 +207,33 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Use the repository as the build working directory so the Dockerfile argument is exact.
-cd -- "$ROOT"
+# Build a disposable local image, or leave the caller-owned existing image untouched.
+if [[ -z "$EXISTING_IMAGE" ]]; then
+    # Use the repository as the build working directory so the Dockerfile argument is exact.
+    cd -- "$ROOT"
 
-# Build one platform image and load it into the local Docker image store.
-step "Building $IMAGE_TAG"
-"$DOCKER_BIN" buildx build \
-    --platform linux/amd64 \
-    --load \
-    -f Containerfile \
-    --tag "$IMAGE_TAG" \
-    --build-arg "OCI_VERSION=$VERSION" \
-    --build-arg "OCI_REVISION=$REVISION" \
-    --build-arg "OCI_SOURCE=$SOURCE" \
-    "$ROOT"
+    # Build one platform image and load it into the local Docker image store.
+    step "Building $IMAGE_TAG"
+    "$DOCKER_BIN" buildx build \
+        --platform linux/amd64 \
+        --load \
+        -f Containerfile \
+        --tag "$IMAGE_TAG" \
+        --build-arg "OCI_VERSION=$VERSION" \
+        --build-arg "OCI_REVISION=$REVISION" \
+        --build-arg "OCI_SOURCE=$SOURCE" \
+        "$ROOT"
 
-# Capture the immutable image identity for safe cleanup after all probes finish.
-BUILT_IMAGE_ID="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$IMAGE_TAG")"
+    # Capture the immutable image identity for safe cleanup after all probes finish.
+    BUILT_IMAGE_ID="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$IMAGE_REF")"
+else
+    # Report the local caller-owned image without pulling, logging in, or changing its tags.
+    step "Using existing image"
+fi
 
 # Inspect the loaded image with host Python and assert the complete runtime contract.
 step "Inspecting image metadata"
-"$DOCKER_BIN" image inspect "$IMAGE_TAG" >"$TEMP_DIR/image-inspect.json"
+"$DOCKER_BIN" image inspect "$IMAGE_REF" >"$TEMP_DIR/image-inspect.json"
 python3 - "$TEMP_DIR/image-inspect.json" "$VERSION" "$REVISION" "$SOURCE" <<'PY'
 import json
 import sys
@@ -175,11 +283,10 @@ checks = {
     "OCI license label": (labels.get("org.opencontainers.image.licenses"), "MIT"),
 }
 
-# Stop at the first contract mismatch so failures remain concise.
+# Stop at the first contract mismatch without exposing supplied metadata.
 for name, (actual, expected) in checks.items():
-    # Report both values to make metadata failures actionable.
     if actual != expected:
-        raise SystemExit(f"{name}: expected {expected!r}, got {actual!r}")
+        raise SystemExit(f"{name}: image metadata did not match the required value")
 PY
 
 # Build common hardened flags once so every runtime probe has the same restrictions.
@@ -200,12 +307,12 @@ HARDENED_RUN_FLAGS=(
 
 # Run the installed launcher with the hardened runtime flags and temporary XDG roots.
 run_app() {
-    "$DOCKER_BIN" run --rm "${HARDENED_RUN_FLAGS[@]}" "$IMAGE_TAG" "$@"
+    "$DOCKER_BIN" run --rm "${HARDENED_RUN_FLAGS[@]}" "$IMAGE_REF" "$@"
 }
 
 # Run a shell-only filesystem or dependency probe without invoking the launcher preflight.
 run_shell() {
-    "$DOCKER_BIN" run --rm "${HARDENED_RUN_FLAGS[@]}" --entrypoint /bin/sh "$IMAGE_TAG" -c "$1"
+    "$DOCKER_BIN" run --rm "${HARDENED_RUN_FLAGS[@]}" --entrypoint /bin/sh "$IMAGE_REF" -c "$1"
 }
 
 # Verify the installed Python package, its defaults, and every required GI namespace.

@@ -1,0 +1,325 @@
+name: Container release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Serialize publication without cancelling an immutable release already in progress.
+concurrency:
+  group: ghcr-meeting-recorder-publication
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/shadyf/meeting-recorder
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      revision: ${{ steps.release.outputs.revision }}
+      version_tag: ${{ steps.release.outputs.version_tag }}
+      sha_tag: ${{ steps.release.outputs.sha_tag }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      source: ${{ steps.release.outputs.source }}
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Run the test suite before publication credentials exist
+        run: python tests/run_tests.py
+
+      - name: Validate release inputs
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/container-release.py validate --tag "$RELEASE_TAG" --revision "$RELEASE_REVISION" --project-root . --github-output "$GITHUB_OUTPUT"
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.release.outputs.digest }}
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # Authenticate immediately before inspecting the protected package registry.
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Inspect the immutable version tag
+        id: version
+        env:
+          TAG: ${{ needs.validate.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/container-registry.py inspect --image "$IMAGE" --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+
+      - name: Inspect the immutable revision tag
+        id: sha
+        env:
+          TAG: ${{ needs.validate.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/container-registry.py inspect --image "$IMAGE" --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+
+      - name: Decide immutable publication action
+        id: immutable
+        env:
+          VERSION_DIGEST: ${{ steps.version.outputs.digest }}
+          SHA_DIGEST: ${{ steps.sha.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/container-release.py immutable --version-digest "$VERSION_DIGEST" --sha-digest "$SHA_DIGEST" --github-output "$GITHUB_OUTPUT"
+
+      # Stop before any alias or build mutation when immutable tags disagree.
+      - name: Reject immutable tag conflict
+        if: steps.immutable.outputs.action == 'conflict'
+        run: |
+          set -euo pipefail
+          exit 1
+
+      # Alias only the absent version tag from the adapter-verified revision digest.
+      - name: Repair the missing version tag
+        id: repair_version
+        if: steps.immutable.outputs.action == 'repair-version'
+        env:
+          SOURCE_DIGEST: ${{ steps.sha.outputs.digest }}
+          TARGET_TAG: ${{ needs.validate.outputs.version_tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+          SOURCE: ${{ needs.validate.outputs.source }}
+        run: |
+          set -euo pipefail
+          python3 scripts/container-registry.py alias --image "$IMAGE" --source-digest "$SOURCE_DIGEST" --target-tag "$TARGET_TAG" --expected-version "$VERSION" --expected-revision "$REVISION" --expected-source "$SOURCE" --github-output "$GITHUB_OUTPUT"
+
+      # Alias only the absent revision tag from the adapter-verified version digest.
+      - name: Repair the missing revision tag
+        id: repair_sha
+        if: steps.immutable.outputs.action == 'repair-sha'
+        env:
+          SOURCE_DIGEST: ${{ steps.version.outputs.digest }}
+          TARGET_TAG: ${{ needs.validate.outputs.sha_tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+          SOURCE: ${{ needs.validate.outputs.source }}
+        run: |
+          set -euo pipefail
+          python3 scripts/container-registry.py alias --image "$IMAGE" --source-digest "$SOURCE_DIGEST" --target-tag "$TARGET_TAG" --expected-version "$VERSION" --expected-revision "$REVISION" --expected-source "$SOURCE" --github-output "$GITHUB_OUTPUT"
+
+      - name: Build the local acceptance image
+        if: steps.immutable.outputs.action == 'publish'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          load: true
+          tags: meeting-recorder:release-acceptance
+          build-args: |
+            OCI_VERSION=${{ needs.validate.outputs.version }}
+            OCI_REVISION=${{ needs.validate.outputs.revision }}
+            OCI_SOURCE=${{ needs.validate.outputs.source }}
+
+      - name: Accept the local image
+        if: steps.immutable.outputs.action == 'publish'
+        env:
+          LOCAL_IMAGE: meeting-recorder:release-acceptance
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+          SOURCE: ${{ needs.validate.outputs.source }}
+        run: |
+          set -euo pipefail
+          scripts/test-runtime-image.sh --existing-image "$LOCAL_IMAGE" --expected-version "$VERSION" --expected-revision "$REVISION" --expected-source "$SOURCE"
+
+      - name: Push the accepted immutable image
+        id: push
+        if: steps.immutable.outputs.action == 'publish'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/shadyf/meeting-recorder:${{ needs.validate.outputs.version_tag }}
+            ghcr.io/shadyf/meeting-recorder:${{ needs.validate.outputs.sha_tag }}
+          build-args: |
+            OCI_VERSION=${{ needs.validate.outputs.version }}
+            OCI_REVISION=${{ needs.validate.outputs.revision }}
+            OCI_SOURCE=${{ needs.validate.outputs.source }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Select the candidate digest
+        id: candidate
+        env:
+          ACTION: ${{ steps.immutable.outputs.action }}
+          VERSION_DIGEST: ${{ steps.version.outputs.digest }}
+          SHA_DIGEST: ${{ steps.sha.outputs.digest }}
+          PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          case "$ACTION" in
+            noop) digest="$VERSION_DIGEST" ;;
+            repair-version) digest="$SHA_DIGEST" ;;
+            repair-sha) digest="$VERSION_DIGEST" ;;
+            publish) digest="$PUSHED_DIGEST" ;;
+            *) exit 1 ;;
+          esac
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      # Verify both immutable aliases and their OCI labels after every no-op, repair, or push.
+      - name: Verify immutable release tags
+        id: verify_immutable
+        env:
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+          VERSION_TAG: ${{ needs.validate.outputs.version_tag }}
+          SHA_TAG: ${{ needs.validate.outputs.sha_tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+          SOURCE: ${{ needs.validate.outputs.source }}
+        run: |
+          set -euo pipefail
+          python3 scripts/container-registry.py verify --image "$IMAGE" --digest "$DIGEST" --tag "$VERSION_TAG" --tag "$SHA_TAG" --expected-version "$VERSION" --expected-revision "$REVISION" --expected-source "$SOURCE" --attempts 5 --github-output "$GITHUB_OUTPUT"
+
+      # Export only the fully verified immutable release digest to downstream smoke validation.
+      - name: Publish verified release digest
+        id: release
+        env:
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf 'digest=%s\n' "$DIGEST" >> "$GITHUB_OUTPUT"
+
+  anonymous-smoke:
+    needs: [validate, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the tagged runtime acceptance script
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Pull and run the published digest anonymously
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+          SOURCE: ${{ needs.validate.outputs.source }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          export DOCKER_CONFIG="$(mktemp -d)"
+          chmod 700 "$DOCKER_CONFIG"
+          unset DOCKER_AUTH_CONFIG REGISTRY_AUTH_FILE
+          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
+          for delay in 5 10 20 40 80; do
+            if docker pull "$IMAGE@$DIGEST"; then
+              pulled=1
+              break
+            fi
+            sleep "$delay"
+          done
+          if [[ "${pulled:-}" != 1 ]]; then
+            docker pull "$IMAGE@$DIGEST"
+          fi
+          scripts/test-runtime-image.sh --existing-image "$IMAGE@$DIGEST" --expected-version "$VERSION" --expected-revision "$REVISION" --expected-source "$SOURCE"
+
+  promote-latest:
+    needs: [validate, publish, anonymous-smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # Authenticate immediately before inspecting or mutating the latest registry tag.
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Inspect the latest tag after anonymous acceptance
+        id: latest_inspect
+        run: |
+          set -euo pipefail
+          python3 scripts/container-registry.py inspect --image "$IMAGE" --tag latest --github-output "$GITHUB_OUTPUT"
+
+      - name: Decide latest tag action
+        id: latest
+        env:
+          CANDIDATE_DIGEST: ${{ needs.publish.outputs.digest }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          LATEST_VERSION: ${{ steps.latest_inspect.outputs.version }}
+          LATEST_DIGEST: ${{ steps.latest_inspect.outputs.digest }}
+        run: |
+          set -euo pipefail
+          args=(--candidate-version "$VERSION" --candidate-digest "$CANDIDATE_DIGEST")
+          if [[ -n "$LATEST_DIGEST" ]]; then
+            [[ -n "$LATEST_VERSION" ]]
+            args+=(--latest-version "$LATEST_VERSION" --latest-digest "$LATEST_DIGEST")
+          fi
+          python3 scripts/container-release.py latest "${args[@]}" --github-output "$GITHUB_OUTPUT"
+
+      # A same-version different digest must never replace the mutable tag.
+      - name: Reject latest tag conflict
+        if: steps.latest.outputs.action == 'conflict'
+        run: |
+          set -euo pipefail
+          exit 1
+
+      - name: Move latest only when pure policy permits it
+        if: steps.latest.outputs.action == 'move'
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+          SOURCE: ${{ needs.validate.outputs.source }}
+        run: |
+          set -euo pipefail
+          python3 scripts/container-registry.py alias --image "$IMAGE" --source-digest "$DIGEST" --target-tag latest --expected-version "$VERSION" --expected-revision "$REVISION" --expected-source "$SOURCE" --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify moved or unchanged latest tag
+        if: steps.latest.outputs.action == 'move' || steps.latest.outputs.action == 'noop'
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+          SOURCE: ${{ needs.validate.outputs.source }}
+        run: |
+          set -euo pipefail
+          python3 scripts/container-registry.py verify --image "$IMAGE" --digest "$DIGEST" --tag latest --expected-version "$VERSION" --expected-revision "$REVISION" --expected-source "$SOURCE" --attempts 5 --github-output "$GITHUB_OUTPUT"

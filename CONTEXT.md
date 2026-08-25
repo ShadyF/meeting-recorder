@@ -121,6 +121,13 @@ Secret Service keyring, browser, valid `TZ`, Wayland and Pulse sockets, session
 bus, and writable XDG/Recording paths. Wayland capture receives the portal
 connection; it does not require a raw PipeWire socket.
 
+**Container release**:
+The intended GHCR publication of the Runtime image from a protected, manually
+managed `vX.Y.Z[-prerelease]` tag. It has an immutable bare-version tag and
+full-commit-SHA tag, plus a stable-only monotonic `latest` convenience tag. It
+is not a deployment, installation, update, rollback, or graphical-capture
+validation process.
+
 ## Runtime image invariants
 
 The image defaults `XDG_CONFIG_HOME` to `/config`, `XDG_STATE_HOME` to `/state`,
@@ -142,3 +149,20 @@ no host networking, exact sockets and mounts, secret handling, SELinux choices,
 and lifecycle are deployment invariants owned by #28 Quadlet. Registry and
 versioned publishing are owned by #27, while real Bluefin validation is owned by
 #29; this context does not claim production readiness or live capture validation.
+
+## Container release invariants
+
+Issue #27's separate least-privilege workflow publishes BuildKit maximum
+provenance and an SBOM for each release digest, with GitHub Actions pinned by
+full commit SHA. The pinned Ubuntu base and attestations establish source and
+provenance reproducibility, not byte-for-byte rebuild reproducibility because
+APT inputs are live.
+
+The bare version and `sha-<full commit SHA>` tags cannot change digest. A
+same-digest rerun is a no-op and a conflict fails. `latest` applies only to
+stable releases, advances monotonically, and is never a deployment pin.
+Digest-qualified consumption is the operator contract. First publication is
+private until the owner makes it public and reruns the complete release; #27
+remains incomplete until anonymous pull and hardened digest smoke succeed.
+That smoke is release verification only, and no workflow or sample updates or
+pulls an installed image automatically.

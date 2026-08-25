@@ -67,10 +67,11 @@ Recording paths must be made writable and persistent as needed by the runtime.
 The compositor, portal backend, PipeWire/Pulse server, buses, NetworkManager,
 keyring, and browser remain host-side; do not assume a raw PipeWire socket.
 
-GHCR and versioned image publishing are issue #27. Quadlet deployment,
-confinement, secrets, socket and mount policy, SELinux choices, and lifecycle
-are issue #28. Real Bluefin host validation is issue #29. Keep those concerns
-out of this local image smoke path.
+Issue #27 defines the intended GHCR release behavior; see
+[Container images](docs/CONTAINER-IMAGES.md). Quadlet deployment, confinement,
+secrets, socket and mount policy, SELinux choices, and lifecycle are issue #28.
+Real Bluefin host validation is issue #29. Keep those concerns out of this local
+image smoke path.
 
 ## Tests
 
@@ -137,7 +138,16 @@ echo $XDG_SESSION_TYPE               # must be x11
 
 ## Releasing (maintainers)
 
-Releases are automated. Bump the version, then tag:
+Debian/APT release remains automated and unchanged. For a container image
+release, create a protected, manually managed tag in the form `vX.Y.Z` or
+`vX.Y.Z-prerelease`; semantic-release is not part of this release path. The
+separate least-privilege GHCR workflow runs when that tag is pushed and follows
+the intended image contract documented in
+[Container images](docs/CONTAINER-IMAGES.md). Do not treat a tag as evidence
+that a public image exists until the first publish and anonymous digest smoke
+have succeeded.
+
+Bump the version, then tag:
 
 ```bash
 # 1. bump __version__ in meeting_recorder/__init__.py and version in pyproject.toml,
