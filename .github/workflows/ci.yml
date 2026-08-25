@@ -6,12 +6,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Tests only need to read the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       # The app deliberately has no pip dependencies and the test runner is
       # stdlib-only, so there is nothing to install for the unit tests.
@@ -20,61 +26,3 @@ jobs:
 
       - name: Byte-compile all modules
         run: python3 -m compileall -q meeting_recorder
-
-  package:
-    name: Build .deb
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build package
-        env:
-          HOMEPAGE: https://github.com/${{ github.repository }}
-        run: ./packaging/build-deb.sh
-
-      - name: Verify the package installs and runs
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ./dist/*.deb
-          meeting-recorder --version
-          # Config must resolve from the installed location, not the source tree.
-          cd /tmp && meeting-recorder config
-
-      - name: Lint the package
-        run: |
-          sudo apt-get install -y lintian
-          # Informational: don't fail the build on packaging nitpicks.
-          lintian --no-tag-display-limit dist/*.deb || true
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: meeting-recorder-deb
-          path: dist/*.deb
-
-  # The debian/ directory exists so a Launchpad PPA *can* be published later; no
-  # PPA is published today (see docs/PPA.md). Building it here keeps it from
-  # bit-rotting and stops it drifting from packaging/build-deb.sh.
-  source-package:
-    name: Build source package (debian/)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install packaging tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential debhelper devscripts dpkg-dev lintian
-
-      # Launchpad would build from a *source* package, so debian/ has to work on
-      # its own. Verify both the binary and source builds.
-      - name: Build binary package from debian/
-        run: dpkg-buildpackage -us -uc -b
-
-      - name: Build source package (what dput uploads)
-        run: dpkg-buildpackage -us -uc -S -d
-
-      - name: Show what was produced
-        run: ls -la ../ | grep -E '\.(deb|dsc|tar\.[gx]z|changes)$' || true
-
-      - name: Lint
-        run: lintian ../*.deb || true

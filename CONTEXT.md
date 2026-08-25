@@ -112,7 +112,7 @@ The Ubuntu 24.04 `linux/amd64` image built from the repository-root
 application directly as `python3 -m meeting_recorder`, and supplies client-side
 GTK/PyGObject, ffmpeg/GStreamer, portal, PulseAudio, D-Bus, and Secret Service
 tooling. It is not the headless development container and does not install a
-Debian package or Python packages with `pip`.
+project application or Python packages with `pip`.
 
 **Runtime host contract**:
 The host-side services and runtime resources that the image does not provide:
@@ -122,8 +122,8 @@ bus, and writable XDG/Recording paths. Wayland capture receives the portal
 connection; it does not require a raw PipeWire socket.
 
 **Container release**:
-The intended GHCR publication of the Runtime image from a protected, manually
-managed `vX.Y.Z[-prerelease]` tag. It has an immutable bare-version tag and
+The GHCR publication of the Runtime image from a protected, manually managed
+`vX.Y.Z[-prerelease]` tag. It has an immutable bare-version tag and
 full-commit-SHA tag, plus a stable-only monotonic `latest` convenience tag. It
 is not a deployment, installation, update, rollback, or graphical-capture
 validation process.
@@ -152,11 +152,11 @@ versioned publishing are owned by #27, while real Bluefin validation is owned by
 
 ## Container release invariants
 
-Issue #27's separate least-privilege workflow publishes BuildKit maximum
+Issue #27's least-privilege workflow publishes BuildKit maximum
 provenance and an SBOM for each release digest, with GitHub Actions pinned by
 full commit SHA. The pinned Ubuntu base and attestations establish source and
 provenance reproducibility, not byte-for-byte rebuild reproducibility because
-APT inputs are live.
+Ubuntu archive inputs are live.
 
 The bare version and `sha-<full commit SHA>` tags cannot change digest. A
 same-digest rerun is a no-op and a conflict fails. `latest` applies only to

@@ -1,7 +1,0 @@
-#!/usr/bin/python3
-"""Console entry point installed as /usr/bin/meeting-recorder."""
-import sys
-
-from meeting_recorder.__main__ import main
-
-sys.exit(main())

@@ -11,45 +11,36 @@ on:
       - "v*"
 
 permissions:
-  contents: write   # needed to create the release and upload the .deb
+  contents: write # needed to create the GitHub Release
 
 jobs:
   release:
-    name: Build and publish
+    name: Validate and publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the tagged revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - name: Check the tag matches the source version
+      - name: Validate the tag and source versions
+        id: validation
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REVISION: ${{ github.sha }}
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          SRC="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' meeting_recorder/__init__.py)"
-          echo "tag=$TAG source=$SRC"
-          if [ "$TAG" != "$SRC" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match __version__ ($SRC)."
-            echo "Bump meeting_recorder/__init__.py (and pyproject.toml) before tagging."
-            exit 1
-          fi
+          set -euo pipefail
+          # Use the same strict SemVer and dual-source validation as the container release.
+          python3 scripts/container-release.py validate --tag "$RELEASE_TAG" --revision "$RELEASE_REVISION" --project-root . --github-output "$GITHUB_OUTPUT"
 
       - name: Run tests
         run: python3 tests/run_tests.py
 
-      - name: Build .deb
-        env:
-          MAINTAINER: ${{ vars.DEB_MAINTAINER }}
-          HOMEPAGE: https://github.com/${{ github.repository }}
-        run: ./packaging/build-deb.sh
-
-      - name: Verify the package installs
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ./dist/*.deb
-          meeting-recorder --version
-
       - name: Assemble release notes
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          # This version's section from CHANGELOG.md ...
+          # Extract this version's section from the changelog.
           awk -v v="$VERSION" '
             $0 ~ "^## \\[" v "\\]" {f=1; next}
             f && /^## \[/ {exit}
@@ -58,30 +49,24 @@ jobs:
           if [ ! -s notes.md ]; then
             echo "Release $GITHUB_REF_NAME" > notes.md
           fi
-          # ... plus the standard install/requirements footer.
-          sed "s/__VERSION__/${VERSION}/g" .github/release-footer.md >> notes.md
-          echo "----- notes -----"; cat notes.md
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.deb
-          body_path: notes.md
-          # Title is the bare tag (v1.2.3) and nothing else, so the releases
-          # list reads as a clean version sequence. This step runs after the
-          # tag push and overwrites whatever title the release already had, so
-          # it is the only place the title can be set.
-          name: ${{ github.ref_name }}
-          draft: false
-          prerelease: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PRERELEASE: ${{ steps.validation.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # Build flags from the validator's trusted prerelease result.
+          release_args=(--title "$GITHUB_REF_NAME" --notes-file notes.md)
+          if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease --latest=false)
+          else
+            release_args+=(--prerelease=false)
+          fi
 
-  # Publish the apt repo explicitly rather than waiting for `release: published`
-  # to trigger it: the release above is created with GITHUB_TOKEN, and GitHub
-  # does not emit workflow-triggering events for that token.
-  apt-repo:
-    name: Publish APT repository
-    needs: [release]
-    uses: ./.github/workflows/apt-repo.yml
-    with:
-      tag: ${{ github.ref_name }}
-    secrets: inherit
+          # Create a generic source release once, then update it safely on reruns.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" "${release_args[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag "${release_args[@]}"
+          fi

@@ -30,7 +30,7 @@ which starts audio-only immediately without showing the prompt.
 | | |
 |---|---|
 | **Session** | X11 or Wayland — **X11 recommended.** X11 captures directly with `x11grab`. Wayland has to go through `xdg-desktop-portal`, which asks permission the first time and, on GNOME 46, sometimes crashes mid-session; screen capture then falls back to audio-only until it restarts. Both are supported and tested; X11 is simply the calmer path today. |
-| OS | Debian/Ubuntu (built and tested on Ubuntu 24.04) |
+| OS | Ubuntu 24.04 for source use (built and tested there) |
 | Desktop | GNOME (tray icon needs the AppIndicator extension, shipped by default on Ubuntu) |
 | Audio | PipeWire or PulseAudio |
 
@@ -50,35 +50,74 @@ mid-session — recording then continues with audio only until it restarts. X11 
 directly, with none of that in the way. Log in with "Ubuntu on Xorg" from the gear menu on the
 login screen. See [Known limitations](#known-limitations) for the rest of the Wayland caveats.
 
-## Install
+## Run from source
 
-### Option 1 — APT repository (recommended, auto-updates)
-
-```bash
-curl -fsSL https://sskazal.github.io/meeting-recorder/KEY.gpg \
-  | sudo gpg --dearmor -o /usr/share/keyrings/meeting-recorder.gpg
-
-echo "deb [arch=all signed-by=/usr/share/keyrings/meeting-recorder.gpg] https://sskazal.github.io/meeting-recorder stable main" \
-  | sudo tee /etc/apt/sources.list.d/meeting-recorder.list
-
-sudo apt update && sudo apt install meeting-recorder
-```
-
-Updates then arrive with `apt upgrade` like any other package.
-
-### Option 2 — download the `.deb`
-
-Grab it from [Releases](../../releases) — `apt` pulls in ffmpeg and the rest automatically:
+Source use is the supported desktop distribution. Clone the repository and
+install the Ubuntu host dependencies:
 
 ```bash
-sudo apt install ./meeting-recorder_0.3.5_all.deb
+git clone https://github.com/ssKazal/meeting-recorder.git
+cd meeting-recorder
+
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-notify-0.7 \
+                 gir1.2-appindicator3-0.1 ffmpeg pulseaudio-utils \
+                 xdg-desktop-portal gstreamer1.0-pipewire gstreamer1.0-tools \
+                 gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+                 x11-utils x11-xserver-utils
+
 ```
 
-The background service is enabled for you and starts at your next login. To start it right away:
+No Python packages are required: the application runs on the system `python3`
+with the distribution's PyGObject.
+
+### Activate desktop integration
+
+From the checkout root, install the user-local launcher, app-grid entries,
+icons, and user service. This does not start the detector:
 
 ```bash
-systemctl --user start meeting-recorder
+./scripts/install-source.sh
 ```
+
+Start it explicitly after installation, or ask the installer to enable and
+start it in one step:
+
+```bash
+systemctl --user enable --now meeting-recorder.service
+# or: ./scripts/install-source.sh --enable
+```
+
+The launcher is `~/.local/bin/meeting-recorder`, so ensure `~/.local/bin` is
+on `PATH` before using the command examples below. The installer only replaces
+the launcher and XDG links it created; it stops safely on caller-owned file
+conflicts.
+
+To update an existing activation, update the checkout and rerun the installer;
+then restart the service if it is running:
+
+```bash
+git pull --ff-only
+./scripts/install-source.sh
+systemctl --user restart meeting-recorder.service
+```
+
+For foreground use without desktop activation, run directly from the checkout:
+
+```bash
+python3 -m meeting_recorder run
+```
+
+To remove source integration, run this from the activated checkout. It stops
+and disables the user service, removes only installer-owned launcher and XDG
+links, and leaves the checkout, recordings, and configuration untouched:
+
+```bash
+./scripts/install-source.sh --remove
+```
+
+Protected release tags also start runtime-image publication to GHCR under the
+policy in [Container images](docs/CONTAINER-IMAGES.md). Do not infer that an
+image is publicly available until its release verification succeeds.
 
 ## Runtime image
 
@@ -87,8 +126,8 @@ Ubuntu 24.04 on `linux/amd64`. It copies the application source to
 `/opt/meeting-recorder` and directly executes `python3 -m meeting_recorder ...`.
 The image includes the client-side GTK/PyGObject,
 ffmpeg/GStreamer, xdg-desktop-portal, PulseAudio, D-Bus, and Secret Service
-tooling needed by the application. It does not install a Debian package or use
-`pip`.
+tooling needed by the application. It runs the application from source and does
+not use `pip`.
 
 This is not the headless development container. The `.devcontainer` image is
 kept for source checks and ordinary development; it deliberately does not
@@ -151,7 +190,7 @@ curl -L -o ~/.local/share/meeting-recorder/std.rnnn \
 
 ## Usage
 
-Once installed there's nothing to do — join a call and choose **Video**, **Audio only**, or
+After source activation, once the detector is running, join a call and choose **Video**, **Audio only**, or
 **Ignore** in the popup. Closing it or leaving it unanswered starts no recording. Recordings land
 in `~/Videos/MeetingRecorder/`.
 
@@ -174,7 +213,7 @@ with a **📁 Open Folder** button.
 
 ### Settings
 
-Open **Meeting Recorder Settings** from your app grid, or:
+After source activation, open **Meeting Recorder Settings** from your app grid, or:
 
 ```bash
 meeting-recorder settings
@@ -184,6 +223,8 @@ Change save folder, format, frame rate, mic/system volume, normalization, noise 
 capture area and behavior. **Save & Apply** restarts the service so changes take effect.
 
 ### Command line
+
+After source activation, use the user-local launcher:
 
 ```bash
 meeting-recorder status     # service state + capture streams + meeting match
@@ -497,15 +538,19 @@ volumes at `1.0`; that makes them equal. Nudge `mic_volume` to `1.2` to sit slig
 **Changes to settings did nothing** — restart the service (`systemctl --user restart
 meeting-recorder`), and make sure you edited `~/.config/meeting-recorder/config.json`.
 
-## Uninstall
+## Remove local source data
+
+Remove source integration first with `./scripts/install-source.sh --remove`.
+Then remove the checkout when it is no longer needed. To remove local settings
+as well:
 
 ```bash
-sudo apt remove meeting-recorder          # or: apt purge
-rm -rf ~/.config/meeting-recorder         # optional: your settings
+rm -rf ~/.config/meeting-recorder
 ```
+
 Your recordings in `~/Videos/MeetingRecorder/` are never touched.
 
-## Development
+## Source development
 
 ```bash
 git clone https://github.com/ssKazal/meeting-recorder.git && cd meeting-recorder
@@ -517,7 +562,6 @@ sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-notify-0.7 \
 
 python3 -m meeting_recorder run     # run from source
 python3 tests/run_tests.py          # tests — zero dependencies, no pytest needed
-./packaging/build-deb.sh            # build dist/meeting-recorder_<version>_all.deb
 ```
 
 No Python packages are required — the app runs on the system `python3` with the distro's PyGObject.

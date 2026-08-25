@@ -334,7 +334,7 @@ for element in pipewiresrc videorate videocrop videoconvert videoscale filesink;
     gst-inspect-1.0 "$element" >/dev/null
 done'
 
-# Check that package-installed desktop integration files are present and non-empty.
+# Check that image-installed desktop integration files are present and non-empty.
 step "Checking desktop entries and icons"
 run_shell 'set -eu
 for path in \

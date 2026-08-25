@@ -23,7 +23,7 @@ PyGObject, and the tests use a tiny zero-dependency runner — no pytest, no vir
 > **You need an X11 session** to exercise recording (`echo $XDG_SESSION_TYPE` must print `x11`).
 > The unit tests themselves run fine headless.
 
-If you have the package installed, stop it first so two daemons don't fight over the same
+If you have source integration active, stop it first so two daemons do not fight over the same
 notification and tray: `meeting-recorder stop`.
 
 ## Devcontainer baseline
@@ -38,8 +38,6 @@ python3 -m compileall -q meeting_recorder
 ```
 
 It deliberately has no desktop integration, capture runtime, host sockets, or credentials.
-`.deb` build and support are outside this development baseline; inherited Debian packaging files
-remain available for their separate workflows.
 
 ## Runtime image
 
@@ -138,28 +136,32 @@ echo $XDG_SESSION_TYPE               # must be x11
 
 ## Releasing (maintainers)
 
-Debian/APT release remains automated and unchanged. For a container image
-release, create a protected, manually managed tag in the form `vX.Y.Z` or
-`vX.Y.Z-prerelease`; semantic-release is not part of this release path. The
-separate least-privilege GHCR workflow runs when that tag is pushed and follows
-the intended image contract documented in
-[Container images](docs/CONTAINER-IMAGES.md). Do not treat a tag as evidence
-that a public image exists until the first publish and anonymous digest smoke
-have succeeded.
+Create a protected, manually managed tag in the form `vX.Y.Z` or
+`vX.Y.Z-prerelease`. Pushing it creates the GitHub release and starts the
+least-privilege GHCR publication workflow. Semantic-release is deliberately
+deferred; it is not part of the current release path.
+
+The release path has no Debian package, APT, or Launchpad step. The container
+workflow follows the policy in [Container images](docs/CONTAINER-IMAGES.md). Do
+not treat a tag as evidence that a public image exists until publication and the
+anonymous digest smoke have succeeded.
 
 Bump the version, then tag:
 
 ```bash
-# 1. bump __version__ in meeting_recorder/__init__.py and version in pyproject.toml,
-#    the README badge/filename, the man page .TH line, and add a CHANGELOG section
+# 1. Bump __version__ in meeting_recorder/__init__.py and version in pyproject.toml,
+#    then add a CHANGELOG section.
 git commit -am "Release vX.Y.Z"
 git tag -a vX.Y.Z -m "vX.Y.Z"
 git push --follow-tags
 ```
 
-Pushing the tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which
-builds the `.deb`, extracts the matching `CHANGELOG.md` section as the release notes, and publishes
-the GitHub Release with the package attached.
+Pushing the tag triggers the GitHub release and container-release workflows.
+The GitHub release uses the matching `CHANGELOG.md` section as its release
+notes. The container workflow publishes and verifies the GHCR image; its
+immutable version and full-commit-SHA tags, stable-only `latest` tag, and
+digest-consumption policy are documented in
+[Container images](docs/CONTAINER-IMAGES.md).
 
 ## License
 

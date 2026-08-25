@@ -31,6 +31,8 @@ All notable changes to this project are documented here. Format follows
   digest-qualified consumption after anonymous release verification.
 
 ### Changed
+- Debian/APT packaging and publishing support was removed. Releases distribute
+  source and publish the runtime image to GHCR.
 - Detected meetings now ask directly whether to record Video, Audio only, or
   Ignore. Closing or leaving the prompt unanswered never starts a recording,
   while auto-record continues to start audio-only without prompting.

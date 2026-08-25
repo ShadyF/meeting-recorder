@@ -22,7 +22,7 @@ classifiers = [
 # Runtime needs are system packages, not wheels: ffmpeg, pulseaudio-utils,
 # python3-gi, gir1.2-gtk-3.0, gir1.2-notify-0.7, gir1.2-appindicator3-0.1,
 # xdg-desktop-portal + gstreamer1.0-pipewire (Wayland capture), x11-utils,
-# x11-xserver-utils (X11 capture). See README / the .deb for the full list.
+# x11-xserver-utils (X11 capture). See README for the full list.
 dependencies = []
 
 [project.scripts]

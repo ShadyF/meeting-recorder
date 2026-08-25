@@ -67,7 +67,9 @@ never records without consent.
 - Everything runs on one **GLib main loop**; ships as a `systemctl --user` service.
 
 ## Environment assumptions
-Ubuntu 24.04, **X11 or Wayland** (X11 is the recommended/steadier path; the
+Source use is supported on Ubuntu 24.04. GitHub releases publish the runtime
+image to GHCR under the policy in [`docs/CONTAINER-IMAGES.md`](docs/CONTAINER-IMAGES.md).
+The desktop runtime uses **X11 or Wayland** (X11 is the recommended/steadier path; the
 Wayland portal is an extra moving part and can crash mid-session), GNOME, **PipeWire**. Runs on system `python3` using system
 PyGObject — **no pip dependencies**. Requires apt: `ffmpeg`, `pulseaudio-utils`,
 `gir1.2-notify-0.7`; `xdg-desktop-portal` + `gstreamer1.0-pipewire` for Wayland capture,
@@ -94,7 +96,7 @@ Wayland caveats: `Gtk.Window.move()` is a no-op (the compositor places the contr
 `tests/` — zero-dep runner: `python3 tests/run_tests.py` (no pytest needed). Pure functions
 (`parse_source_outputs`, `match_meeting_app`, `DebounceMachine`, `build_ffmpeg_cmd`,
 `build_pipewire_cmd`) are the
-unit-test surface. `systemd/`, `scripts/install.sh` handle packaging.
+unit-test surface. `systemd/` contains the user-service assets.
 
 ## Conventions
 - Keep it dependency-free (stdlib + system `gi` only). No pip packages.

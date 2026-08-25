@@ -17,7 +17,7 @@ docs/**
 .github/
 .github/**
 
-# Keep generated caches and build, distribution, and Debian artifacts out.
+# Keep generated caches and build artifacts out.
 __pycache__/
 **/__pycache__/**
 .pytest_cache/
@@ -28,12 +28,6 @@ build/
 build/**
 dist/
 dist/**
-debian/
-debian/**
-*.deb
-*.changes
-*.buildinfo
-*.dsc
 
 # Allow the application source and the two container helpers.
 !meeting_recorder/

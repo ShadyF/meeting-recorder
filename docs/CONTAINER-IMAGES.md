@@ -4,23 +4,22 @@
 
 Issue #27 defines the intended GHCR release behavior for the runtime image. It
 does not mean that a public image is available yet. The target image name is
-`ghcr.io/shadyf/meeting-recorder`. The first package publish defaults to private:
-the package owner must make it public manually, then rerun the complete release
+`ghcr.io/shadyf/meeting-recorder`. The first image publish defaults to private:
+the image owner must make it public manually, then rerun the complete release
 workflow. Issue #27 remains open until an anonymous digest pull and hardened
 digest smoke both succeed.
 
 This document covers image publishing and consumption. It is not a deployment,
-installation, auto-update, or graphical-capture guide. Debian/APT releases stay
-separate and unchanged. Quadlet installation, update, rollback, confinement,
-and lifecycle are #28; graphical Bluefin validation is #29.
+installation, auto-update, or graphical-capture guide. Quadlet installation,
+update, rollback, confinement, and lifecycle are #28; graphical Bluefin
+validation is #29.
 
 ## Release input and output
 
-The GHCR workflow is separate from other release workflows and uses only the
-permissions needed to publish and attest the image. It runs when a maintainer
-pushes a protected, manually managed Git tag in the form `vX.Y.Z` or
-`vX.Y.Z-prerelease`. Semantic-release is deliberately deferred to a later
-release-pipeline issue.
+The GHCR workflow uses only the permissions needed to publish and attest the
+image. It runs when a maintainer pushes a protected, manually managed Git tag
+in the form `vX.Y.Z` or `vX.Y.Z-prerelease`. Semantic-release is deliberately
+deferred to a later release-pipeline issue.
 
 For a release commit, the workflow publishes these tags:
 
@@ -41,7 +40,8 @@ The publishing workflow pins GitHub Actions by full commit SHA and publishes
 BuildKit maximum provenance plus an SBOM for the released digest. Those
 attestations support source and provenance reproducibility; they do not make the
 result a byte-for-byte reproducible rebuild. The runtime `Containerfile` pins
-its Ubuntu base image, but its live APT inputs can change between builds.
+its Ubuntu base image, but its live Ubuntu archive inputs can change between
+builds.
 
 The workflow's anonymous hardened digest smoke is release verification only. It
 does not install the image, configure a host, test graphical capture, or update
