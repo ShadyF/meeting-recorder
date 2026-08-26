@@ -5,34 +5,32 @@ GNOME desktop. It runs the reviewed image as a rootless Podman **user** Quadlet
 in the graphical desktop session. It is for consented Recording capture, not a
 headless service or a production-validation claim.
 
-This bootstrap release uses its immutable version tag and the Quadlet sets
+This release uses its published image digest and the Quadlet sets
 `Pull=never`:
 
 ```text
-ghcr.io/shadyf/meeting-recorder:0.4.0
+ghcr.io/shadyf/meeting-recorder@sha256:a5c8160590b8913d28fb126297d19e83376e38fb279f3dfb82a1c928de6cb90f
 ```
 
-After v0.4.0 is published and its digest is verified, the current guide and
-Quadlet will be promoted to that digest-qualified image. The final operator
-contract remains digest-qualified; this bootstrap tag is safe only because the
-release workflow makes the `:0.4.0` version tag immutable.
+The operator contract is digest-qualified. `Pull=never` keeps the user manager
+from pulling or replacing this exact local image during a graphical session.
 
 There is no installer or wrapper, Compose deployment, automatic pull or update,
 host networking, privileged container, device access, extra capability, broad
 home/runtime-directory mount, or raw PipeWire socket mount. Do not add any of
 those to make a local problem appear to work.
 
-## Obtain the matching release checkout
+## Obtain the matching deployment checkout
 
 Pulling an image supplies no Quadlet or X11 drop-in files. Before copying either
-file, obtain the source checkout or release archive that matches this bootstrap
-image tag. The commands below create a detached, version-consistent checkout; an
-archive is equivalent only when it is from that same tag and contains the same
-reviewed files.
+file, obtain the release checkout or archive that contains the reviewed
+deployment files for this digest. The commands below create a detached checkout;
+an archive is equivalent only when it is from that same tag and contains the
+same reviewed files.
 
 ```bash
-IMAGE='ghcr.io/shadyf/meeting-recorder:0.4.0'
-RELEASE_TAG='v0.4.0'
+IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:a5c8160590b8913d28fb126297d19e83376e38fb279f3dfb82a1c928de6cb90f'
+RELEASE_TAG='v0.4.1'
 SOURCE_DIR="$HOME/src/meeting-recorder-$RELEASE_TAG"
 
 git clone https://github.com/ShadyF/meeting-recorder.git "$SOURCE_DIR"
@@ -44,7 +42,7 @@ test -f "$SOURCE_DIR/deploy/bluefin/meeting-recorder.container.d/50-x11.conf"
 ```
 
 The tag checks, `grep`, and file check confirm that the files copied below are
-the reviewed bootstrap files. Do not copy deployment files from an unrelated
+the reviewed release files. Do not copy deployment files from an unrelated
 checkout, branch, or later release. This remains a direct copy procedure, not an
 installer.
 
@@ -163,7 +161,7 @@ this JSON. Calendar credentials belong in the host Secret Service.
 
 ## Pull the reviewed image and choose Speakr handling
 
-Pull and inspect the immutable bootstrap version tag before the service is
+Pull and inspect the published image digest before the service is
 created. `Pull=never` means the user manager will not pull or replace it during
 a graphical session.
 
@@ -378,13 +376,12 @@ expose the callback beyond loopback.
 
 There are no automatic image updates. Stop cleanly, retain the old local image,
 pull and inspect a verified new digest, edit only `Image=` in the copied Quadlet,
-reload, and start. Promote the bootstrap tag to the verified v0.4.0 digest using
-this procedure after publication:
+reload, and start. Use this procedure to update from the published v0.4.0 digest:
 
 ```bash
 UNIT="$HOME/.config/containers/systemd/meeting-recorder.container"
-OLD_IMAGE='ghcr.io/shadyf/meeting-recorder:0.4.0'
-NEW_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:REPLACE_WITH_VERIFIED_V0.4.0_DIGEST'
+OLD_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:a5c8160590b8913d28fb126297d19e83376e38fb279f3dfb82a1c928de6cb90f'
+NEW_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:REPLACE_WITH_VERIFIED_NEW_DIGEST'
 
 systemctl --user stop meeting-recorder.service
 podman image inspect "$OLD_IMAGE"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read and safely create immutable container registry aliases with Buildx."""
+"""Read registry identities and safely manage immutable aliases and mutable tags."""
 
 from __future__ import annotations
 
@@ -303,6 +303,32 @@ def alias_command(arguments: argparse.Namespace, registry: Registry) -> int:
     return 0
 
 
+def move_command(arguments: argparse.Namespace, registry: Registry) -> int:
+    """Set a policy-approved mutable tag to a proven immutable source identity."""
+    # Verify the immutable source before any mutable tag update can occur.
+    digest = _digest(arguments.source_digest)
+    expected = _expected(arguments)
+    _require(registry.inspect(arguments.image, "@" + digest), digest, expected)
+
+    # Inspect the current target so an exact match avoids an unnecessary registry write.
+    try:
+        target = registry.inspect(arguments.image, arguments.target_tag)
+    except NotFound:
+        target = None
+    if target is not None and target.digest == digest:
+        _require(target, digest, expected)
+        action = "noop"
+    else:
+        # Buildx creates an absent tag or updates an existing mutable tag in the registry.
+        registry.create(_token(arguments.image, "image", _IMAGE), digest, _token(arguments.target_tag, "target tag", _TAG))
+        action = "moved"
+
+    # Re-read the mutable tag so the requested identity is proven after the command returns.
+    _require(registry.inspect(arguments.image, arguments.target_tag), digest, expected)
+    append_github_output(Path(arguments.github_output), {"digest": digest, "action": action})
+    return 0
+
+
 def verify_command(arguments: argparse.Namespace, registry: Registry) -> int:
     """Wait a bounded time for every immutable tag to become consistently visible."""
     # Validate inputs once before bounded propagation reads begin.
@@ -335,6 +361,10 @@ def build_parser() -> argparse.ArgumentParser:
     alias = commands.add_parser("alias")
     alias.add_argument("--image", required=True); alias.add_argument("--source-digest", required=True); alias.add_argument("--target-tag", required=True)
     alias.add_argument("--expected-version", required=True); alias.add_argument("--expected-revision", required=True); alias.add_argument("--expected-source", required=True); alias.add_argument("--github-output", required=True)
+    # Keep mutable tag updates separate from immutable alias creation.
+    move = commands.add_parser("move")
+    move.add_argument("--image", required=True); move.add_argument("--source-digest", required=True); move.add_argument("--target-tag", required=True)
+    move.add_argument("--expected-version", required=True); move.add_argument("--expected-revision", required=True); move.add_argument("--expected-source", required=True); move.add_argument("--github-output", required=True)
     verify = commands.add_parser("verify")
     verify.add_argument("--image", required=True); verify.add_argument("--digest", required=True); verify.add_argument("--tag", action="append", required=True)
     verify.add_argument("--expected-version", required=True); verify.add_argument("--expected-revision", required=True); verify.add_argument("--expected-source", required=True); verify.add_argument("--attempts", type=int, required=True); verify.add_argument("--github-output", required=True)
@@ -347,7 +377,7 @@ def main(argv: Sequence[str] | None = None, registry: Registry | None = None) ->
     try:
         arguments = build_parser().parse_args(argv)
         active_registry = registry or Registry()
-        return {"inspect": inspect_command, "alias": alias_command, "verify": verify_command}[arguments.command](arguments, active_registry)
+        return {"inspect": inspect_command, "alias": alias_command, "move": move_command, "verify": verify_command}[arguments.command](arguments, active_registry)
     except (OSError, RegistryError, subprocess.SubprocessError):
         print("container registry operation failed", file=sys.stderr)
         return 2

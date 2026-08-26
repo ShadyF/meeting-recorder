@@ -6,6 +6,16 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-08-26
+
+### Fixed
+- Mutable `latest` promotion now separates policy-approved tag movement from
+  immutable alias creation.
+
+### Changed
+- Bluefin deployment now moves from the bootstrap version tag to the verified
+  v0.4.0 digest.
+
 ## [0.4.0] — 2026-08-26
 
 ### Added
@@ -386,6 +396,7 @@ First release.
   apply to new recordings only.
 - Drag-selecting a capture region needs the optional `slop` package.
 
+[0.4.1]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.1
 [0.4.0]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.0
 [0.3.5]: https://github.com/ssKazal/meeting-recorder/releases/tag/v0.3.5
 [0.3.4]: https://github.com/ssKazal/meeting-recorder/releases/tag/v0.3.4

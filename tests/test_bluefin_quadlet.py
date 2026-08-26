@@ -30,14 +30,14 @@ def _section_values(text: str, section: str, name: str) -> list[str]:
 
 
 def test_base_unit_pins_the_image_and_confines_the_container() -> None:
-    """Keep the bootstrap image immutable and the desktop container unprivileged."""
+    """Keep the published image immutable and the desktop container unprivileged."""
 
     # Read the complete production unit before checking its independent policies.
     text = UNIT.read_text(encoding="utf-8")
 
-    # Require the immutable bootstrap version tag and an offline pull policy.
+    # Require the published image digest and an offline pull policy.
     assert _section_values(text, "Container", "Image") == [
-        "ghcr.io/shadyf/meeting-recorder:0.4.0"
+        "ghcr.io/shadyf/meeting-recorder@sha256:a5c8160590b8913d28fb126297d19e83376e38fb279f3dfb82a1c928de6cb90f"
     ]
     assert _section_values(text, "Container", "Pull") == ["never"]
 

@@ -311,7 +311,7 @@ jobs:
           SOURCE: ${{ needs.validate.outputs.source }}
         run: |
           set -euo pipefail
-          python3 scripts/container-registry.py alias --image "$IMAGE" --source-digest "$DIGEST" --target-tag latest --expected-version "$VERSION" --expected-revision "$REVISION" --expected-source "$SOURCE" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/container-registry.py move --image "$IMAGE" --source-digest "$DIGEST" --target-tag latest --expected-version "$VERSION" --expected-revision "$REVISION" --expected-source "$SOURCE" --github-output "$GITHUB_OUTPUT"
 
       - name: Verify moved or unchanged latest tag
         if: steps.latest.outputs.action == 'move' || steps.latest.outputs.action == 'noop'

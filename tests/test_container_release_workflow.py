@@ -42,6 +42,7 @@ def test_registry_policy_build_and_digest_flow() -> None:
     assert "python3 scripts/container-release.py latest" in text
     assert "python3 scripts/container-registry.py inspect" in text
     assert "python3 scripts/container-registry.py alias" in text
+    assert "python3 scripts/container-registry.py move" in text
     assert "python3 scripts/container-registry.py verify" in text
     assert "\n          scripts/container-release.py" not in text
     assert "\n          scripts/container-registry.py" not in text
@@ -66,6 +67,8 @@ def test_registry_policy_build_and_digest_flow() -> None:
     publish = text.split("  publish:\n", 1)[1].split("  anonymous-smoke:\n", 1)[0]
     assert "--target-tag latest" not in publish
     assert "--target-tag latest --expected-version" in promote_latest
+    assert "container-registry.py move --image \"$IMAGE\"" in promote_latest
+    assert "container-registry.py alias --image \"$IMAGE\" --source-digest \"$DIGEST\" --target-tag latest" not in promote_latest
     assert "Inspect the latest tag after anonymous acceptance" in promote_latest
     assert "needs.publish.outputs.digest" in promote_latest
     assert "--target-tag latest --expected-version" in text

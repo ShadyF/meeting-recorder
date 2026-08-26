@@ -173,6 +173,11 @@ def alias_args(output: Path) -> list[str]:
     return ["alias", "--image", IMAGE, "--source-digest", DIGEST, "--target-tag", "v1", "--expected-version", "1.2.3", "--expected-revision", "c" * 40, "--expected-source", "https://example.test/repo", "--github-output", str(output)]
 
 
+def move_args(output: Path) -> list[str]:
+    """Return a complete mutable-tag move command with trusted expected labels."""
+    return ["move", "--image", IMAGE, "--source-digest", DIGEST, "--target-tag", "latest", "--expected-version", "1.2.3", "--expected-revision", "c" * 40, "--expected-source", "https://example.test/repo", "--github-output", str(output)]
+
+
 def test_alias_creates_absent_target_and_postverifies() -> None:
     """A missing alias is created once and then read back exactly."""
     # Queue source inspection, target absence, create, and final target inspection.
@@ -205,6 +210,28 @@ def test_alias_rejects_target_conflict_and_source_label_mismatch() -> None:
         wrong_labels = dict(LABELS); wrong_labels["org.opencontainers.image.version"] = "wrong"
         mismatch = FakeRunner(inspection_replies(metadata=image_metadata(wrong_labels)))
         assert registry_module.main(alias_args(output), registry_module.Registry(mismatch)) == 2
+
+
+def test_move_replaces_a_differing_target_and_postverifies() -> None:
+    """A policy-approved move updates a mutable target with a different digest."""
+    # Queue source inspection, differing target, update, and final target inspection.
+    fake = FakeRunner(inspection_replies() + inspection_replies(digest=CHILD) + [result()] + inspection_replies())
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "out"
+        assert registry_module.main(move_args(output), registry_module.Registry(fake)) == 0
+        assert output.read_text().endswith(f"digest={DIGEST}\naction=moved\n")
+    assert any(call[3] == "create" for call in fake.calls)
+
+
+def test_move_matching_target_is_a_noop_without_create() -> None:
+    """An already matching mutable target is verified without a registry update."""
+    # Queue source, target, and post-check inspections with no create reply.
+    fake = FakeRunner(inspection_replies() + inspection_replies() + inspection_replies())
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "out"
+        assert registry_module.main(move_args(output), registry_module.Registry(fake)) == 0
+        assert output.read_text().endswith("action=noop\n")
+    assert not any(call[3] == "create" for call in fake.calls)
 
 
 def verify_args(output: Path, attempts: str = "2") -> list[str]:
