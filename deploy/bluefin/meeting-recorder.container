@@ -6,8 +6,8 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Container]
-# Pin the published release by digest so the local image is exact and immutable.
-Image=ghcr.io/shadyf/meeting-recorder@sha256:a5c8160590b8913d28fb126297d19e83376e38fb279f3dfb82a1c928de6cb90f
+# Pin the published v0.4.1 release by digest so the local image is exact and immutable.
+Image=ghcr.io/shadyf/meeting-recorder@sha256:f9514278412cb399f29dcbcaabd3d3be85e1b9b87dcf61cfbd32b026ffe83949
 Pull=never
 ContainerName=meeting-recorder
 

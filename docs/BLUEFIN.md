@@ -5,11 +5,11 @@ GNOME desktop. It runs the reviewed image as a rootless Podman **user** Quadlet
 in the graphical desktop session. It is for consented Recording capture, not a
 headless service or a production-validation claim.
 
-This release uses its published image digest and the Quadlet sets
+This v0.4.1 release uses its published image digest and the Quadlet sets
 `Pull=never`:
 
 ```text
-ghcr.io/shadyf/meeting-recorder@sha256:a5c8160590b8913d28fb126297d19e83376e38fb279f3dfb82a1c928de6cb90f
+ghcr.io/shadyf/meeting-recorder@sha256:f9514278412cb399f29dcbcaabd3d3be85e1b9b87dcf61cfbd32b026ffe83949
 ```
 
 The operator contract is digest-qualified. `Pull=never` keeps the user manager
@@ -23,28 +23,28 @@ those to make a local problem appear to work.
 ## Obtain the matching deployment checkout
 
 Pulling an image supplies no Quadlet or X11 drop-in files. Before copying either
-file, obtain the release checkout or archive that contains the reviewed
+file, obtain the deployment checkout or archive that contains the reviewed
 deployment files for this digest. The commands below create a detached checkout;
-an archive is equivalent only when it is from that same tag and contains the
-same reviewed files.
+an archive is equivalent only when it is from that same deployment tag and
+contains the same reviewed files.
 
 ```bash
-IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:a5c8160590b8913d28fb126297d19e83376e38fb279f3dfb82a1c928de6cb90f'
-RELEASE_TAG='v0.4.1'
-SOURCE_DIR="$HOME/src/meeting-recorder-$RELEASE_TAG"
+IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:f9514278412cb399f29dcbcaabd3d3be85e1b9b87dcf61cfbd32b026ffe83949'
+DEPLOYMENT_TAG='bluefin-v0.4.1'
+SOURCE_DIR="$HOME/src/meeting-recorder-$DEPLOYMENT_TAG"
 
 git clone https://github.com/ShadyF/meeting-recorder.git "$SOURCE_DIR"
-git -C "$SOURCE_DIR" checkout --detach "$RELEASE_TAG"
-test "$(git -C "$SOURCE_DIR" for-each-ref --format='%(objecttype)' "refs/tags/$RELEASE_TAG")" = tag
-test "$(git -C "$SOURCE_DIR" describe --exact-match --tags HEAD)" = "$RELEASE_TAG"
+git -C "$SOURCE_DIR" checkout --detach "$DEPLOYMENT_TAG"
+test "$(git -C "$SOURCE_DIR" for-each-ref --format='%(objecttype)' "refs/tags/$DEPLOYMENT_TAG")" = tag
+test "$(git -C "$SOURCE_DIR" describe --exact-match --tags HEAD)" = "$DEPLOYMENT_TAG"
 grep -Fx "Image=$IMAGE" "$SOURCE_DIR/deploy/bluefin/meeting-recorder.container"
 test -f "$SOURCE_DIR/deploy/bluefin/meeting-recorder.container.d/50-x11.conf"
 ```
 
-The tag checks, `grep`, and file check confirm that the files copied below are
-the reviewed release files. Do not copy deployment files from an unrelated
-checkout, branch, or later release. This remains a direct copy procedure, not an
-installer.
+The deployment tag checks, `grep`, and file check confirm that the files copied
+below are the reviewed deployment files. Do not copy deployment files from an
+unrelated deployment checkout, branch, or later deployment tag. This remains a
+direct copy procedure, not an installer.
 
 ## Security boundary and trust decision
 
@@ -376,12 +376,13 @@ expose the callback beyond loopback.
 
 There are no automatic image updates. Stop cleanly, retain the old local image,
 pull and inspect a verified new digest, edit only `Image=` in the copied Quadlet,
-reload, and start. Use this procedure to update from the published v0.4.0 digest:
+reload, and start. Use this procedure to update from the published v0.4.0 digest
+to the published v0.4.1 digest:
 
 ```bash
 UNIT="$HOME/.config/containers/systemd/meeting-recorder.container"
 OLD_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:a5c8160590b8913d28fb126297d19e83376e38fb279f3dfb82a1c928de6cb90f'
-NEW_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:REPLACE_WITH_VERIFIED_NEW_DIGEST'
+NEW_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:f9514278412cb399f29dcbcaabd3d3be85e1b9b87dcf61cfbd32b026ffe83949'
 
 systemctl --user stop meeting-recorder.service
 podman image inspect "$OLD_IMAGE"

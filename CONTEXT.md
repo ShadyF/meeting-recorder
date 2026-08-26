@@ -164,9 +164,9 @@ is activated in a future GNOME session/login. A `daemon-reload` does not start a
 new want for an already-active target, so the operator explicitly starts the
 generated service for the current session; `PartOf=graphical-session.target`
 stops it with that target. Real graphical lifecycle evidence remains with #29.
-The bootstrap v0.4.0 source unit explicitly uses the immutable `:0.4.0` version
-tag with `Pull=never` pending same-release digest promotion. The final operator
-contract remains a digest-qualified image with `Pull=never`; there are no
+The `bluefin-v0.4.1` deployment unit pins the published v0.4.1 image digest with
+`Pull=never`. The operator contract remains a digest-qualified image with
+`Pull=never`; there are no
 wrappers, installers, Compose deployment, auto-updates, host networking,
 privileged mode, devices, broad home/runtime mounts, or raw PipeWire socket.
 
