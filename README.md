@@ -5,7 +5,7 @@ nothing. Stops automatically when the call ends.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux%20%7C%20X11%20%7C%20Wayland-blue)
-![Version](https://img.shields.io/badge/version-0.3.5-green)
+![Version](https://img.shields.io/badge/version-0.4.0-green)
 
 No more remembering to hit record. The app sits in the background, notices when a call starts, and
 asks:
@@ -175,6 +175,14 @@ public image already exists until its first publish and anonymous digest smoke
 succeed. Quadlet confinement and lifecycle belong to #28, and real Bluefin host
 validation belongs to #29. Live capture has not been validated by this image
 contract.
+
+### Bluefin rootless Podman operators
+
+For the canonical direct-command Quadlet guide—including the pinned digest,
+trusted-desktop security boundary, exact desktop sockets, manual lifecycle,
+update, rollback, secret-file handling, and removal steps—see [Bluefin GNOME /
+rootless Podman operator guide](docs/BLUEFIN.md). It is not evidence of
+real-host graphical validation; issue #29 owns that validation.
 
 <details>
 <summary>Optional: better noise cancellation</summary>
@@ -346,8 +354,9 @@ scans historical directories to create jobs. For `meeting-recorder record`, the
 automatic enqueue happens after its GLib loop exits; the daemon worker attempts the
 durable job later.
 
-Configure the production Speakr origin with `speakr_url`; it must use HTTPS. The
-bearer token remains available only through `MEETING_RECORDER_SPEAKR_TOKEN`:
+Configure the production Speakr origin with `speakr_url`; it must use HTTPS. For
+native/source use, provide the bearer token only through
+`MEETING_RECORDER_SPEAKR_TOKEN`:
 
 ```bash
 MEETING_RECORDER_SPEAKR_TOKEN='…' meeting-recorder speakr upload PATH
@@ -361,7 +370,8 @@ and 0600 SQLite boundary. The database contains no credentials or copied private
 Meeting title, notes, or participants. Publication state lives at
 `$XDG_STATE_HOME/meeting-recorder/publications.sqlite3` (or
 `~/.local/state/meeting-recorder/publications.sqlite3` when `XDG_STATE_HOME` is
-unset).
+unset). The Bluefin Quadlet instead mounts the token as its fixed mode-`0400`
+secret file; see [Bluefin GNOME / rootless Podman operator guide](docs/BLUEFIN.md).
 
 Automatic and normal explicit network attempts are admitted only when
 NetworkManager reports an active Wi-Fi SSID that exactly matches an entry in
@@ -479,7 +489,7 @@ restart the service after changing these keys.
 | `min_recording_seconds` | Discard recordings shorter than this |
 | `google_calendar_client_id` | Optional bare user-owned Google Desktop OAuth client ID; no secret or credential JSON |
 | `google_calendar_loopback_port` | OAuth loopback port: `0` for an OS-selected port (default), or `1`--`65535` |
-| `speakr_url` | Public Speakr HTTPS origin in production; the bearer token must come from `MEETING_RECORDER_SPEAKR_TOKEN` |
+| `speakr_url` | Public Speakr HTTPS origin in production; native/source use supplies the bearer token through `MEETING_RECORDER_SPEAKR_TOKEN` (the Bluefin Quadlet uses its documented secret file) |
 | `speakr_publication_mode` | `disabled` (default), `manual`, or `automatic`; controls automatic enqueueing and daemon attempts |
 | `speakr_allowed_ssids` | `[]` by default; exact, case-sensitive Wi-Fi SSID strings, each at most 32 UTF-8 bytes; no trimming or normalization |
 | `allowlist` | `{"match": "<substring>", "app": "<Display Name>"}` rules |

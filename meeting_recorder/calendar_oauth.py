@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import hashlib
 import hmac
 import json
@@ -35,6 +36,10 @@ SCOPES = (
 _CLIENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.apps\.googleusercontent\.com$")
 _CALLBACK_PATH = "/oauth2/callback"
 _CONNECTION_TIMEOUT_SECONDS = 10
+_LOOPBACK_LISTEN_ADDRESSES = frozenset({"127.0.0.1", "0.0.0.0"})
+_PORTAL_TIMEOUT_SECONDS = 10
+_PORTAL_MAX_BUFFERED_RESPONSES = 4
+_PORTAL_CLOSE_TIMEOUT_MILLISECONDS = 1000
 
 
 class CalendarError(RuntimeError):
@@ -76,6 +81,14 @@ def validate_loopback_port(port: Any) -> int:
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
         raise CalendarConfigurationError("Google Calendar loopback port must be 0 or 1..65535")
     return port
+
+
+def validate_listener_address(address: Any) -> str:
+    """Accept only listener addresses that are safe for the container callback."""
+    # Reject every address except the two explicit container listener choices.
+    if not isinstance(address, str) or address not in _LOOPBACK_LISTEN_ADDRESSES:
+        raise CalendarConfigurationError("Google OAuth listener address is malformed")
+    return address
 
 
 def create_pkce_verifier() -> str:
@@ -157,6 +170,122 @@ def _post_form(url: str, data: dict[str, str], timeout: float) -> tuple[int, byt
         raise CalendarUnavailableError("Google validation is temporarily unavailable") from exc
 
 
+def _portal_open_uri_response(uri: str, *, gio: Any | None = None,
+                              glib: Any | None = None) -> int | None:
+    """Request a host-browser launch through the session portal and await its response."""
+    # Load GI only for the managed portal path so native and headless imports stay usable.
+    if gio is None or glib is None:
+        from gi.repository import Gio, GLib
+        gio = Gio if gio is None else gio
+        glib = GLib if glib is None else glib
+
+    # Connect to the existing session bus without using a browser or host command.
+    connection = gio.bus_get_sync(gio.BusType.SESSION, None)
+    loop = glib.MainLoop()
+    request_path = ""
+    response_code: int | None = None
+    buffered_responses: deque[tuple[str, Any]] = deque(maxlen=_PORTAL_MAX_BUFFERED_RESPONSES)
+    timeout_source = 0
+    timed_out = False
+
+    def handle_response(object_path: str, parameters: Any) -> None:
+        nonlocal response_code
+
+        # Ignore signals for other portal requests and malformed response payloads.
+        if object_path != request_path:
+            return
+        try:
+            values = parameters.unpack()
+        except Exception:
+            return
+        if not isinstance(values, tuple) or len(values) != 2:
+            return
+        code = values[0]
+        if isinstance(code, bool) or not isinstance(code, int):
+            return
+
+        # Finish the bounded wait once the matching portal request responds.
+        response_code = code
+        loop.quit()
+
+    def on_response(_connection: Any, _sender: str, object_path: str,
+                    _interface: str, _signal: str, parameters: Any, _data: Any) -> None:
+        # Buffer early signals until OpenURI returns the request object to filter against.
+        if not request_path:
+            buffered_responses.append((object_path, parameters))
+            return
+        handle_response(object_path, parameters)
+
+    def on_timeout() -> None:
+        nonlocal timed_out, timeout_source
+
+        # Mark the source as consumed before leaving the loop to avoid stale removal.
+        timed_out = True
+        timeout_source = 0
+        loop.quit()
+
+    # Subscribe before issuing OpenURI so a fast Request.Response cannot be missed.
+    subscription = connection.signal_subscribe(
+        "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request", "Response",
+        None, None, gio.DBusSignalFlags.NONE, on_response)
+    try:
+        # Send the exact OpenURI request with no parent window and no extra options.
+        reply = connection.call_sync(
+            "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.OpenURI", "OpenURI",
+            glib.Variant("(ssa{sv})", ("", uri, {})), None,
+            gio.DBusCallFlags.NONE, _PORTAL_TIMEOUT_SECONDS * 1000, None)
+
+        # Accept only the single object path returned by the portal Request API.
+        values = reply.unpack()
+        if not isinstance(values, tuple) or len(values) != 1 or not isinstance(values[0], str):
+            return None
+        # Keep only absolute request object paths for response signal filtering.
+        request_path = values[0]
+        if not request_path.startswith("/"):
+            return None
+
+        # Process any matching response that arrived during the synchronous method call.
+        for object_path, parameters in buffered_responses:
+            handle_response(object_path, parameters)
+        if response_code is not None:
+            return response_code
+
+        # Bound the Request.Response wait after a well-formed portal reply.
+        timeout_source = glib.timeout_add_seconds(_PORTAL_TIMEOUT_SECONDS, on_timeout)
+        loop.run()
+        # Cancel a timed-out portal request so it cannot launch a browser later.
+        if timed_out and response_code is None:
+            try:
+                connection.call_sync(
+                    "org.freedesktop.portal.Desktop", request_path,
+                    "org.freedesktop.portal.Request", "Close", None, None,
+                    gio.DBusCallFlags.NONE, _PORTAL_CLOSE_TIMEOUT_MILLISECONDS, None)
+            except Exception:
+                pass
+        return response_code
+    finally:
+        # Remove all GLib and D-Bus registrations before leaving the portal path.
+        if timeout_source:
+            glib.source_remove(timeout_source)
+        connection.signal_unsubscribe(subscription)
+
+
+def _open_uri_with_portal(
+    uri: str, transport: Callable[[str], int | None] | None = None,
+) -> bool:
+    """Convert portal dispatch outcomes into the browser opener's boolean contract."""
+    # Keep the GI transport replaceable for deterministic tests without a session bus.
+    open_request = _portal_open_uri_response if transport is None else transport
+    try:
+        response_code = open_request(uri)
+    except Exception:
+        return False
+
+    # Only the portal's exact success code confirms browser dispatch.
+    return isinstance(response_code, int) and not isinstance(response_code, bool) and response_code == 0
+
+
 def _json_response(body: bytes) -> dict[str, Any]:
     try:
         data = json.loads(body.decode("utf-8"))
@@ -194,25 +323,47 @@ class CalendarOAuth:
 
     def __init__(self, config: Any, *, secret_store: CalendarSecrets | None = None,
                  post_form: Callable[[str, dict[str, str], float], tuple[int, bytes]] = _post_form,
-                 browser_open: Callable[[str], bool] = webbrowser.open,
+                 browser_open: Callable[[str], bool] | None = None,
+                 portal_open: Callable[[str], bool] = _open_uri_with_portal,
                  server_factory: Callable[..., HTTPServer] = HTTPServer,
                  cache_clear: Callable[[], None] = clear_calendar_cache,
                  callback_timeout: float = 120, max_callback_requests: int = 3) -> None:
         self.config = config
         self.secrets = secret_store or CalendarSecrets()
         self._post_form = post_form
-        self._browser_open = browser_open
+
+        # Remember whether callers explicitly selected a browser dispatch seam.
+        self._browser_open = webbrowser.open if browser_open is None else browser_open
+        self._browser_open_is_injected = browser_open is not None
+        self._portal_open = portal_open
         self._server_factory = server_factory
         self._cache_clear = cache_clear
         self._callback_timeout = callback_timeout
         self._max_callback_requests = max_callback_requests
 
-    def _configuration(self) -> tuple[str | None, int]:
+    def _configuration(self) -> tuple[str | None, int, str]:
+        """Load the client configuration and the local listener binding."""
+        # Validate optional listener overrides before binding any callback socket.
         port = validate_loopback_port(self.config.google_calendar_loopback_port)
+        listener = validate_listener_address(
+            os.environ.get("MEETING_RECORDER_GOOGLE_OAUTH_LISTEN_ADDRESS", "127.0.0.1"))
         raw_client = self.config.google_calendar_client_id
         if raw_client == "":
-            return None, port
-        return validate_client_id(raw_client), port
+            return None, port, listener
+        return validate_client_id(raw_client), port, listener
+
+    def _open_browser(self, uri: str) -> bool:
+        """Dispatch authorization through the host portal only for managed defaults."""
+        # Keep explicit browser seams authoritative for tests and native callers.
+        if self._browser_open_is_injected:
+            return self._browser_open(uri)
+
+        # Use the session portal from managed containers instead of a local browser command.
+        if os.environ.get("MEETING_RECORDER_MANAGED_CONTAINER") == "1":
+            return self._portal_open(uri)
+
+        # Preserve Python's native browser dispatch outside managed containers.
+        return self._browser_open(uri)
 
     def _request_token(self, data: dict[str, str]) -> dict[str, Any]:
         status, body = self._post_form(TOKEN_URL, data, 15)
@@ -315,13 +466,13 @@ class CalendarOAuth:
 
     def connect(self) -> None:
         """Complete authorization and store only a validated refresh token."""
-        client_id, port = self._configuration()
+        client_id, port, listener = self._configuration()
         if client_id is None:
             raise CalendarConfigurationError("Google Calendar client ID is not configured")
 
         # Binding precedes browser launch so consent never targets a dead listener.
         try:
-            server = self._server_factory(("127.0.0.1", port), BaseHTTPRequestHandler)
+            server = self._server_factory((listener, port), BaseHTTPRequestHandler)
         except OSError as exc:
             raise CalendarUnavailableError(
                 "Could not bind the Google OAuth loopback listener") from exc
@@ -331,7 +482,7 @@ class CalendarOAuth:
             verifier = create_pkce_verifier()
             state = secrets.token_urlsafe(32)
             url = build_authorization_url(client_id, redirect_uri, state, verifier)
-            if not self._browser_open(url):
+            if not self._open_browser(url):
                 raise CalendarUnavailableError("Could not open a browser for Google authorization")
             code = self._wait_for_callback(server, state)
         finally:
@@ -364,7 +515,7 @@ class CalendarOAuth:
     def status(self) -> CalendarStatus:
         """Validate a stored credential without retaining response access tokens."""
         try:
-            client_id, _port = self._configuration()
+            client_id, _port, _listener = self._configuration()
         except CalendarConfigurationError as exc:
             return CalendarStatus("misconfigured", str(exc), 1)
         try:
@@ -399,7 +550,7 @@ class CalendarOAuth:
 
     def access_token(self) -> str:
         """Return one transient refresh-grant access token without persisting it."""
-        client_id, _port = self._configuration()
+        client_id, _port, _listener = self._configuration()
         if client_id is None:
             raise CalendarConfigurationError("Google Calendar client ID is not configured")
         try:

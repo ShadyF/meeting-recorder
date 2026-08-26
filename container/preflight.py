@@ -20,6 +20,8 @@ from zoneinfo import ZoneInfo
 _MAX_ERROR_LENGTH = 128
 _MAX_ERRORS = 4
 _TIMEZONE_SHAPE = re.compile(r"^[^/\s\x00]+(?:/[^/\s\x00]+)+$")
+_X11_DISPLAY = re.compile(r"^:(\d+)(?:\.\d+)?$")
+_X11_SOCKET_ROOT = Path("/tmp/.X11-unix")
 
 
 def _runtime_path(runtime_dir: str | None, child: str) -> Path:
@@ -139,6 +141,32 @@ def dbus_socket_path(address: str | None, runtime_dir: str | None) -> Path | Non
     raise ValueError("DBUS_SESSION_BUS_ADDRESS has no filesystem Unix path")
 
 
+def x11_socket_path(display: str | None, socket_root: Path = _X11_SOCKET_ROOT) -> Path | None:
+    """Resolve only the local X11 display form mounted by the container."""
+    # Require the exact local display notation to avoid accepting remote displays.
+    if not isinstance(display, str):
+        return None
+    match = _X11_DISPLAY.fullmatch(display)
+    if match is None:
+        raise ValueError("DISPLAY is malformed")
+    return socket_root / f"X{match.group(1)}"
+
+
+def _validate_xauthority(path_value: str | None) -> str | None:
+    """Require a readable, nonempty regular Xauthority file without exposing it."""
+    # Treat missing, unsafe, and unusable authority files as one redacted failure.
+    if not path_value or "\x00" in path_value:
+        return "Xauthority file is unavailable"
+    try:
+        metadata = os.stat(path_value)
+    except OSError:
+        return "Xauthority file is unavailable"
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_size == 0
+            or not metadata.st_mode & 0o444 or not os.access(path_value, os.R_OK)):
+        return "Xauthority file is unavailable"
+    return None
+
+
 def _resource_path(
     resolver: Callable[[Mapping[str, str], str | None], Path | None],
     env: Mapping[str, str], resource: str,
@@ -152,7 +180,9 @@ def _resource_path(
     return path, None
 
 
-def validate_environment(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+def validate_environment(
+    env: Mapping[str, str] | None = None, *, x11_socket_root: Path = _X11_SOCKET_ROOT,
+) -> tuple[str, ...]:
     """Return stable, redacted errors for the daemon's local prerequisites."""
     values = os.environ if env is None else env
     errors: list[str] = []
@@ -162,20 +192,41 @@ def validate_environment(env: Mapping[str, str] | None = None) -> tuple[str, ...
     if timezone_error is not None:
         errors.append(timezone_error)
 
-    # Wayland is required even when the display variable is absent.
-    path, error = _resource_path(
-        lambda current, runtime: wayland_socket_path(
-            current.get("WAYLAND_DISPLAY"), runtime),
-        values, "Wayland",
-    )
-    if error is not None:
-        errors.append(error)
-    elif path is None:
-        errors.append("Wayland socket is unavailable")
+    # Validate only the display system selected by the active desktop session.
+    session_type = values.get("XDG_SESSION_TYPE")
+    if session_type == "wayland":
+        path, error = _resource_path(
+            lambda current, runtime: wayland_socket_path(
+                current.get("WAYLAND_DISPLAY"), runtime),
+            values, "Wayland",
+        )
+        if error is not None:
+            errors.append(error)
+        elif path is None:
+            errors.append("Wayland socket is unavailable")
+        else:
+            socket_error = _validate_socket_path(path, "Wayland")
+            if socket_error is not None:
+                errors.append(socket_error)
+    elif session_type == "x11":
+        # Map the selected local display to the mounted X11 socket root.
+        try:
+            path = x11_socket_path(values.get("DISPLAY"), x11_socket_root)
+        except ValueError:
+            errors.append("X11 display is malformed")
+        else:
+            if path is None:
+                errors.append("X11 display is unavailable")
+            else:
+                socket_error = _validate_socket_path(path, "X11")
+                if socket_error is not None:
+                    errors.append(socket_error)
+        # Require the matching authority file after validating the display socket.
+        xauthority_error = _validate_xauthority(values.get("XAUTHORITY"))
+        if xauthority_error is not None:
+            errors.append(xauthority_error)
     else:
-        socket_error = _validate_socket_path(path, "Wayland")
-        if socket_error is not None:
-            errors.append(socket_error)
+        errors.append("desktop session type is unsupported")
 
     # PulseAudio always uses its explicit Unix address or the runtime fallback.
     path, error = _resource_path(

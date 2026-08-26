@@ -120,7 +120,7 @@ def test_source_installer_links_and_removes_only_its_user_files() -> None:
             [str(launcher), "--version"], cwd=temporary_root, env=environment,
             check=True, capture_output=True, text=True,
         )
-        assert version.stdout.strip() == "meeting-recorder 0.3.5"
+        assert version.stdout.strip() == "meeting-recorder 0.4.0"
 
         # Remove the owned integration and prove the launcher, unit, and state are gone.
         subprocess.run([str(installer), "--remove"], cwd=ROOT, env=environment, check=True)

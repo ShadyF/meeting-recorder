@@ -10,7 +10,7 @@ from pathlib import Path
 from meeting_recorder.calendar_oauth import CalendarOAuth
 from meeting_recorder.config import (
     Config, PublicationMode, load_config, load_defaults, load_raw_config,
-    resolve_speakr_url, save_google_calendar_ids, save_user_config,
+    require_speakr_token, resolve_speakr_url, save_google_calendar_ids, save_user_config,
     validate_google_calendar_ids, validate_speakr_allowed_ssids,
 )
 from meeting_recorder.domain import VideoSource
@@ -112,6 +112,26 @@ def test_production_speakr_resolver_requires_https_but_normalizer_keeps_http():
             pass
         else:
             raise AssertionError(f"unsafe Speakr URL accepted: {value!r}")
+
+
+def test_speakr_token_uses_environment_before_the_fixed_container_secret():
+    # Isolate the fixed container secret source without reading any real credential.
+    with patch("meeting_recorder.config._SPEAKR_TOKEN_SECRET_PATH") as secret_path:
+        # Prove the explicit environment token wins over the fixed secret fallback.
+        secret_path.read_text.return_value = "secret-token"
+        assert require_speakr_token({}) == "secret-token"
+        assert require_speakr_token({"MEETING_RECORDER_SPEAKR_TOKEN": "env-token"}) == "env-token"
+        assert not secret_path.read_text.called or secret_path.read_text.call_count == 1
+
+        # Validate both sources with the same existing token restrictions.
+        secret_path.read_text.return_value = "bad token"
+        for values in ({}, {"MEETING_RECORDER_SPEAKR_TOKEN": "bad token"}):
+            try:
+                require_speakr_token(values)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid Speakr token was accepted")
 
 
 def test_speakr_publication_keys_roundtrip_and_credentials_are_scrubbed():

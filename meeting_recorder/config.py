@@ -24,6 +24,7 @@ from .utils import LOG, expand_path
 # Ships inside the package so it resolves the same from a source checkout and an
 # installed system package.
 _DEFAULTS_FILE = Path(__file__).resolve().parent / "default_config.json"
+_SPEAKR_TOKEN_SECRET_PATH = Path("/run/secrets/meeting-recorder-speakr-token")
 _FORBIDDEN_CALENDAR_KEYS = frozenset({
     "access_token",
     "authorization_code",
@@ -237,11 +238,20 @@ def resolve_speakr_url(config: Config, environ: Any | None = None) -> str:
 
 
 def require_speakr_token(environ: Any | None = None) -> str:
-    """Require the on-demand Speakr bearer token from the process environment."""
+    """Require the on-demand Speakr bearer token from its supported sources."""
     values = os.environ if environ is None else environ
-    if "MEETING_RECORDER_SPEAKR_TOKEN" not in values:
-        raise ValueError("Speakr token is not configured")
-    token = values["MEETING_RECORDER_SPEAKR_TOKEN"]
+
+    # Preserve the environment override for native installs and local use.
+    if "MEETING_RECORDER_SPEAKR_TOKEN" in values:
+        token = values["MEETING_RECORDER_SPEAKR_TOKEN"]
+    else:
+        # Read the fixed container secret only when no explicit override exists.
+        try:
+            token = _SPEAKR_TOKEN_SECRET_PATH.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("Speakr token is not configured") from exc
+
+    # Apply the same constraints regardless of where the token was supplied.
     if (
         not isinstance(token, str)
         or not token

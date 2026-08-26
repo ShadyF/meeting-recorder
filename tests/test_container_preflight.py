@@ -37,6 +37,7 @@ def _valid_environment(directory: Path) -> tuple[dict[str, str], list[socket.soc
     # Use explicit session addresses so fallback behavior can be tested separately.
     environment = {
         "TZ": "Etc/UTC",
+        "XDG_SESSION_TYPE": "wayland",
         "WAYLAND_DISPLAY": str(wayland_path),
         "PULSE_SERVER": f"unix:{pulse_path}",
         "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus_path},guid=redacted-test-guid",
@@ -94,7 +95,7 @@ def test_all_required_variables_absent() -> None:
     errors = preflight.validate_environment({})
     assert errors == (
         "TZ is missing",
-        "Wayland socket is unavailable",
+        "desktop session type is unsupported",
         "Pulse socket is unavailable",
         "D-Bus socket is unavailable",
     )
@@ -233,6 +234,7 @@ def test_errors_are_bounded_and_redacted() -> None:
     # Supply hostile values and verify that only safe bounded classifications escape.
     environment = {
         "TZ": secret,
+        "XDG_SESSION_TYPE": secret,
         "WAYLAND_DISPLAY": secret,
         "PULSE_SERVER": f"tcp:{secret}",
         "DBUS_SESSION_BUS_ADDRESS": f"unix:path={secret},guid={secret}",
@@ -242,6 +244,44 @@ def test_errors_are_bounded_and_redacted() -> None:
     assert len(errors) <= 4
     assert all(len(error) <= 128 for error in errors)
     assert all(secret not in error for error in errors)
+
+
+def test_x11_requires_exact_socket_mapping_and_nonempty_authority_file() -> None:
+    """Accept only a local X11 socket and an available authority file."""
+    with tempfile.TemporaryDirectory() as raw_directory:
+        # Keep the X11 socket root and every other test resource private to this test.
+        directory = Path(raw_directory)
+        environment, listeners = _valid_environment(directory)
+        xauthority = directory / "Xauthority"
+        xauthority.write_bytes(b"cookie")
+        x11_directory = directory / "x11-sockets"
+        x11_directory.mkdir()
+        x11, _x11_path = _unix_socket(x11_directory, "X88")
+        try:
+            # Exercise the production display mapping against the isolated socket root.
+            environment.update({
+                "XDG_SESSION_TYPE": "x11",
+                "DISPLAY": ":88",
+                "XAUTHORITY": str(xauthority),
+            })
+            assert preflight.validate_environment(
+                environment, x11_socket_root=x11_directory) == ()
+
+            # Reject remote display forms even when the local socket exists.
+            environment["DISPLAY"] = "localhost:88"
+            assert "X11 display is malformed" in preflight.validate_environment(
+                environment, x11_socket_root=x11_directory)
+
+            # Reject empty authority files after the exact socket mapping succeeds.
+            environment["DISPLAY"] = ":88"
+            xauthority.write_bytes(b"")
+            assert "Xauthority file is unavailable" in preflight.validate_environment(
+                environment, x11_socket_root=x11_directory)
+        finally:
+            # Close the isolated socket before TemporaryDirectory removes its path.
+            x11.close()
+            for listener in listeners:
+                listener.close()
 
 
 def test_cli_returns_stable_nonzero_for_invalid_resources() -> None:
@@ -275,7 +315,7 @@ def test_launcher_bypasses_preflight_for_other_commands() -> None:
         check=False,
     )
     assert result.returncode == 0
-    assert "meeting-recorder 0.3.5" in result.stdout
+    assert "meeting-recorder 0.4.0" in result.stdout
 
 
 def _controlled_launcher_invocation(arguments: list[str]) -> tuple[bool, list[str]]:

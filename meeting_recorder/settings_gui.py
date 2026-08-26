@@ -8,6 +8,8 @@ and written back untouched. Launch with:  python -m meeting_recorder settings
 from __future__ import annotations
 
 import shutil
+import os
+import signal
 import subprocess
 import sys
 
@@ -340,9 +342,17 @@ class SettingsWindow(Gtk.Window):
         if _restart_service():
             self.status.set_markup(
                 "<span foreground='#2e7d32'>Saved and applied.</span>")
+            # The container supervisor recreates the daemon after PID 1 exits.
+            if os.environ.get("MEETING_RECORDER_MANAGED_CONTAINER") == "1":
+                self.close()
             return
         # Saved, but the running daemon still has the old values — say so
         # rather than implying the change took effect.
+        if os.environ.get("MEETING_RECORDER_MANAGED_CONTAINER") == "1":
+            self.status.set_markup(
+                "<span foreground='#b26a00'>Saved, but the container daemon could "
+                "not be restarted — settings are not applied.</span>")
+            return
         self.status.set_markup(
             "<span foreground='#b26a00'>Saved, but the background service could "
             "not be restarted — run <tt>meeting-recorder restart</tt> to apply."
@@ -350,6 +360,17 @@ class SettingsWindow(Gtk.Window):
 
 
 def _restart_service() -> bool:
+    """Apply saved settings through the active service supervisor."""
+    # Let Quadlet's restart policy recreate the container daemon without host control.
+    if os.environ.get("MEETING_RECORDER_MANAGED_CONTAINER") == "1":
+        try:
+            os.kill(1, signal.SIGTERM)
+        except OSError as exc:
+            LOG.warning("Could not signal managed container daemon: %s", exc)
+            return False
+        return True
+
+    # Keep the native user-service behavior unchanged outside managed containers.
     try:
         r = subprocess.run(
             ["systemctl", "--user", "restart", "meeting-recorder.service"],

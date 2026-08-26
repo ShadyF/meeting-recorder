@@ -117,9 +117,11 @@ project application or Python packages with `pip`.
 **Runtime host contract**:
 The host-side services and runtime resources that the image does not provide:
 the compositor, portal backend, PipeWire/Pulse server, buses, NetworkManager,
-Secret Service keyring, browser, valid `TZ`, Wayland and Pulse sockets, session
-bus, and writable XDG/Recording paths. Wayland capture receives the portal
-connection; it does not require a raw PipeWire socket.
+Secret Service keyring, browser, valid `TZ`, selected desktop transport, Pulse
+socket, session bus, and writable XDG/Recording paths. The selected transport is
+a Wayland socket for the Wayland profile, or the exact local X11 socket and
+readable Xauthority file for the best-effort X11 profile. Wayland capture
+receives the portal connection; it does not require a raw PipeWire socket.
 
 **Container release**:
 The GHCR publication of the Runtime image from a protected, manually managed
@@ -136,11 +138,14 @@ The image defaults `XDG_CONFIG_HOME` to `/config`, `XDG_STATE_HOME` to `/state`,
 entrypoint and its no-argument default is the `run` subcommand. It selects no
 fixed user; ownership, persistence, and writable mounts are runtime concerns.
 
-Daemon startup requires a valid `TZ`, Wayland socket, PulseAudio socket, and
-session bus. Headless administrative commands remain available without
-starting the daemon. Missing optional system bus access, Secret Service, Speakr
-token, or Calendar OAuth configuration disables only the dependent optional
-behavior; it does not redefine the base capture or administrative contract.
+Daemon startup requires a valid `TZ`, the selected desktop transport, a
+PulseAudio socket, and a session bus. The selected transport is a Wayland socket
+for the Wayland profile, or the exact local X11 socket and readable Xauthority
+file for the best-effort X11 profile. Headless administrative commands remain
+available without starting the daemon. Missing optional system bus access, Secret
+Service, Speakr token, or Calendar OAuth configuration disables only the
+dependent optional behavior; it does not redefine the base capture or
+administrative contract.
 
 The image contract supports read-only roots, private temporary filesystems, and
 arbitrary host-compatible UIDs, but it does not itself enforce deployment
@@ -149,6 +154,74 @@ no host networking, exact sockets and mounts, secret handling, SELinux choices,
 and lifecycle are deployment invariants owned by #28 Quadlet. Registry and
 versioned publishing are owned by #27, while real Bluefin validation is owned by
 #29; this context does not claim production readiness or live capture validation.
+
+## Bluefin Quadlet invariants (#28)
+
+The Bluefin deployment is a rootless Podman cgroup-v2 **user** Quadlet in the
+active GNOME graphical session. It does not use lingering. Its generator-applied
+`[Install] WantedBy=graphical-session.target` applies when the graphical target
+is activated in a future GNOME session/login. A `daemon-reload` does not start a
+new want for an already-active target, so the operator explicitly starts the
+generated service for the current session; `PartOf=graphical-session.target`
+stops it with that target. Real graphical lifecycle evidence remains with #29.
+The bootstrap v0.4.0 source unit explicitly uses the immutable `:0.4.0` version
+tag with `Pull=never` pending same-release digest promotion. The final operator
+contract remains a digest-qualified image with `Pull=never`; there are no
+wrappers, installers, Compose deployment, auto-updates, host networking,
+privileged mode, devices, broad home/runtime mounts, or raw PipeWire socket.
+
+The deployment uses private, persistent config, state, and cache directories,
+plus one absolute writable Recording directory. The image receives them at
+`/config/meeting-recorder`, `/state/meeting-recorder`, and
+`/cache/meeting-recorder`; the Recording directory has the **same absolute
+path** on host and container. Configuration is therefore
+`/config/meeting-recorder/config.json` in the container and
+`$HOME/.config/meeting-recorder/config.json` on the host. That JSON fixes
+`google_calendar_loopback_port` at `8765`, uses an absolute `output_dir`, may
+contain only a bare public Google Desktop client ID, and contains neither a
+Google refresh token nor a Speakr token. A Speakr bearer token, when configured,
+is a rootless Podman secret file at
+`/run/secrets/meeting-recorder-speakr-token`, owned by the user and mode `0400`.
+It is never injected as an environment variable, placed in argv/history, or
+written to configuration. The only published port is host `127.0.0.1:8765` to
+the container callback port.
+
+The Wayland variant mounts individual Wayland, Pulse, and session D-Bus sockets
+at the active user's actual runtime paths: Wayland is `ro`, Pulse is `rw`, the
+session D-Bus socket is `rw`, and the system D-Bus socket is `ro`.
+Portal, notifications, and Secret Service use session D-Bus; NetworkManager
+access uses the system bus. Managed-container Calendar `connect` requests the
+host browser through the explicit XDG Desktop Portal OpenURI session-bus call;
+it needs no GIO workaround or additional mount. The X11 alternative is the
+supplied complete drop-in: it resets and re-adds the common volumes, then mounts
+X11 `X0` and Xauthority `ro`, while retaining Pulse and session D-Bus `rw` and
+system D-Bus `ro`. It remains a trusted, best-effort X11 path. `TZ`, runtime UID, Wayland
+display, X11 display, and Xauthority paths are operator-specific values, not
+portable defaults.
+
+`ReadOnly=true` gives the container a read-only root filesystem; its bounded,
+private `/tmp` is a writable tmpfs, not a read-only temporary mount.
+`NoNewPrivileges` and all capability drops remain required.
+`SecurityLabelDisable=true` is also required for this desktop socket integration:
+it disables per-container SELinux process label separation while host SELinux
+remains enforcing. This is a trusted desktop application rather than a strong
+sandbox. Socket `ro` mounts do not limit protocol requests; session D-Bus can
+reach portal, notifications, and potentially broader unlocked Secret Service
+collections, while system D-Bus exposes more than NetworkManager and relies on
+D-Bus policy and Polkit. `:Z` labels data mounts but does not restore process
+separation.
+
+`Restart=always` restarts a daemon that terminates after a successful settings
+save once; an explicit stop remains stopped and graceful stop is allowed before
+forced termination. Updates are manual: retain and record the old digest, pull
+and edit to a verified new digest, and preserve the old local image for rollback.
+Quadlet-generated services are not enabled or disabled like ordinary units.
+Uninstall stops the service, removes the Quadlet and optional X11 drop-in, then
+reloads the user manager; container/image removal is optional. It preserves data
+and Podman secrets by default; secret and data removal is a separate destructive
+operator action. Real Bluefin logout/login, portal consent, live capture,
+Recording output, Calendar portal/browser behavior, update, and rollback evidence
+remains the responsibility of **#29** and is not claimed by these invariants.
 
 ## Container release invariants
 

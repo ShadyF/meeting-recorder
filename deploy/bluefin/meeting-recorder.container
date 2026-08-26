@@ -1,0 +1,71 @@
+# This unit is for a trusted local desktop session. SecurityLabelDisable is needed
+# because the compositor and desktop sockets are labeled for the logged-in user.
+[Unit]
+# Start with the graphical user session and stop when that session stops.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Container]
+# Bootstrap with the immutable release tag; promote this to its verified digest after publication.
+Image=ghcr.io/shadyf/meeting-recorder:0.4.0
+Pull=never
+ContainerName=meeting-recorder
+
+# Keep files created through bind mounts owned by the logged-in desktop user.
+UserNS=keep-id
+
+# This is intentionally a trusted-desktop exception for host session sockets.
+SecurityLabelDisable=true
+ReadOnly=true
+ReadOnlyTmpfs=true
+Tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m
+NoNewPrivileges=true
+DropCapability=all
+LogDriver=journald
+StopTimeout=20
+
+# Keep application data in dedicated directories. Change the Recording path if needed.
+Volume=%h/.config/meeting-recorder:/config/meeting-recorder:Z
+Volume=%h/.local/state/meeting-recorder:/state/meeting-recorder:Z
+Volume=%h/.cache/meeting-recorder:/cache/meeting-recorder:Z
+# Operator: change this host Recording directory to the desired destination.
+Volume=%h/Videos/MeetingRecorder:%h/Videos/MeetingRecorder:Z
+
+# Pass only the live desktop sockets that the Wayland session needs. Do not relabel sockets.
+# Operator: change wayland-0 when the compositor uses another Wayland display name.
+Volume=%t/wayland-0:/run/user/%U/wayland-0:ro
+Volume=%t/pulse/native:/run/user/%U/pulse/native:rw
+Volume=%t/bus:/run/user/%U/bus:rw
+Volume=/run/dbus/system_bus_socket:/run/dbus/system_bus_socket:ro
+
+# Read the Speakr token only from the Podman secret store; do not place it in this unit.
+Secret=meeting-recorder-speakr-token,target=/run/secrets/meeting-recorder-speakr-token,uid=%U,gid=%G,mode=0400
+
+# Operator: change this config port and the OAuth redirect registration together.
+PublishPort=127.0.0.1:8765:8765/tcp
+
+# Keep desktop paths and socket addresses explicit so the preflight can fail closed.
+# Operator: set TZ to the desktop user's IANA timezone.
+Environment=TZ=Etc/UTC
+Environment=LANG=C.UTF-8
+Environment=XDG_CONFIG_HOME=/config
+Environment=XDG_STATE_HOME=/state
+Environment=XDG_CACHE_HOME=/cache
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=XDG_SESSION_TYPE=wayland
+Environment=WAYLAND_DISPLAY=/run/user/%U/wayland-0
+Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+Environment=DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
+Environment=MEETING_RECORDER_MANAGED_CONTAINER=1
+Environment=MEETING_RECORDER_GOOGLE_OAUTH_LISTEN_ADDRESS=0.0.0.0
+
+[Service]
+# Restart transient failures without making shutdown wait for the full service timeout.
+Restart=always
+RestartSec=10s
+TimeoutStopSec=30s
+
+[Install]
+# This remains a user-session unit and must not require login lingering.
+WantedBy=graphical-session.target

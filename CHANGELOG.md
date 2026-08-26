@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-26
+
 ### Added
 - #19 adds bounded Google Calendar Desktop OAuth credential management with
   PKCE, Secret Service refresh-token storage, and `calendar connect|status|disconnect`.
@@ -29,6 +31,11 @@ All notable changes to this project are documented here. Format follows
 - #27 adds the intended GHCR container-release contract: protected manual tags,
   immutable version/SHA tags, stable-only `latest`, provenance/SBOM, and
   digest-qualified consumption after anonymous release verification.
+- #28 ships Bluefin runtime prerequisites and bootstrap Quadlet/operator guidance
+  for Wayland and best-effort X11, fixed secret-file Speakr tokens,
+  loopback-bound container Calendar OAuth through the session-bus OpenURI portal,
+  and managed restart after settings save. The final digest pin is applied after
+  publication.
 
 ### Changed
 - Debian/APT packaging and publishing support was removed. Releases distribute
@@ -379,6 +386,7 @@ First release.
   apply to new recordings only.
 - Drag-selecting a capture region needs the optional `slop` package.
 
+[0.4.0]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.0
 [0.3.5]: https://github.com/ssKazal/meeting-recorder/releases/tag/v0.3.5
 [0.3.4]: https://github.com/ssKazal/meeting-recorder/releases/tag/v0.3.4
 [0.3.3]: https://github.com/ssKazal/meeting-recorder/releases/tag/v0.3.3
