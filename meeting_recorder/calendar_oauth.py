@@ -209,7 +209,7 @@ def _portal_open_uri_response(uri: str, *, gio: Any | None = None,
         loop.quit()
 
     def on_response(_connection: Any, _sender: str, object_path: str,
-                    _interface: str, _signal: str, parameters: Any, _data: Any) -> None:
+                    _interface: str, _signal: str, parameters: Any) -> None:
         # Buffer early signals until OpenURI returns the request object to filter against.
         if not request_path:
             buffered_responses.append((object_path, parameters))

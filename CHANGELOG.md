@@ -6,6 +6,11 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- #31 shows a visible audio-only fallback notice when requested screen capture is unavailable.
+- #32 uses the six-argument Calendar OpenURI response callback expected by Gio signal delivery.
+- #33 makes manual portal controller coverage deterministic for Wayland and portal-ready video capture.
+
 ## [0.4.1] — 2026-08-26
 
 ### Fixed

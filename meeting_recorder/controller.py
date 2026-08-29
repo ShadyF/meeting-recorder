@@ -6,11 +6,10 @@ States: IDLE -> PROMPTING -> RECORDING -> IDLE.
 - Meeting ends      : stop + save, notify, return to IDLE.
 An ignored session is remembered so we don't re-prompt for the same call.
 
-Only two notifications are shown, deliberately: the capture-mode prompt, and
-the "saved" result at the end (plus a failure notice, which would otherwise
-lose a recording silently). Progress and status are the tray icon's job —
-anything more is noise during a call. "Saved" carries an Open Folder button:
-a button has to be clicked, so the file manager never appears unbidden.
+Notifications cover the capture-mode prompt, a visible audio-only fallback
+when requested video is unavailable, and final saved or failure outcomes.
+Progress and status are the tray icon's job. "Saved" carries an Open Folder
+button: a button has to be clicked, so the file manager never appears unbidden.
 """
 
 from __future__ import annotations
@@ -191,6 +190,16 @@ class Controller:
             return
         LOG.warning("Screen capture unavailable (%s); recording audio only",
                     message)
+
+        # Tell the user that recording continues without exposing the portal error.
+        try:
+            self.notifier.info(
+                "Recording audio only",
+                "Screen capture was unavailable. Recording continued with audio only.",
+            )
+        except Exception:
+            LOG.exception("Could not show screen capture fallback notice")
+
         self._session = None
         path, self._pending_path = self._pending_path, None
         capture_mode, self._pending_capture_mode = self._pending_capture_mode, None
