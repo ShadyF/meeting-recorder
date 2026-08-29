@@ -96,13 +96,13 @@ def test_validate_command_and_output_safety() -> None:
     # Validate matching source versions and confirm only normalized trusted output is written.
     with tempfile.TemporaryDirectory() as directory:
         output = Path(directory) / "output"
-        result = release.main(["validate", "--tag", "v0.4.1", "--revision", "A" * 40, "--project-root", str(ROOT), "--github-output", str(output)])
+        result = release.main(["validate", "--tag", "v0.4.2", "--revision", "A" * 40, "--project-root", str(ROOT), "--github-output", str(output)])
         assert result == 0
-        assert output.read_text() == f"version=0.4.1\nversion_tag=0.4.1\nsha_tag=sha-{'a' * 40}\nrevision={'a' * 40}\nprerelease=false\nsource={release.SOURCE}\n"
+        assert output.read_text() == f"version=0.4.2\nversion_tag=0.4.2\nsha_tag=sha-{'a' * 40}\nrevision={'a' * 40}\nprerelease=false\nsource={release.SOURCE}\n"
         assert "version_tag=v" not in output.read_text()
         link = Path(directory) / "link"
         link.symlink_to(output)
-        assert release.main(["validate", "--tag", "v0.4.1", "--revision", "a" * 40, "--project-root", str(ROOT), "--github-output", str(link)]) == 2
+        assert release.main(["validate", "--tag", "v0.4.2", "--revision", "a" * 40, "--project-root", str(ROOT), "--github-output", str(link)]) == 2
 
 
 def test_source_version_mismatch_and_bounds_redaction() -> None:

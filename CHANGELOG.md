@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-08-29
+
 ### Fixed
 - #31 shows a visible audio-only fallback notice when requested screen capture is unavailable.
 - #32 uses the six-argument Calendar OpenURI response callback expected by Gio signal delivery.
@@ -401,6 +403,7 @@ First release.
   apply to new recordings only.
 - Drag-selecting a capture region needs the optional `slop` package.
 
+[0.4.2]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.2
 [0.4.1]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.1
 [0.4.0]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.0
 [0.3.5]: https://github.com/ssKazal/meeting-recorder/releases/tag/v0.3.5
