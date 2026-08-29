@@ -111,6 +111,9 @@ def test_manual_start_derives_a_per_run_capture_mode_without_changing_config():
     controller = Controller(cfg, FakeNotifier(), recorder)
     controller._show_widget = lambda: None
 
+    # Keep this test on the direct capture path regardless of the host session.
+    controller._needs_portal = lambda capture_mode: False
+
     cfg.record_screen = False
     cfg.video_source = VideoSource.AREA
     controller.start_manual()
@@ -123,6 +126,85 @@ def test_manual_start_derives_a_per_run_capture_mode_without_changing_config():
     controller.start_manual()
     assert recorder.capture_mode is CaptureMode.AUDIO_VIDEO
     assert cfg.record_screen is True
+
+
+def test_manual_video_portal_waits_for_ready_session_without_changing_config():
+    class FakeRecorder:
+        is_recording = False
+
+        def __init__(self):
+            self.attached_sessions = []
+            self.started_modes = []
+
+        def start(self, _path, _source_app, capture_mode):
+            # Track the requested mode after recording starts.
+            self.started_modes.append(capture_mode)
+            self.is_recording = True
+            return True
+
+        def attach_session(self, session):
+            # Record the session attached after the portal is ready.
+            self.attached_sessions.append(session)
+
+    class FakeNotifier:
+        pass
+
+    captured = {}
+
+    class FakeSession:
+        restore_token = None
+
+        def __init__(self):
+            # Keep the fake session for the delayed ready callback.
+            captured["session"] = self
+
+        def open(self, _source_types, _token, on_ready, _on_error, **_kwargs):
+            # Hold the ready callback until the test completes the portal request.
+            captured["ready_callback"] = on_ready
+
+        def close(self):
+            pass
+
+    # Replace the portal module with a session that waits for a manual ready signal.
+    fake_module = types.ModuleType("meeting_recorder.screencast")
+    fake_module.CURSOR_EMBEDDED = 2
+    fake_module.CURSOR_HIDDEN = 1
+    fake_module.ScreenCastSession = FakeSession
+    fake_module.source_types_for = lambda _source: 1
+    fake_module.use_portal_capture = lambda: True
+    module_name = "meeting_recorder.screencast"
+    previous_module = sys.modules.get(module_name)
+    sys.modules[module_name] = fake_module
+
+    try:
+        # Request video capture and retain the original persistent configuration.
+        cfg = load_config()
+        cfg.record_screen = True
+        original_config = (cfg.record_screen, cfg.video_source)
+        recorder = FakeRecorder()
+        controller = Controller(cfg, FakeNotifier(), recorder)
+        controller._show_widget = lambda: None
+
+        # Start the asynchronous portal request without completing its ready callback.
+        controller.start_manual()
+
+        # Verify video capture remains pending until the portal is ready.
+        assert recorder.started_modes == []
+        assert controller._pending_capture_mode is CaptureMode.AUDIO_VIDEO
+
+        # Complete the portal handshake and start the requested video capture.
+        captured["ready_callback"](captured["session"])
+    finally:
+        # Restore the real module so later tests use their selected capture path.
+        if previous_module is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
+
+    # Confirm the ready session starts video capture without changing configuration.
+    assert recorder.attached_sessions == [captured["session"]]
+    assert recorder.started_modes == [CaptureMode.AUDIO_VIDEO]
+    assert (cfg.record_screen, cfg.video_source) == original_config
 
 
 def test_manual_video_source_selects_the_matching_portal_source_type():
@@ -313,8 +395,15 @@ def test_requested_video_mode_survives_portal_failure():
             pass
 
     class FakeNotifier:
+        def __init__(self):
+            self.info_calls = []
+
         def prompt_capture_mode(self, _app_name, _timeout, **callbacks):
             self.callbacks = callbacks
+
+        def info(self, summary, body):
+            # Record the visible fallback notice for the final check.
+            self.info_calls.append((summary, body))
 
     class FakeSession:
         def open(self, _source_types, _token, _ready, on_error, **_kwargs):
@@ -345,4 +434,9 @@ def test_requested_video_mode_survives_portal_failure():
         else:
             sys.modules[module_name] = previous_module
 
+    # Confirm the video request falls back and shows the static notice.
     assert recorder.capture_mode is CaptureMode.AUDIO_VIDEO
+    assert notifier.info_calls == [(
+        "Recording audio only",
+        "Screen capture was unavailable. Recording continued with audio only.",
+    )]

@@ -148,9 +148,9 @@ class _PortalHarness:
                 # Fill the bounded queue with unrelated signals before the matching response.
                 for index in range(4):
                     self.subscription[-1](self, "sender", f"/other/{index}", "iface", "Response",
-                                          _PortalVariant((0, {})), None)
+                                          _PortalVariant((0, {})))
                 self.subscription[-1](self, "sender", self.request_path, "iface", "Response",
-                                      _PortalVariant((self.response, {})), None)
+                                      _PortalVariant((self.response, {})))
             return _PortalVariant((self.request_path,))
         return _PortalVariant(())
 
@@ -166,9 +166,9 @@ class _PortalHarness:
             self.timeout_callback()
             return
         self.subscription[-1](self, "sender", "/other/request", "iface", "Response",
-                              _PortalVariant((0, {})), None)
+                              _PortalVariant((0, {})))
         self.subscription[-1](self, "sender", self.request_path, "iface", "Response",
-                              _PortalVariant((self.response, {})), None)
+                              _PortalVariant((self.response, {})))
 
 
 class _PartialRequest:

@@ -219,6 +219,9 @@ There's no "recording started" notification; the tray icon already shows it. Whe
 balanced in the background — you'll see a brief *"Processing recording…"*, then **"Recording saved"**
 with a **📁 Open Folder** button.
 
+If requested screen capture is unavailable, a visible notification confirms that recording continued
+audio-only.
+
 ### Settings
 
 After source activation, open **Meeting Recorder Settings** from your app grid, or:
