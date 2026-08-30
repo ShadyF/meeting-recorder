@@ -18,12 +18,14 @@ display, PulseAudio session and D-Bus session).
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import signal
 import stat
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -925,9 +927,30 @@ def _cmd_calendar_correct(cfg, recording: str, refresh: bool,
         return 1
 
 
+def _read_client_secret_from_tty() -> str:
+    """Read one client secret without accepting getpass echo fallback."""
+    from .calendar_oauth import CalendarError
+
+    # Capture getpass warnings so echo fallback cannot be mistaken for secure input.
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", getpass.GetPassWarning)
+            secret = getpass.getpass("Google Calendar client secret: ")
+        if any(issubclass(item.category, getpass.GetPassWarning) for item in caught):
+            raise CalendarError("Secure client-secret input is unavailable")
+
+    # Convert terminal closure and cancellation into fixed CLI errors.
+    except getpass.GetPassWarning:
+        raise CalendarError("Secure client-secret input is unavailable") from None
+    except (EOFError, KeyboardInterrupt):
+        raise CalendarError("Client-secret input was cancelled") from None
+    return secret
+
+
 def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = False,
                   recording: str | None = None, refresh: bool = False,
-                  selector: str | None = None) -> int:
+                  selector: str | None = None,
+                  client_secret_action: str | None = None) -> int:
     """Run the isolated Calendar credential command without starting recording."""
     if action == "correct":
         assert recording is not None
@@ -942,6 +965,28 @@ def _cmd_calendar(cfg, action: str, ids: list[str] | None = None, clear: bool = 
 
     oauth = CalendarOAuth(cfg)
     try:
+        if action == "client-secret":
+            if client_secret_action == "set":
+                # Refuse secret input unless it comes from an interactive terminal.
+                if not sys.stdin.isatty():
+                    print("Calendar: client-secret set requires an interactive TTY", file=sys.stderr)
+                    return 2
+                # Read the secret without echo; arguments and piped input are never accepted.
+                secret = _read_client_secret_from_tty()
+                oauth.save_client_secret(secret)
+                print("Calendar: client secret saved")
+                return 0
+            if client_secret_action == "status":
+                # Report only the fixed semantic state, never the binding or its value.
+                status = oauth.client_secret_status()
+                print(f"Calendar client secret: {status}")
+                return 0
+            if client_secret_action == "clear":
+                # Clear is safe to run from scripts and remains idempotent in Secret Service.
+                oauth.clear_client_secret()
+                print("Calendar: client secret cleared")
+                return 0
+            raise CalendarError("unknown client-secret action")
         if action == "select":
             if clear:
                 save_google_calendar_ids([])
@@ -1038,6 +1083,19 @@ def build_parser() -> argparse.ArgumentParser:
     select_group.add_argument("--id", dest="calendar_ids", action="append", default=[])
     select_group.add_argument("--clear", action="store_true")
     calendar_sub.add_parser("refresh", parents=[common], help="refresh selected Calendar caches")
+    client_secret = calendar_sub.add_parser(
+        "client-secret", parents=[common], help="manage the optional Desktop OAuth client secret",
+    )
+    # Keep secret management argument-free; only the set value is hidden by getpass.
+    client_secret_sub = client_secret.add_subparsers(
+        dest="client_secret_command", required=True,
+    )
+    for name, help_text in (
+        ("set", "set the client secret using a hidden TTY prompt"),
+        ("status", "show whether the client secret binding is usable"),
+        ("clear", "clear the stored client secret"),
+    ):
+        client_secret_sub.add_parser(name, parents=[common], help=help_text)
     correct = calendar_sub.add_parser("correct", parents=[common],
                                       help="correct one recording from cached Calendar data")
     correct.add_argument("recording")
@@ -1092,6 +1150,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.calendar_command == "correct":
             return _cmd_calendar_correct(cfg, args.recording, args.refresh,
                                          args.selector, args.clear)
+        if args.calendar_command == "client-secret":
+            return _cmd_calendar(
+                cfg,
+                args.calendar_command,
+                client_secret_action=args.client_secret_command,
+            )
         return _cmd_calendar(cfg, args.calendar_command,
                              getattr(args, "calendar_ids", None), getattr(args, "clear", False))
     if command == "speakr":

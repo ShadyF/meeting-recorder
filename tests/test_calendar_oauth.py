@@ -39,6 +39,7 @@ CLIENT = "12345-example.apps.googleusercontent.com"
 class _Secrets:
     def __init__(self, token=None, fail_save=False, fail_clear=False):
         self.token = token
+        self.client_secret = None
         self.fail_save = fail_save
         self.fail_clear = fail_clear
         self.cleared = False
@@ -56,6 +57,18 @@ class _Secrets:
         if self.fail_clear:
             raise SecretServiceError("locked")
         self.token = None
+
+    def client_secret_status(self, client_id):
+        return "configured" if self.client_secret is not None else "absent"
+
+    def load_client_secret(self, client_id):
+        return self.client_secret
+
+    def save_client_secret(self, client_id, client_secret):
+        self.client_secret = client_secret
+
+    def clear_client_secret(self):
+        self.client_secret = None
 
 
 class _Server:
@@ -338,6 +351,112 @@ def test_connect_binds_before_browser_and_sends_no_client_secret():
     assert request["grant_type"] == "authorization_code"
     assert "client_secret" not in request
     assert server.closed
+
+
+def test_optional_client_secret_is_sent_only_to_token_forms_and_not_authorization_url():
+    calls = []
+    server = _Server(49154)
+
+    class Secrets(_Secrets):
+        def load_client_secret(self, client_id):
+            assert client_id == CLIENT
+            return "desktop-secret"
+
+    def browser(url):
+        calls.append(("browser", url))
+        return True
+
+    def post(url, data, timeout):
+        calls.append(("post", url, data, timeout))
+        return _response()
+
+    oauth = CalendarOAuth(_config(), secret_store=Secrets("saved-refresh"), post_form=post,
+                          browser_open=browser, server_factory=lambda *_: server)
+    oauth._wait_for_callback = lambda _server, _state: "authorization-code"
+    oauth.connect()
+    assert oauth.status().state == "connected"
+    oauth.access_token()
+
+    assert "desktop-secret" not in calls[0][1]
+    assert calls[1][2]["client_secret"] == "desktop-secret"
+    assert calls[2][2]["client_secret"] == "desktop-secret"
+    assert calls[3][2]["client_secret"] == "desktop-secret"
+
+
+def test_client_secret_binding_failure_stops_connect_before_browser_or_network():
+    events = []
+
+    class MismatchedSecrets(_Secrets):
+        def load_client_secret(self, _client_id):
+            raise SecretServiceError("stored secret belongs to another client")
+
+    oauth = CalendarOAuth(
+        _config(), secret_store=MismatchedSecrets(),
+        post_form=lambda *_: events.append("network"),
+        browser_open=lambda _url: events.append("browser") or True,
+        server_factory=lambda *_: events.append("bind") or _Server(),
+    )
+    try:
+        oauth.connect()
+    except CalendarConfigurationError as exc:
+        assert str(exc) == "Google Calendar client secret is unavailable"
+    else:
+        raise AssertionError("mismatched client secret was accepted")
+    assert events == []
+
+
+def test_google_client_secret_errors_and_revocation_are_redacted_and_secret_free():
+    marker = "desktop-secret-marker"
+    requests = []
+    oauth = CalendarOAuth(
+        _config(), secret_store=_Secrets(),
+        post_form=lambda url, data, timeout: requests.append((url, data, timeout)) or
+        (400, ('{"error":"invalid_client","error_description":"%s"}' % marker).encode()),
+        browser_open=lambda url: requests.append(("browser", {"url": url}, 0)) or True,
+        server_factory=lambda *_: _Server(),
+    )
+    oauth._wait_for_callback = lambda _server, _state: "authorization-code"
+    try:
+        oauth.connect()
+    except CalendarConfigurationError as exc:
+        assert marker not in str(exc)
+    else:
+        raise AssertionError("rejected client credentials were accepted")
+    assert marker not in requests[0][1].get("url", "")
+
+    revoked = []
+    oauth._post_form = lambda url, data, timeout: revoked.append((url, data, timeout)) or (200, b"")
+    oauth._revoke("saved-refresh")
+    assert revoked == [("https://oauth2.googleapis.com/revoke", {"token": "saved-refresh"}, 10)]
+    assert all(marker not in repr(request) for request in requests + revoked)
+
+
+def test_disconnect_clears_refresh_token_but_retains_client_secret():
+    class Secrets(_Secrets):
+        def __init__(self):
+            super().__init__("saved-refresh")
+            self.client_secret = "desktop-secret"
+
+        def clear_client_secret(self):
+            raise AssertionError("disconnect cleared the client secret")
+
+    store = Secrets()
+    result = CalendarOAuth(_config(), secret_store=store,
+                           post_form=lambda *_: (200, b"")).disconnect()
+    assert result.state == "disconnected"
+    assert store.token is None and store.client_secret == "desktop-secret"
+
+
+def test_explicit_client_secret_clear_uses_the_single_secret_item_without_client_id():
+    events = []
+
+    class Secrets(_Secrets):
+        def clear_client_secret(self):
+            events.append("clear")
+
+    for config in (_config(client=""), _config(client=None), _config(client="malformed")):
+        CalendarOAuth(config, secret_store=Secrets()).clear_client_secret()
+    assert events == ["clear", "clear", "clear"]
 
 
 def test_oauth_listener_can_bind_all_interfaces_without_advertising_them():
@@ -673,6 +792,27 @@ def test_request_token_classifies_invalid_grant_and_rate_limit_403():
         pass
     else:
         raise AssertionError("rate-limited request was not transient")
+
+
+def test_request_token_redacts_required_and_rejected_client_secret_descriptions():
+    marker = "client-secret-marker"
+    oauth = CalendarOAuth(_config(), secret_store=_Secrets())
+    cases = (
+        ('{"error":"invalid_request","error_description":"Missing required parameter: client_secret %s"}' % marker,
+         "Google requires the configured client secret"),
+        ('{"error":"invalid_request","error_description":"The client secret is invalid: %s"}' % marker,
+         "Google rejected the configured client"),
+        ('{"error":"invalid_client","error_description":"rejected %s"}' % marker,
+         "Google rejected the configured client"),
+    )
+    for body, expected in cases:
+        oauth._post_form = lambda *_args, body=body: (400, body.encode())
+        try:
+            oauth._request_token({})
+        except CalendarConfigurationError as exc:
+            assert str(exc) == expected and marker not in str(exc)
+        else:
+            raise AssertionError("Google client-secret rejection was accepted")
 
 
 def test_url_network_failure_is_transient_without_an_http_request():

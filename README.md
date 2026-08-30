@@ -248,6 +248,7 @@ meeting-recorder run        # run the detector in the foreground
 meeting-recorder record     # record right now until Ctrl-C
 meeting-recorder config     # create/print the config file
 meeting-recorder calendar connect|status|disconnect  # manage Calendar credentials
+meeting-recorder calendar client-secret set|status|clear  # manage a required client secret
 meeting-recorder speakr upload PATH [--force]         # publish one Recording
 meeting-recorder speakr upload --all [--force]       # attempt all due jobs
 meeting-recorder speakr upload --status JOB
@@ -276,14 +277,20 @@ journalctl --user -u meeting-recorder -f
 
 Calendar support uses private, bounded offline snapshots to enrich completed
 recordings without delaying capture. Create a **Desktop** OAuth client that you own in Google
-Cloud, enable the Google Calendar API, and put only its bare client ID (ending in
-`.apps.googleusercontent.com`) in `google_calendar_client_id`. Never put a client secret,
-downloaded credential JSON, authorization code, or token in the config.
+Cloud, enable the Google Calendar API, and put only its bare public client ID (ending in
+`.apps.googleusercontent.com`) in `google_calendar_client_id`. Google's Desktop client
+documentation describes a client secret as optional, but some real Desktop client
+configurations require one at the token endpoint. If yours does, manage it with the
+`client-secret` commands below. Never put the secret, downloaded credential JSON,
+authorization code, or token in the config.
 
 ```bash
 meeting-recorder calendar connect
 meeting-recorder calendar status
 meeting-recorder calendar disconnect
+meeting-recorder calendar client-secret set
+meeting-recorder calendar client-secret status
+meeting-recorder calendar client-secret clear
 meeting-recorder calendar list
 meeting-recorder calendar select --id "calendar-id"
 meeting-recorder calendar refresh
@@ -292,11 +299,26 @@ meeting-recorder calendar correct path/to/recording.mkv
 
 `connect` starts a short-lived listener on `127.0.0.1`, opens your browser, and requests only
 Calendar-list and event read-only access. The refresh token is stored in your desktop's Secret
-Service, not in the config file, environment, recordings, or sidecars. `disconnect` tries to
-revoke it and always attempts to remove the local token and Calendar-only cache. It reports a
-nonzero cleanup failure if either local removal cannot be confirmed. During a temporary Google or
-network outage, `calendar status` reports `connected` with `credential present; validation
-unavailable` and a nonzero exit status; it retains the credential rather than treating it as expired.
+Service, not in the config file, environment, recordings, or sidecars. When a client secret is
+required, `calendar client-secret set` reads it through a hidden interactive prompt and stores it
+only in Secret Service, associated with the configured public client ID. This is the only command
+that requires a real interactive TTY; do not pass the secret as an argument, pipe it, or place it
+in a shell variable. The secret is sent only to Google's token endpoint, never to the browser
+authorization URL, Calendar API requests, config, environment, credential JSON, or Quadlet.
+`status` and `clear` can run without a TTY.
+For valid Secret Service storage, `calendar client-secret status` reports one of
+`absent`, `configured`, or `client-ID mismatch` without printing the secret.
+Malformed or unavailable Secret Service storage fails safely without exposing
+stored contents. `calendar client-secret clear` explicitly removes the secret
+and remains usable even when the public client ID is absent or malformed.
+
+`disconnect` tries to revoke the refresh token and always attempts to remove the local refresh
+token and Calendar-only cache. It retains the public client ID, loopback configuration, and any
+stored client secret. Use `calendar client-secret clear` when the client secret itself must be
+removed. It reports a nonzero cleanup failure if either local removal cannot be confirmed. During
+a temporary Google or network outage, `calendar status` reports `connected` with `credential
+present; validation unavailable` and a nonzero exit status; it retains the credential rather than
+treating it as expired.
 
 The listener normally uses an OS-selected port. Set `google_calendar_loopback_port` to a fixed
 integer from 1 through 65535 only when a container, sandbox, or firewall requires it; that exact
@@ -490,7 +512,7 @@ restart the service after changing these keys.
 | `start_debounce_seconds` / `stop_debounce_seconds` | How long audio must be present/absent before starting/stopping. Because muting releases the microphone, the stop delay is also the longest mute that won't end the recording — raise it if you mute for long stretches. The wait is trimmed off the saved file. |
 | `poll_interval_seconds` | How often capture streams are checked |
 | `min_recording_seconds` | Discard recordings shorter than this |
-| `google_calendar_client_id` | Optional bare user-owned Google Desktop OAuth client ID; no secret or credential JSON |
+| `google_calendar_client_id` | Optional bare user-owned Google Desktop OAuth client ID; a required client secret is managed separately with `calendar client-secret`, never in config or credential JSON |
 | `google_calendar_loopback_port` | OAuth loopback port: `0` for an OS-selected port (default), or `1`--`65535` |
 | `speakr_url` | Public Speakr HTTPS origin in production; native/source use supplies the bearer token through `MEETING_RECORDER_SPEAKR_TOKEN` (the Bluefin Quadlet uses its documented secret file) |
 | `speakr_publication_mode` | `disabled` (default), `manual`, or `automatic`; controls automatic enqueueing and daemon attempts |
@@ -553,9 +575,12 @@ meeting-recorder`), and make sure you edited `~/.config/meeting-recorder/config.
 
 ## Remove local source data
 
-Remove source integration first with `./scripts/install-source.sh --remove`.
-Then remove the checkout when it is no longer needed. To remove local settings
-as well:
+If the Calendar client secret itself must be removed, run
+`meeting-recorder calendar client-secret clear` before removing source
+integration or the checkout. Remove source integration with
+`./scripts/install-source.sh --remove`, then remove the checkout when it is no
+longer needed. To remove local settings as well (this does not remove a
+Calendar client secret from Secret Service):
 
 ```bash
 rm -rf ~/.config/meeting-recorder

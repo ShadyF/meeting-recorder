@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from .calendar_secrets import CalendarSecrets, SecretServiceError
+from .calendar_secrets import CalendarSecrets, SecretServiceError, validate_client_secret
 from .calendar_cache import CalendarCache, calendar_operation_lock
 
 
@@ -40,6 +40,7 @@ _LOOPBACK_LISTEN_ADDRESSES = frozenset({"127.0.0.1", "0.0.0.0"})
 _PORTAL_TIMEOUT_SECONDS = 10
 _PORTAL_MAX_BUFFERED_RESPONSES = 4
 _PORTAL_CLOSE_TIMEOUT_MILLISECONDS = 1000
+_TOKEN_SECRET_UNSET = object()
 
 
 class CalendarError(RuntimeError):
@@ -318,6 +319,32 @@ def _retryable_403(response: dict[str, Any]) -> bool:
                ("ratelimit", "quota", "retry", "temporarily", "resourceexhausted"))
 
 
+def _client_secret_error(response: dict[str, Any]) -> str | None:
+    """Map Google client-secret failures to fixed, redacted messages."""
+    error = response.get("error")
+    description = response.get("error_description")
+    values: list[str] = []
+    # Inspect only bounded response fields needed for fixed error classification.
+    if isinstance(error, str):
+        values.append(error)
+    elif isinstance(error, dict):
+        values.extend(str(error.get(key, "")) for key in ("status", "message", "code"))
+    if isinstance(description, str):
+        values.append(description)
+    normalized = " ".join(values).lower().replace("_", " ").replace("-", " ")
+    # Prefer the required-secret result for missing-parameter responses.
+    if (error == "client_secret_required" or
+            ("client secret" in normalized and any(
+                term in normalized for term in ("required", "missing")))):
+        return "Google requires the configured client secret"
+    # Keep invalid and rejected credentials distinct from missing-secret cases.
+    if (error == "invalid_client" or "invalid client" in normalized or
+            ("client secret" in normalized and any(
+                term in normalized for term in ("invalid", "reject")))):
+        return "Google rejected the configured client"
+    return None
+
+
 class CalendarOAuth:
     """OAuth workflow with injectable I/O for deterministic, network-free tests."""
 
@@ -352,6 +379,71 @@ class CalendarOAuth:
             return None, port, listener
         return validate_client_id(raw_client), port, listener
 
+    def _load_client_secret(self, client_id: str) -> str | None:
+        """Load an optional secret while converting storage failures to safe errors."""
+        try:
+            client_secret = self.secrets.load_client_secret(client_id)
+        except SecretServiceError:
+            raise CalendarConfigurationError(
+                "Google Calendar client secret is unavailable") from None
+        if client_secret is None:
+            return None
+        if not isinstance(client_secret, str) or not client_secret:
+            raise CalendarConfigurationError("Google Calendar client secret is invalid")
+        return client_secret
+
+    def client_secret_status(self) -> str:
+        """Return only absent, configured, or client-ID mismatch semantics."""
+        client_id, _port, _listener = self._configuration()
+        if client_id is None:
+            raise CalendarConfigurationError("Google Calendar client ID is not configured")
+        try:
+            status = self.secrets.client_secret_status(client_id)
+        except SecretServiceError:
+            raise CalendarConfigurationError(
+                "Google Calendar client secret storage is malformed or unavailable") from None
+        if status not in {"absent", "configured", "client-ID mismatch"}:
+            raise CalendarConfigurationError(
+                "Google Calendar client secret storage is malformed or unavailable")
+        return status
+
+    def save_client_secret(self, client_secret: str) -> None:
+        """Store an interactive client secret without placing it in configuration."""
+        try:
+            validate_client_secret(client_secret)
+        except SecretServiceError as exc:
+            raise CalendarConfigurationError(str(exc)) from None
+        client_id, _port, _listener = self._configuration()
+        if client_id is None:
+            raise CalendarConfigurationError("Google Calendar client ID is not configured")
+        try:
+            self.secrets.save_client_secret(client_id, client_secret)
+        except SecretServiceError:
+            raise CalendarConfigurationError(
+                "Secret Service could not securely store the client secret") from None
+
+    def clear_client_secret(self) -> None:
+        """Clear the fixed client-secret item independently of Calendar config."""
+        try:
+            self.secrets.clear_client_secret()
+        except SecretServiceError:
+            raise CalendarConfigurationError(
+                "Secret Service could not clear the client secret") from None
+
+    def _build_token_form(
+        self, client_id: str, grant_type: str, *,
+        client_secret: str | None | object = _TOKEN_SECRET_UNSET,
+        **fields: str,
+    ) -> dict[str, str]:
+        """Build each token request and attach the optional secret only to that form."""
+        # Keep authorization URLs and revocation requests outside this shared token path.
+        form = {"client_id": client_id, "grant_type": grant_type, **fields}
+        if client_secret is _TOKEN_SECRET_UNSET:
+            client_secret = self._load_client_secret(client_id)
+        if isinstance(client_secret, str):
+            form["client_secret"] = client_secret
+        return form
+
     def _open_browser(self, uri: str) -> bool:
         """Dispatch authorization through the host portal only for managed defaults."""
         # Keep explicit browser seams authoritative for tests and native callers.
@@ -375,6 +467,9 @@ class CalendarOAuth:
         if status == 403 and _retryable_403(response):
             raise CalendarUnavailableError("Google validation is temporarily unavailable")
         if status >= 400:
+            client_secret_error = _client_secret_error(response)
+            if client_secret_error is not None:
+                raise CalendarConfigurationError(client_secret_error)
             error = response.get("error")
             if error == "invalid_grant":
                 raise CalendarExpiredError("Google rejected the saved refresh token")
@@ -469,6 +564,8 @@ class CalendarOAuth:
         client_id, port, listener = self._configuration()
         if client_id is None:
             raise CalendarConfigurationError("Google Calendar client ID is not configured")
+        # Resolve the optional binding before opening a browser or binding a callback.
+        client_secret = self._load_client_secret(client_id)
 
         # Binding precedes browser launch so consent never targets a dead listener.
         try:
@@ -488,13 +585,10 @@ class CalendarOAuth:
         finally:
             server.server_close()
 
-        response = self._request_token({
-            "code": code,
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "grant_type": "authorization_code",
-            "code_verifier": verifier,
-        })
+        # Send the client secret only to Google's authorization-code token form.
+        response = self._request_token(self._build_token_form(
+            client_id, "authorization_code", code=code, redirect_uri=redirect_uri,
+            code_verifier=verifier, client_secret=client_secret))
         refresh_token = response.get("refresh_token")
         if not isinstance(refresh_token, str) or not refresh_token or not _required_scopes(response):
             raise CalendarConfigurationError("Google did not grant a usable Calendar refresh token")
@@ -530,11 +624,9 @@ class CalendarOAuth:
         if refresh_token is None:
             return CalendarStatus("disconnected")
         try:
-            response = self._request_token({
-                "client_id": client_id,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-            })
+            # Send the optional client secret only to Google's refresh-token form.
+            response = self._request_token(self._build_token_form(
+                client_id, "refresh_token", refresh_token=refresh_token))
             if not isinstance(response.get("access_token"), str) or not response["access_token"]:
                 raise CalendarConfigurationError("Google returned a malformed credential")
             if "scope" in response and not _required_scopes(response):
@@ -559,8 +651,9 @@ class CalendarOAuth:
             raise CalendarConfigurationError("Secret Service is unavailable or locked") from exc
         if refresh_token is None:
             raise CalendarConfigurationError("Google Calendar is disconnected")
-        response = self._request_token({"client_id": client_id, "refresh_token": refresh_token,
-                                        "grant_type": "refresh_token"})
+        # Send the optional client secret only to Google's refresh-token form.
+        response = self._request_token(self._build_token_form(
+            client_id, "refresh_token", refresh_token=refresh_token))
         token = response.get("access_token")
         if not isinstance(token, str) or not token:
             raise CalendarConfigurationError("Google returned a malformed credential")

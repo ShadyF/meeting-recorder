@@ -1,8 +1,10 @@
 """Calendar parser tests keep the credential CLI intentionally narrow."""
 
 import io
+import getpass
 import sys
 import types
+import warnings
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -40,6 +42,102 @@ def test_calendar_parser_rejects_secret_token_and_code_options():
             pass
         else:
             raise AssertionError(f"forbidden option accepted: {option}")
+
+
+def test_client_secret_parser_is_discoverable_and_accepts_no_secret_arguments():
+    parser = build_parser()
+    help_output = io.StringIO()
+    try:
+        with redirect_stdout(help_output):
+            parser.parse_args(["calendar", "--help"])
+    except SystemExit:
+        pass
+    assert "client-secret" in help_output.getvalue()
+    for action in ("set", "status", "clear"):
+        args = parser.parse_args(["calendar", "client-secret", action])
+        assert args.client_secret_command == action
+        try:
+            parser.parse_args(["calendar", "client-secret", action, "secret-value"])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("client secret argument was accepted")
+
+
+def test_client_secret_cli_requires_a_tty_before_prompting_or_storage():
+    output = io.StringIO()
+    cfg = SimpleNamespace(google_calendar_client_id="12345-example.apps.googleusercontent.com",
+                          google_calendar_loopback_port=0)
+    with patch.object(sys.stdin, "isatty", return_value=False), \
+            patch("meeting_recorder.__main__.getpass.getpass",
+                  side_effect=AssertionError("prompted without a TTY")), \
+            redirect_stdout(output), redirect_stderr(output):
+        assert _cmd_calendar(cfg, "client-secret", client_secret_action="set") == 2
+    assert "interactive tty" in output.getvalue().lower()
+
+
+def test_client_secret_cli_rejects_echo_warning_eof_and_interrupt_without_storage():
+    cfg = SimpleNamespace(google_calendar_client_id="12345-example.apps.googleusercontent.com",
+                          google_calendar_loopback_port=0)
+    marker = "client-secret-marker"
+
+    def warned(_prompt):
+        warnings.warn("echo fallback", getpass.GetPassWarning)
+        return marker
+
+    for failure in (warned, EOFError, KeyboardInterrupt):
+        output = io.StringIO()
+        stored = []
+        with patch.object(sys.stdin, "isatty", return_value=True), \
+                patch("meeting_recorder.__main__.getpass.getpass", side_effect=failure), \
+                patch("meeting_recorder.calendar_oauth.CalendarOAuth.save_client_secret",
+                      side_effect=stored.append), \
+                redirect_stdout(output), redirect_stderr(output):
+            assert _cmd_calendar(cfg, "client-secret", client_secret_action="set") == 1
+        assert not stored and marker not in output.getvalue()
+        if failure is warned:
+            assert "secure client-secret input is unavailable" in output.getvalue().lower()
+        else:
+            assert "input was cancelled" in output.getvalue().lower()
+
+
+def test_client_secret_status_and_clear_work_without_a_tty():
+    output = io.StringIO()
+    cfg = SimpleNamespace(google_calendar_client_id="12345-example.apps.googleusercontent.com",
+                          google_calendar_loopback_port=0)
+    with patch.object(sys.stdin, "isatty", return_value=False), \
+            patch("meeting_recorder.calendar_oauth.CalendarOAuth.client_secret_status",
+                  return_value="client-ID mismatch"), \
+            patch("meeting_recorder.calendar_oauth.CalendarOAuth.clear_client_secret"), \
+            redirect_stdout(output):
+        assert _cmd_calendar(cfg, "client-secret", client_secret_action="status") == 0
+        assert _cmd_calendar(cfg, "client-secret", client_secret_action="clear") == 0
+    assert output.getvalue().splitlines() == [
+        "Calendar client secret: client-ID mismatch",
+        "Calendar: client secret cleared",
+    ]
+
+
+def test_client_secret_cli_sets_statuses_and_clears_without_exposing_the_secret():
+    output = io.StringIO()
+    saved, cleared = [], []
+    cfg = SimpleNamespace(google_calendar_client_id="12345-example.apps.googleusercontent.com",
+                          google_calendar_loopback_port=0)
+    with patch.object(sys.stdin, "isatty", return_value=True), \
+            patch("meeting_recorder.__main__.getpass.getpass",
+                  return_value="desktop-secret"), \
+            patch("meeting_recorder.calendar_oauth.CalendarOAuth.save_client_secret",
+                  side_effect=saved.append), \
+            patch("meeting_recorder.calendar_oauth.CalendarOAuth.client_secret_status",
+                  return_value="configured"), \
+            patch("meeting_recorder.calendar_oauth.CalendarOAuth.clear_client_secret",
+                  side_effect=lambda: cleared.append(True)), \
+            redirect_stdout(output), patch.object(output, "isatty", return_value=True):
+        assert _cmd_calendar(cfg, "client-secret", client_secret_action="set") == 0
+        assert _cmd_calendar(cfg, "client-secret", client_secret_action="status") == 0
+        assert _cmd_calendar(cfg, "client-secret", client_secret_action="clear") == 0
+    assert saved == ["desktop-secret"] and cleared == [True]
+    assert "desktop-secret" not in output.getvalue()
 
 
 def test_calendar_cli_reports_authorization_denial_without_callback_values():

@@ -155,9 +155,12 @@ with the literal absolute path of `MR_RECORDINGS`; do not use `~` there.
 
 The listener port, container port, and registered Google OAuth loopback redirect
 are fixed at **8765** for this guide. Store only a bare public Google Desktop
-client ID in `google_calendar_client_id`. Never put a Google client secret,
-credential JSON, authorization code, refresh token, or Speakr bearer token in
-this JSON. Calendar credentials belong in the host Secret Service.
+client ID in `google_calendar_client_id`. Some real Google Desktop client
+configurations also require a client secret. Never put that secret, credential
+JSON, authorization code, refresh token, or Speakr bearer token in this JSON.
+Manage a required client secret with the interactive `calendar client-secret`
+commands below; it belongs only in the host Secret Service and is associated
+with this public client ID. It is not a Podman secret or a Quadlet value.
 
 ## Pull the reviewed image and choose Speakr handling
 
@@ -324,10 +327,14 @@ podman exec meeting-recorder meeting-recorder settings
 podman exec meeting-recorder meeting-recorder config
 
 # Calendar connect uses the session-bus OpenURI portal to request the host browser.
-# Calendar administration also requires the host session bus and unlocked Secret Service.
+# Only client-secret set needs an attached TTY for hidden input.
+# Calendar administration requires the host session bus and unlocked Secret Service.
 podman exec meeting-recorder meeting-recorder calendar connect
 podman exec meeting-recorder meeting-recorder calendar status
 podman exec meeting-recorder meeting-recorder calendar disconnect
+podman exec -it meeting-recorder meeting-recorder calendar client-secret set
+podman exec meeting-recorder meeting-recorder calendar client-secret status
+podman exec meeting-recorder meeting-recorder calendar client-secret clear
 podman exec meeting-recorder meeting-recorder calendar list
 podman exec meeting-recorder meeting-recorder calendar select --id 'calendar-id'
 podman exec meeting-recorder meeting-recorder calendar refresh
@@ -345,6 +352,26 @@ podman exec meeting-recorder meeting-recorder speakr upload --forget JOB
 podman exec meeting-recorder meeting-recorder cleanup --older-than 30
 podman exec meeting-recorder meeting-recorder cleanup --older-than 30 --delete
 ```
+
+`calendar client-secret set` prompts for the secret without displaying it. It
+is the only client-secret operation that needs an attached interactive TTY as
+shown above; do not pass the secret in an argument, pipe it through standard
+input, put it in a shell variable, or add it to the Quadlet. For valid Secret
+Service storage, `client-secret status` reports `absent`, `configured`, or
+`client-ID mismatch` without revealing the secret. Malformed or unavailable
+Secret Service storage fails safely without exposing stored contents.
+`client-secret clear` explicitly removes the secret, can run without a TTY, and
+remains usable even when the public client ID is absent or malformed. The secret
+is used only at Google's token endpoint; it is not sent to the browser
+authorization URL or Calendar API requests.
+
+`calendar disconnect` revokes the refresh token on a best-effort basis and
+removes the local refresh token and Calendar-only cache. It retains the public
+client ID, loopback configuration, and client secret. Use `calendar client-secret
+clear` when the secret itself must be removed. None of these commands change
+the reviewed socket mounts, privileges, capability policy, SELinux setting, or
+trusted-desktop security boundary; the client secret uses the existing session-
+bus Secret Service path.
 
 `--force` is accepted with Speakr `upload PATH`, `upload --all`, and
 `upload --retry JOB`; it bypasses only the SSID gate. Cleanup preview does not
@@ -378,6 +405,16 @@ There are no automatic image updates. Stop cleanly, retain the old local image,
 pull and inspect a verified new digest, edit only `Image=` in the copied Quadlet,
 reload, and start. Use this procedure to update from the published v0.4.0 digest
 to the published v0.4.1 digest:
+
+> **v0.4.2 rollback caveat:** The released v0.4.2 image predates this
+> client-secret support, and this reviewed Bluefin checkout is pinned to v0.4.1.
+> If a build with `calendar client-secret` support is rolled back to v0.4.2 or
+> v0.4.1, the older image does not consume the client-secret entry. A Google
+> Desktop client that requires a secret may therefore fail to connect or
+> validate after the rollback. The Secret Service entry remains in place;
+> rollback does not clear it. Restore the supporting build before using that
+> client again, or clear the secret with that build before an intentional
+> credential removal. Do not treat image rollback as secret deletion.
 
 ```bash
 UNIT="$HOME/.config/containers/systemd/meeting-recorder.container"
@@ -416,7 +453,7 @@ image until it is no longer a rollback option.
 Generated Quadlet services are **not** disabled with `systemctl disable`. Normal
 uninstall stops the service, removes the user Quadlet and its optional X11
 drop-in, and reloads the user manager. It preserves config, state, cache,
-Recordings, and Podman secrets.
+Recordings, Podman secrets, and Calendar Secret Service credentials.
 
 ```bash
 systemctl --user stop meeting-recorder.service
@@ -437,7 +474,9 @@ podman image rm "$IMAGE"
 
 The following is a separate destructive decision. It removes the Podman secret
 when present and all private application data, including every Recording and
-adjacent Meeting sidecar. `MR_RECORDINGS` must be copied from the **verified**
+adjacent Meeting sidecar. It does not remove a Google Calendar client secret
+from Secret Service; use `calendar client-secret clear` with a supporting image
+when that secret must be removed. `MR_RECORDINGS` must be copied from the **verified**
 absolute `output_dir` in `config.json` after confirming it is the same absolute
 container target in the copied Quadlet. Do not substitute the original example
 path after customizing the installation. Print and review that explicit path;

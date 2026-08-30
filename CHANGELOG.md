@@ -6,6 +6,16 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- #35 adds optional Google Desktop OAuth client-secret support with Secret
+  Service storage bound to the configured public client ID. The secret is
+  managed through the hidden TTY-only `calendar client-secret set` command and
+  its non-secret `status` and `clear` operations.
+
+### Fixed
+- #35 maps Google client-secret errors to fixed, redacted messages so provider
+  response details and credential material are not exposed.
+
 ## [0.4.2] — 2026-08-29
 
 ### Fixed

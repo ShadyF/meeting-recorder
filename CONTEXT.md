@@ -35,6 +35,20 @@ lists nearby fresh occurrences, selects one exact stable selector, or clears a
 sidecar. It never performs a network refresh unless `--refresh` is requested and
 never changes old recordings automatically after a later cache refresh.
 
+**Google Calendar client secret**:
+An optional OAuth credential for a Google Desktop client. Google's native-app
+documentation describes this secret as optional, but some real Desktop client
+configurations require it at the token endpoint. The `calendar client-secret
+set|status|clear` commands manage it; `set` accepts the value only through a
+hidden interactive TTY and stores it only in Secret Service, associated with the
+configured public client ID. It is never stored in config, environment, argv,
+credential JSON, or a Quadlet, and is never sent outside the token endpoint.
+Only `set` requires an interactive TTY. For valid Secret Service storage,
+`status` reports `absent`, `configured`, or `client-ID mismatch`; malformed or
+unavailable storage fails safely without exposing stored contents. `clear` can
+run without a TTY and removes the item even when the public client ID is absent
+or malformed. `calendar disconnect` retains this secret.
+
 **Capture mode**:
 The selected media composition for a recording: audio-only or audio-video.
 _Avoid_: Recording type, media mode
@@ -179,8 +193,17 @@ path** on host and container. Configuration is therefore
 `$HOME/.config/meeting-recorder/config.json` on the host. That JSON fixes
 `google_calendar_loopback_port` at `8765`, uses an absolute `output_dir`, may
 contain only a bare public Google Desktop client ID, and contains neither a
-Google refresh token nor a Speakr token. A Speakr bearer token, when configured,
-is a rootless Podman secret file at
+Google refresh token, a Google client secret, nor a Speakr token. Some real
+Desktop clients require a client secret despite Google's documentation calling
+it optional; the `calendar client-secret set|status|clear` commands manage that
+secret; only `set` requires an interactive TTY. `status` reports `absent`,
+`configured`, or `client-ID mismatch` for valid Secret Service storage, while
+malformed or unavailable storage fails safely without exposing stored contents.
+`clear` works without a TTY and removes the item even when the public client ID
+is absent or malformed. It is stored in Secret Service bound to the public
+client ID and is used only at the token endpoint, never in config, environment,
+argv, credential JSON, or the Quadlet. A Speakr bearer token, when
+configured, is a rootless Podman secret file at
 `/run/secrets/meeting-recorder-speakr-token`, owned by the user and mode `0400`.
 It is never injected as an environment variable, placed in argv/history, or
 written to configuration. The only published port is host `127.0.0.1:8765` to
@@ -215,12 +238,22 @@ separation.
 save once; an explicit stop remains stopped and graceful stop is allowed before
 forced termination. Updates are manual: retain and record the old digest, pull
 and edit to a verified new digest, and preserve the old local image for rollback.
+The released v0.4.2 image predates this client-secret support, and the reviewed
+Bluefin checkout is pinned to v0.4.1. If a build with client-secret management
+is rolled back to v0.4.2 or v0.4.1, the older image does not consume the stored
+client-secret entry, so a Desktop client that requires it may fail to connect or
+validate. The Secret Service entry remains in place; rollback does not clear it.
+Restore the supporting build before using that client again, or use its explicit
+`calendar client-secret clear` command when removal is intended. `calendar
+disconnect` retains the public client configuration and client secret; only the
+explicit client-secret clear operation removes that secret.
 Quadlet-generated services are not enabled or disabled like ordinary units.
 Uninstall stops the service, removes the Quadlet and optional X11 drop-in, then
-reloads the user manager; container/image removal is optional. It preserves data
-and Podman secrets by default; secret and data removal is a separate destructive
-operator action. Real Bluefin logout/login, portal consent, live capture,
-Recording output, Calendar portal/browser behavior, update, and rollback evidence
+reloads the user manager; container/image removal is optional. It preserves data,
+Podman secrets, and Calendar Secret Service credentials by default; secret and
+data removal is a separate destructive operator action. Real Bluefin logout/login,
+portal consent, live capture, Recording output, Calendar portal/browser behavior,
+update, and rollback evidence
 remains the responsibility of **#29** and is not claimed by these invariants.
 
 ## Container release invariants
