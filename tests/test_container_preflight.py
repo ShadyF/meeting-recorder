@@ -315,7 +315,7 @@ def test_launcher_bypasses_preflight_for_other_commands() -> None:
         check=False,
     )
     assert result.returncode == 0
-    assert "meeting-recorder 0.4.2" in result.stdout
+    assert "meeting-recorder 0.4.3" in result.stdout
 
 
 def _controlled_launcher_invocation(arguments: list[str]) -> tuple[bool, list[str]]:

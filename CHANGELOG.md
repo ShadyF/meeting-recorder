@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-08-30
+
 ### Added
 - #35 adds optional Google Desktop OAuth client-secret support with Secret
   Service storage bound to the configured public client ID. The secret is
@@ -413,6 +415,7 @@ First release.
   apply to new recordings only.
 - Drag-selecting a capture region needs the optional `slop` package.
 
+[0.4.3]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.3
 [0.4.2]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.2
 [0.4.1]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.1
 [0.4.0]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.0
