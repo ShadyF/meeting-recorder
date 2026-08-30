@@ -5,11 +5,11 @@ GNOME desktop. It runs the reviewed image as a rootless Podman **user** Quadlet
 in the graphical desktop session. It is for consented Recording capture, not a
 headless service or a production-validation claim.
 
-This v0.4.1 release uses its published image digest and the Quadlet sets
+This v0.4.3 release uses its published image digest and the Quadlet sets
 `Pull=never`:
 
 ```text
-ghcr.io/shadyf/meeting-recorder@sha256:f9514278412cb399f29dcbcaabd3d3be85e1b9b87dcf61cfbd32b026ffe83949
+ghcr.io/shadyf/meeting-recorder@sha256:ba80ec8bd7a70930eff15f12e8ed2cff0feb64d7ad6b9927e0817f24177829c6
 ```
 
 The operator contract is digest-qualified. `Pull=never` keeps the user manager
@@ -29,8 +29,8 @@ an archive is equivalent only when it is from that same deployment tag and
 contains the same reviewed files.
 
 ```bash
-IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:f9514278412cb399f29dcbcaabd3d3be85e1b9b87dcf61cfbd32b026ffe83949'
-DEPLOYMENT_TAG='bluefin-v0.4.1'
+IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:ba80ec8bd7a70930eff15f12e8ed2cff0feb64d7ad6b9927e0817f24177829c6'
+DEPLOYMENT_TAG='bluefin-v0.4.3'
 SOURCE_DIR="$HOME/src/meeting-recorder-$DEPLOYMENT_TAG"
 
 git clone https://github.com/ShadyF/meeting-recorder.git "$SOURCE_DIR"
@@ -403,23 +403,22 @@ expose the callback beyond loopback.
 
 There are no automatic image updates. Stop cleanly, retain the old local image,
 pull and inspect a verified new digest, edit only `Image=` in the copied Quadlet,
-reload, and start. Use this procedure to update from the published v0.4.0 digest
-to the published v0.4.1 digest:
+reload, and start. Use this procedure to update from the published v0.4.2 digest
+to the published v0.4.3 digest:
 
-> **v0.4.2 rollback caveat:** The released v0.4.2 image predates this
-> client-secret support, and this reviewed Bluefin checkout is pinned to v0.4.1.
-> If a build with `calendar client-secret` support is rolled back to v0.4.2 or
-> v0.4.1, the older image does not consume the client-secret entry. A Google
-> Desktop client that requires a secret may therefore fail to connect or
-> validate after the rollback. The Secret Service entry remains in place;
-> rollback does not clear it. Restore the supporting build before using that
-> client again, or clear the secret with that build before an intentional
-> credential removal. Do not treat image rollback as secret deletion.
+> **v0.4.2/v0.4.1 rollback caveat:** Those older images ignore the
+> Secret Service client-secret item. If a build with `calendar client-secret`
+> support is rolled back to v0.4.2 or v0.4.1, a Google Desktop client that
+> requires a secret may fail to refresh. The Secret Service item remains in
+> place; rollback does not clear it. v0.4.3 consumes the item. Restore v0.4.3
+> before using that client again, or clear the secret with a supporting build
+> before intentional credential removal. Do not treat image rollback as secret
+> deletion.
 
 ```bash
 UNIT="$HOME/.config/containers/systemd/meeting-recorder.container"
-OLD_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:a5c8160590b8913d28fb126297d19e83376e38fb279f3dfb82a1c928de6cb90f'
-NEW_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:f9514278412cb399f29dcbcaabd3d3be85e1b9b87dcf61cfbd32b026ffe83949'
+OLD_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:766eb08d1270d5ff6276e41ae31fe85a3ad2593fe5145273da5004ac3edc562b'
+NEW_IMAGE='ghcr.io/shadyf/meeting-recorder@sha256:ba80ec8bd7a70930eff15f12e8ed2cff0feb64d7ad6b9927e0817f24177829c6'
 
 systemctl --user stop meeting-recorder.service
 podman image inspect "$OLD_IMAGE"
@@ -508,7 +507,9 @@ rm -rf -- "$HOME/.config/meeting-recorder" \
 
 ## Validation boundary
 
-This document specifies the intended operator configuration and commands. It
-does **not** claim a real-host result. Bluefin logout/login behavior, portal
-consent, live capture, Recording output, update, rollback, and their evidence
-remain the responsibility of **issue #29**, the real-host validation owner.
+This document specifies the intended operator configuration and commands. For
+v0.4.3, CI, release, container publication, anonymous digest smoke, and real
+managed-container Calendar connect/restart/refresh/disconnect/clear validation
+passed. Those results do not claim broader live capture, logout/login, or other
+graphical-host validation; that evidence remains the responsibility of
+**issue #29**, the real-host validation owner.

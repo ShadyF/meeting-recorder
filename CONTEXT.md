@@ -178,8 +178,10 @@ is activated in a future GNOME session/login. A `daemon-reload` does not start a
 new want for an already-active target, so the operator explicitly starts the
 generated service for the current session; `PartOf=graphical-session.target`
 stops it with that target. Real graphical lifecycle evidence remains with #29.
-The `bluefin-v0.4.1` deployment unit pins the published v0.4.1 image digest with
-`Pull=never`. The operator contract remains a digest-qualified image with
+The `bluefin-v0.4.3` deployment unit pins the published v0.4.3 image digest
+`sha256:ba80ec8bd7a70930eff15f12e8ed2cff0feb64d7ad6b9927e0817f24177829c6` from
+release commit `fc9ee2841e9736430feb86c7f41dfe31a5fd7f1e`, with `Pull=never`.
+The operator contract remains a digest-qualified image with
 `Pull=never`; there are no
 wrappers, installers, Compose deployment, auto-updates, host networking,
 privileged mode, devices, broad home/runtime mounts, or raw PipeWire socket.
@@ -238,23 +240,27 @@ separation.
 save once; an explicit stop remains stopped and graceful stop is allowed before
 forced termination. Updates are manual: retain and record the old digest, pull
 and edit to a verified new digest, and preserve the old local image for rollback.
-The released v0.4.2 image predates this client-secret support, and the reviewed
-Bluefin checkout is pinned to v0.4.1. If a build with client-secret management
-is rolled back to v0.4.2 or v0.4.1, the older image does not consume the stored
-client-secret entry, so a Desktop client that requires it may fail to connect or
-validate. The Secret Service entry remains in place; rollback does not clear it.
-Restore the supporting build before using that client again, or use its explicit
-`calendar client-secret clear` command when removal is intended. `calendar
-disconnect` retains the public client configuration and client secret; only the
-explicit client-secret clear operation removes that secret.
+The released v0.4.2 and v0.4.1 images ignore the client-secret item. If a build
+with client-secret management is rolled back to either older image, a Desktop
+client that requires a secret may fail to refresh. The Secret Service item
+remains in place; rollback does not clear it. v0.4.3 consumes the item. Restore
+v0.4.3 before using that client again, or use its explicit `calendar client-secret
+clear` command when removal is intended. `calendar disconnect` retains the public
+client configuration and client secret; only the explicit client-secret clear
+operation removes that secret.
 Quadlet-generated services are not enabled or disabled like ordinary units.
 Uninstall stops the service, removes the Quadlet and optional X11 drop-in, then
 reloads the user manager; container/image removal is optional. It preserves data,
 Podman secrets, and Calendar Secret Service credentials by default; secret and
 data removal is a separate destructive operator action. Real Bluefin logout/login,
 portal consent, live capture, Recording output, Calendar portal/browser behavior,
-update, and rollback evidence
-remains the responsibility of **#29** and is not claimed by these invariants.
+update, and rollback evidence remains the responsibility of **#29** and is not
+claimed by these invariants.
+
+For v0.4.3 release commit `fc9ee2841e9736430feb86c7f41dfe31a5fd7f1e`, CI,
+release, container publication, anonymous digest smoke, and real managed-container
+Calendar connect/restart/refresh/disconnect/clear validation passed. This does
+not claim broader live capture or logout/login validation.
 
 ## Container release invariants
 

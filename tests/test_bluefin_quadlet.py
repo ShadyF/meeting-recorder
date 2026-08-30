@@ -35,9 +35,9 @@ def test_base_unit_pins_the_image_and_confines_the_container() -> None:
     # Read the complete production unit before checking its independent policies.
     text = UNIT.read_text(encoding="utf-8")
 
-    # Require the published v0.4.1 image digest and an offline pull policy.
+    # Require the published v0.4.3 image digest and an offline pull policy.
     assert _section_values(text, "Container", "Image") == [
-        "ghcr.io/shadyf/meeting-recorder@sha256:f9514278412cb399f29dcbcaabd3d3be85e1b9b87dcf61cfbd32b026ffe83949"
+        "ghcr.io/shadyf/meeting-recorder@sha256:ba80ec8bd7a70930eff15f12e8ed2cff0feb64d7ad6b9927e0817f24177829c6"
     ]
     assert _section_values(text, "Container", "Pull") == ["never"]
 
