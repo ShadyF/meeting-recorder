@@ -1,0 +1,514 @@
+<!doctype html>
+<!-- Question/plan: Compare three terminal-first structures for inspecting publication jobs and safely running local or network-gated actions. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Throwaway Publication Job Manager Prototype</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #e8eadf;
+      --muted: #9ba091;
+      --dim: #6f7569;
+      --base: #0b0d0b;
+      --panel: #121612;
+      --raised: #191e19;
+      --line: #343b33;
+      --focus: #f3c969;
+      --cyan: #72d6cb;
+      --warn: #ffb86b;
+      --bad: #ff7979;
+      --good: #98d878;
+      --mono: "IBM Plex Mono", "Cascadia Mono", "Nimbus Mono PS", monospace;
+      --display: "Arial Narrow", "Liberation Sans Narrow", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 12% -10%, rgba(114, 214, 203, .09), transparent 32rem),
+        linear-gradient(rgba(255,255,255,.018) 1px, transparent 1px),
+        var(--base);
+      background-size: auto, 100% 4px, auto;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    button, input { font: inherit; }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      background: var(--raised);
+      color: var(--ink);
+      cursor: pointer;
+      padding: 7px 11px;
+      transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
+    }
+
+    button:hover:not(:disabled) { border-color: var(--cyan); background: #202820; }
+    button:active:not(:disabled) { transform: translateY(1px); }
+    button:disabled { color: var(--dim); cursor: not-allowed; background: #101310; }
+    button.primary { background: var(--focus); border-color: var(--focus); color: #17130a; font-weight: 800; }
+    button.danger { border-color: var(--bad); color: #ffd5d5; }
+
+    :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+    .shell {
+      width: min(1180px, calc(100vw - 28px));
+      min-height: min(740px, calc(100vh - 34px));
+      margin: 16px auto 86px;
+      border: 1px solid #465044;
+      background: rgba(11, 14, 11, .94);
+      box-shadow: 0 24px 70px rgba(0,0,0,.58), inset 0 1px rgba(255,255,255,.03);
+    }
+
+    .topbar {
+      min-height: 74px;
+      padding: 13px 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+
+    .eyebrow { color: var(--focus); font-size: 10px; font-weight: 800; letter-spacing: .13em; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-family: var(--display); font-stretch: condensed; font-size: 22px; letter-spacing: .025em; }
+    h2 { font-size: 14px; }
+    h3 { font-size: 12px; }
+    .subtle { color: var(--muted); }
+    .tiny { color: var(--muted); font-size: 11px; }
+    .kbd { border: 1px solid var(--line); border-bottom-width: 2px; padding: 1px 5px; color: var(--muted); }
+
+    .network {
+      display: grid;
+      grid-template-columns: auto auto;
+      gap: 2px 9px;
+      min-width: 230px;
+      padding-left: 14px;
+      border-left: 2px solid var(--warn);
+    }
+
+    .status-mark { font-weight: 800; }
+    .status-mark::before { content: "[!] "; color: var(--warn); }
+    .state::before { margin-right: 7px; font-weight: 900; }
+    .state.attention::before { content: "!"; color: var(--warn); }
+    .state.waiting::before { content: "~"; color: var(--cyan); }
+    .state.done::before { content: "+"; color: var(--good); }
+    .state.stopped::before { content: "x"; color: var(--bad); }
+
+    .result-strip {
+      border-bottom: 1px solid var(--line);
+      background: #111711;
+      padding: 9px 18px;
+      display: grid;
+      grid-template-columns: 104px 1fr auto;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .result-strip[data-kind="warning"] { border-left: 4px solid var(--warn); }
+    .result-strip[data-kind="success"] { border-left: 4px solid var(--good); }
+    .result-strip[data-kind="info"] { border-left: 4px solid var(--cyan); }
+    .result-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .result-time { color: var(--dim); white-space: nowrap; }
+
+    .layout-a { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(310px, .75fr); min-height: 610px; }
+    .table-zone { border-right: 1px solid var(--line); overflow: auto; }
+    .pane-title { padding: 12px 14px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
+
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    th { color: var(--muted); font-size: 10px; letter-spacing: .08em; text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); }
+    td { padding: 9px 8px; border-bottom: 1px solid #222822; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    tr[data-job] { cursor: pointer; }
+    tr[data-job]:hover { background: #171d17; }
+    tr.selected { background: #20261e; box-shadow: inset 3px 0 var(--focus); }
+    tr:focus-visible { outline-offset: -3px; }
+    .job-short { color: var(--cyan); font-weight: 800; }
+
+    .inspector { padding: 17px; }
+    .selected-heading { padding-bottom: 13px; border-bottom: 1px solid var(--line); }
+    .selected-heading h2 { color: var(--focus); font-size: 16px; }
+    .field-list { display: grid; grid-template-columns: 44% 56%; margin: 14px 0 18px; }
+    .field-list dt, .field-list dd { margin: 0; padding: 5px 0; border-bottom: 1px dotted #343b33; overflow-wrap: anywhere; }
+    .field-list dt { color: var(--muted); }
+    .warning-box { border: 1px solid #6a5031; background: #21190f; padding: 10px; margin: 12px 0; color: #ffd9a3; }
+    .action-stack { display: grid; gap: 7px; }
+    .action-row { display: grid; grid-template-columns: 1fr; }
+    .why-disabled { color: var(--dim); font-size: 10px; padding: 3px 3px 6px; }
+
+    .layout-b { min-height: 610px; padding: 15px; }
+    .lane-toolbar { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 13px; }
+    .lanes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 11px; align-items: start; }
+    .lane { border: 1px solid var(--line); min-height: 455px; background: #101310; }
+    .lane-head { padding: 11px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
+    .lane-head strong { color: var(--focus); }
+    .lane-body { padding: 8px; display: grid; gap: 8px; }
+    .job-card { width: 100%; text-align: left; padding: 10px; background: #171b17; border-left: 3px solid var(--dim); }
+    .job-card.selected { border-color: var(--focus); background: #252b22; }
+    .job-card[data-tone="attention"] { border-left-color: var(--warn); }
+    .job-card[data-tone="done"] { border-left-color: var(--good); }
+    .card-top { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+    .card-meta { color: var(--muted); font-size: 10px; line-height: 1.6; }
+    .dock { margin-top: 12px; border: 1px solid #566151; background: #151a15; display: grid; grid-template-columns: 1fr auto; gap: 15px; padding: 12px; align-items: center; }
+    .dock-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+
+    .layout-c { min-height: 610px; display: grid; grid-template-columns: 300px 1fr; }
+    .command-rail { border-right: 1px solid var(--line); padding: 17px; }
+    .step { display: grid; grid-template-columns: 26px 1fr; gap: 9px; margin: 0 0 18px; color: var(--muted); }
+    .step-number { width: 24px; height: 24px; border: 1px solid var(--line); display: grid; place-items: center; }
+    .step.active { color: var(--ink); }
+    .step.active .step-number { background: var(--focus); color: #17130a; border-color: var(--focus); }
+    .step.complete .step-number { border-color: var(--good); color: var(--good); }
+    .command-main { padding: 24px clamp(20px, 6vw, 72px); }
+    .command-main h2 { font-family: var(--display); font-size: 26px; margin-bottom: 4px; }
+    .palette { margin-top: 24px; border: 1px solid var(--line); box-shadow: 10px 10px 0 #070807; }
+    .palette-head { padding: 10px 13px; border-bottom: 1px solid var(--line); color: var(--muted); }
+    .palette-option { width: 100%; border: 0; border-bottom: 1px solid #262c26; text-align: left; padding: 13px; display: grid; grid-template-columns: 175px 1fr; gap: 16px; background: #141814; }
+    .palette-option:last-child { border-bottom: 0; }
+    .palette-option strong { color: var(--cyan); }
+    .palette-option:disabled strong { color: var(--dim); }
+    .chosen-job { border: 1px solid #4b5648; padding: 13px; margin-top: 20px; display: grid; grid-template-columns: 1fr auto; gap: 16px; }
+    .job-picker { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+
+    .variant-switcher {
+      position: fixed;
+      z-index: 20;
+      left: 50%;
+      bottom: 17px;
+      transform: translateX(-50%);
+      display: grid;
+      grid-template-columns: 42px minmax(250px, auto) 42px;
+      align-items: stretch;
+      background: #090b09;
+      border: 1px solid #596454;
+      box-shadow: 0 8px 28px #000;
+    }
+
+    .variant-switcher button { border: 0; border-radius: 0; padding: 9px; }
+    .variant-label { border-inline: 1px solid var(--line); padding: 7px 15px; text-align: center; }
+    .variant-label strong { color: var(--focus); display: block; }
+
+    dialog { width: min(650px, calc(100vw - 28px)); padding: 0; border: 1px solid var(--focus); background: #111511; color: var(--ink); box-shadow: 0 24px 90px #000; }
+    dialog::backdrop { background: rgba(0,0,0,.82); backdrop-filter: blur(2px); }
+    .modal-head { padding: 15px 18px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 15px; }
+    .modal-body { padding: 18px; }
+    .modal-body p + p { margin-top: 10px; }
+    .scope { margin: 15px 0; border: 1px solid var(--line); padding: 11px; white-space: pre-wrap; color: var(--muted); }
+    .confirm-input { display: grid; gap: 6px; margin: 14px 0; }
+    input[type="text"] { width: 100%; background: #090b09; border: 1px solid var(--line); color: var(--ink); padding: 9px; }
+    .check { display: flex; gap: 9px; align-items: flex-start; margin: 14px 0; }
+    .modal-actions { border-top: 1px solid var(--line); padding: 12px 18px; display: flex; justify-content: flex-end; gap: 8px; }
+
+    @media (max-width: 820px) {
+      .shell { width: 100%; margin-top: 0; border-inline: 0; }
+      .topbar { align-items: flex-start; }
+      .layout-a, .layout-c { grid-template-columns: 1fr; }
+      .table-zone, .command-rail { border-right: 0; border-bottom: 1px solid var(--line); }
+      .lanes { grid-template-columns: 1fr; }
+      .lane { min-height: 0; }
+      .dock { grid-template-columns: 1fr; }
+      .dock-actions { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">THROWAWAY PROTOTYPE / NO REAL CHANGES</div>
+        <h1>Publication job manager</h1>
+        <p class="subtle">Local demo state only. No API, network, or filesystem calls.</p>
+      </div>
+      <div class="network" aria-label="Network publication status">
+        <span class="status-mark">Network gate</span><strong>WAITING</strong>
+        <span class="tiny">Allowed SSID</span><span class="tiny">not detected</span>
+      </div>
+    </header>
+    <section id="feedback" class="result-strip" data-kind="info" aria-live="polite"></section>
+    <section id="app"></section>
+  </main>
+
+  <nav class="variant-switcher" aria-label="Prototype variants">
+    <button id="previousVariant" aria-label="Previous variant">&lt;</button>
+    <div class="variant-label"><strong id="variantName"></strong><span id="variantHint"></span></div>
+    <button id="nextVariant" aria-label="Next variant">&gt;</button>
+  </nav>
+
+  <dialog id="confirmDialog" aria-labelledby="dialogTitle">
+    <div class="modal-head"><div><div class="eyebrow">CONFIRM DEMO ACTION</div><h2 id="dialogTitle"></h2></div><button id="closeDialog" aria-label="Close confirmation">Esc</button></div>
+    <div id="dialogBody" class="modal-body"></div>
+    <div class="modal-actions"><button id="cancelAction">Cancel</button><button id="confirmAction" class="primary">Confirm</button></div>
+  </dialog>
+
+  <script>
+    const variants = {
+      A: { name: "VARIANT A / INSPECTOR", hint: "Dense table + side pane" },
+      B: { name: "VARIANT B / QUEUE LANES", hint: "State groups + action dock" },
+      C: { name: "VARIANT C / COMMAND GUIDE", hint: "Choose action first" }
+    };
+
+    const seedJobs = [
+      { id: "pub-7F2A", title: "Weekly product review.mkv", path: "/recordings/2026-08-31_Weekly-product-review.mkv", state: "metadata_pending", action: "patch", resume: "patch", origin: "https://speakr.example.com", attempts: 2, next: "due now", remote: "1842", error: "metadata_failed", http: "503", tone: "attention", group: null, leased: false },
+      { id: "pub-91CD", title: "Design pairing.mkv", path: "/recordings/2026-08-31_Design-pairing.mkv", state: "blocked", action: "none", resume: "post", origin: "https://speakr.example.com", attempts: 1, next: "operator action", remote: "-", error: "transfer_not_sent", http: "401", tone: "stopped", group: null, leased: false },
+      { id: "pub-204B", title: "Budget check-in.mkv", path: "/recordings/2026-09-01_Budget-check-in.mkv", state: "queued", action: "post", resume: "post", origin: "https://speakr.example.com", attempts: 0, next: "waiting for allowed SSID", remote: "-", error: "-", http: "-", tone: "waiting", group: null, leased: false },
+      { id: "pub-E8B0", title: "Vendor briefing.mkv", path: "/recordings/2026-08-29_Vendor-briefing.mkv", state: "uncertain", action: "none", resume: "reconcile", origin: "https://speakr.example.com", attempts: 3, next: "operator action", remote: "unknown", error: "transfer_unknown", http: "-", tone: "attention", group: null, leased: false, duplicateRisk: true },
+      { id: "pub-2AC1", title: "Research sync.mkv", path: "/recordings/2026-08-30_Research-sync.mkv", state: "uncertain", action: "reconcile", resume: "reconcile", origin: "https://speakr.example.com", attempts: 2, next: "due now", remote: "unknown", error: "reconciliation_failed", http: "502", tone: "attention", group: null, leased: false },
+      { id: "pub-A103", title: "Town hall.mkv", path: "/recordings/2026-06-12_Town-hall.mkv", state: "published", action: "none", resume: "none", origin: "https://speakr.example.com", attempts: 1, next: "-", remote: "1710", error: "-", http: "-", tone: "done", group: "group-townhall", leased: false, age: "81 days" },
+      { id: "pub-A104", title: "Town hall.mkv", path: "/recordings/2026-06-12_Town-hall.mkv", state: "published", action: "none", resume: "none", origin: "https://archive.example.com", attempts: 1, next: "-", remote: "903", error: "-", http: "-", tone: "done", group: "group-townhall", leased: false, age: "81 days" },
+      { id: "pub-FF10", title: "Operations retro.mkv", path: null, state: "local_removed", action: "none", resume: "none", origin: "https://speakr.example.com", attempts: 2, next: "-", remote: "1659", error: "-", http: "-", tone: "done", group: null, leased: false }
+    ];
+
+    let jobs = structuredClone(seedJobs);
+    let selectedId = jobs[0].id;
+    let pendingAction = null;
+    let result = { kind: "info", title: "READY", body: "Select a job to inspect its full publication state, action limits, and local impact.", time: "demo state" };
+
+    // Read the requested variant and fall back without changing the page location.
+    function currentVariant() {
+      const requested = new URLSearchParams(location.search).get("variant");
+      return Object.hasOwn(variants, requested) ? requested : "A";
+    }
+
+    // Escape demo data before inserting it into the prototype markup.
+    function esc(value) {
+      return String(value ?? "-").replace(/[&<>'"]/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
+    }
+
+    // Keep selection valid after a local forget removes a job.
+    function selectedJob() {
+      return jobs.find(job => job.id === selectedId) || jobs[0];
+    }
+
+    // Render every required status field in one stable order.
+    function fullState(job) {
+      if (!job) return "Local job: absent";
+      return [
+        `Job: ${job.id}`,
+        `State: ${job.state} | Action: ${job.action} | Resume: ${job.resume}`,
+        `Origin: ${job.origin}`,
+        `Attempts: ${job.attempts} | Next: ${job.next}`,
+        `Remote recording ID: ${job.remote}`,
+        `Last error: ${job.error} | HTTP: ${job.http}`
+      ].join("\n");
+    }
+
+    // Explain action availability with explicit text rather than color alone.
+    function capabilities(job) {
+      const active = job.state === "transferring" || job.leased;
+      const cleanupGroup = job.group ? jobs.filter(item => item.group === job.group) : [];
+      const cleanupReady = cleanupGroup.length > 0 && cleanupGroup.every(item => item.state === "published" && !item.leased);
+      const retryReady = ["uncertain", "blocked", "missing", "metadata_pending", "queued"].includes(job.state) && !active;
+      return {
+        forget: { enabled: !active && job.state !== "local_removed", why: active ? "Disabled: an active lease protects this job." : job.state === "local_removed" ? "Disabled: no local path or active job remains." : "Removes this local job only; keeps the Recording and Speakr data." },
+        cleanup: { enabled: cleanupReady, why: cleanupReady ? `Eligible complete same-path group: ${cleanupGroup.length} jobs, ${job.age || "age verified"}.` : "Disabled: requires a complete, unleased, all-published same-path group." },
+        retry: { enabled: retryReady, why: retryReady ? (job.duplicateRisk ? "Explicit retry can create a duplicate remote Recording." : "Runs the stored resume intent; normal SSID admission still applies.") : "Disabled: this job has no operator-authorized retry to run." },
+        force: { enabled: retryReady, why: retryReady ? "Retries while bypassing only allowed-SSID admission for this run." : "Disabled: force is available only with an eligible network retry." }
+      };
+    }
+
+    // Show the latest action result as a persistent, complete status record.
+    function renderFeedback() {
+      const target = document.getElementById("feedback");
+      target.dataset.kind = result.kind;
+      target.innerHTML = `<strong>${esc(result.title)}</strong><div class="result-body">${esc(result.body)}</div><span class="result-time">${esc(result.time)}</span>`;
+    }
+
+    // Build the dense status table and selected-job inspector.
+    function renderA() {
+      const job = selectedJob();
+      const cap = capabilities(job);
+      const rows = jobs.map(item => `<tr data-job="${esc(item.id)}" tabindex="0" class="${item.id === job.id ? "selected" : ""}">
+        <td class="job-short">${esc(item.id)}</td><td><span class="state ${esc(item.tone)}">${esc(item.state)}</span></td><td>${esc(item.action)}</td><td>${esc(item.resume)}</td><td>${esc(item.attempts)}</td><td>${esc(item.next)}</td><td>${esc(item.error === "-" ? item.http : item.error)}</td>
+      </tr>`).join("");
+      return `<div class="layout-a">
+        <section class="table-zone"><div class="pane-title"><strong>8 local publication jobs</strong><span class="tiny"><span class="kbd">J/K</span> select</span></div>
+          <table aria-label="Publication jobs"><colgroup><col style="width:13%"><col style="width:20%"><col style="width:10%"><col style="width:12%"><col style="width:9%"><col style="width:21%"><col style="width:15%"></colgroup>
+            <thead><tr><th>JOB</th><th>STATE</th><th>ACTION</th><th>RESUME</th><th>TRIES</th><th>NEXT</th><th>ERROR / HTTP</th></tr></thead><tbody>${rows}</tbody>
+          </table>
+        </section>
+        <aside class="inspector"><div class="selected-heading"><div class="eyebrow">SELECTED JOB</div><h2>${esc(job.id)}</h2><p>${esc(job.title)}</p></div>
+          ${detailFields(job)}${job.duplicateRisk ? `<div class="warning-box"><strong>Duplicate risk</strong><br>The previous media transfer may have reached Speakr. This job cannot safely reconcile it. Retrying may POST the same Recording again.</div>` : ""}
+          <h3>AVAILABLE ACTIONS</h3><div class="action-stack">${actionButtons(job, cap, true)}</div>
+        </aside>
+      </div>`;
+    }
+
+    // Render the selected job's operational fields without exposing its SHA-256.
+    function detailFields(job) {
+      return `<dl class="field-list"><dt>State</dt><dd class="state ${esc(job.tone)}">${esc(job.state)}</dd><dt>Action / resume</dt><dd>${esc(job.action)} / ${esc(job.resume)}</dd><dt>Origin</dt><dd>${esc(job.origin)}</dd><dt>Attempts</dt><dd>${esc(job.attempts)}</dd><dt>Next attempt</dt><dd>${esc(job.next)}</dd><dt>Remote ID</dt><dd>${esc(job.remote)}</dd><dt>Last error</dt><dd>${esc(job.error)}</dd><dt>HTTP status</dt><dd>${esc(job.http)}</dd><dt>Local Recording</dt><dd>${esc(job.path || "removed")}</dd></dl>`;
+    }
+
+    // Render actions with a visible reason beneath every enabled or disabled control.
+    function actionButtons(job, cap, stacked = false) {
+      return [
+        ["retry", "Retry job"],
+        ["force", "Retry and bypass SSID gate"],
+        ["cleanup", "Delete local recording"],
+        ["forget", "Forget job"]
+      ].map(([action, label]) => `<div class="action-row"><button data-action="${action}" data-job-id="${esc(job.id)}" ${cap[action].enabled ? "" : "disabled"} class="${action === "cleanup" || action === "forget" ? "danger" : ""}">${label}</button>${stacked ? `<span class="why-disabled">${esc(cap[action].why)}</span>` : ""}</div>`).join("");
+    }
+
+    // Group jobs by operator need to test a queue-first navigation model.
+    function renderB() {
+      const job = selectedJob();
+      const cap = capabilities(job);
+      const groups = [
+        { title: "NEEDS YOU", note: "4 jobs", test: item => ["uncertain", "blocked", "missing", "metadata_pending"].includes(item.state) },
+        { title: "WAITING", note: "1 job", test: item => ["queued", "transferring"].includes(item.state) },
+        { title: "COMPLETE", note: "3 jobs", test: item => ["published", "local_removed"].includes(item.state) }
+      ];
+      const lanes = groups.map(group => `<section class="lane"><div class="lane-head"><strong>${group.title}</strong><span>${group.note}</span></div><div class="lane-body">${jobs.filter(group.test).map(item => `<button class="job-card ${item.id === job.id ? "selected" : ""}" data-job="${esc(item.id)}" data-tone="${esc(item.tone)}"><span class="card-top"><strong>${esc(item.id)}</strong><span class="state ${esc(item.tone)}">${esc(item.state)}</span></span><span>${esc(item.title)}</span><span class="card-meta">${esc(item.action)} -> ${esc(item.resume)} | try ${esc(item.attempts)}<br>${esc(item.next)} | HTTP ${esc(item.http)}</span></button>`).join("")}</div></section>`).join("");
+      return `<div class="layout-b"><div class="lane-toolbar"><div><h2>Queue by operator need</h2><p class="tiny">Move across groups, then act from the fixed dock.</p></div><span class="tiny">No automatic resend of uncertain transfers</span></div><div class="lanes">${lanes}</div>
+        <section class="dock"><div><div class="eyebrow">ACTION DOCK / ${esc(job.id)}</div><strong>${esc(job.title)} - ${esc(job.state)}</strong><p class="tiny">${esc(cap.retry.why)}</p></div><div class="dock-actions">${actionButtons(job, cap)}</div></section>
+      </div>`;
+    }
+
+    // Lead with operator intent to test a guided action-first workflow.
+    function renderC() {
+      const job = selectedJob();
+      const cap = capabilities(job);
+      const options = [
+        ["retry", "Retry a job", "Continue its stored resume intent. Normal allowed-SSID admission applies."],
+        ["force", "Bypass SSID for retry", "One explicit retry. All other safety, identity, and network checks remain."],
+        ["cleanup", "Delete a local Recording", "Run Publication cleanup on one eligible complete same-path group."],
+        ["forget", "Forget local job state", "Remove one local Publication job. Keep local and remote Recordings."]
+      ];
+      return `<div class="layout-c"><aside class="command-rail"><div class="eyebrow">GUIDED COMMAND</div><h2>Three clear steps</h2><div style="margin-top:22px"><div class="step active"><span class="step-number">1</span><div><strong>Choose intent</strong><br><span class="tiny">Start with the outcome.</span></div></div><div class="step"><span class="step-number">2</span><div><strong>Review scope</strong><br><span class="tiny">See every affected job and boundary.</span></div></div><div class="step"><span class="step-number">3</span><div><strong>Confirm result</strong><br><span class="tiny">Read the full resulting state.</span></div></div></div><div class="warning-box" style="margin-top:70px"><strong>Local means local</strong><br>Forget changes job state only. Cleanup removes files only after group checks. Neither deletes from Speakr.</div></aside>
+        <section class="command-main"><div class="eyebrow">STEP 1 / OPERATOR INTENT</div><h2>What do you need to do?</h2><p class="subtle">Unavailable commands remain visible and explain why.</p>
+          <div class="chosen-job"><div><strong>Target: ${esc(job.id)}</strong><br><span class="subtle">${esc(job.title)} / ${esc(job.state)} / ${esc(job.origin)}</span><div class="job-picker">${jobs.map(item => `<button data-job="${esc(item.id)}" aria-label="Select ${esc(item.id)}" class="${item.id === job.id ? "primary" : ""}">${esc(item.id)}</button>`).join("")}</div></div><span class="state ${esc(job.tone)}">${esc(job.state)}</span></div>
+          <div class="palette">${options.map(([action, label, description]) => `<button class="palette-option" data-action="${action}" data-job-id="${esc(job.id)}" ${cap[action].enabled ? "" : "disabled"}><strong>&gt; ${label}</strong><span>${esc(cap[action].enabled ? description : cap[action].why)}</span></button>`).join("")}</div>
+        </section></div>`;
+    }
+
+    // Rebuild the active structure and reconnect its interactive controls.
+    function render() {
+      const variant = currentVariant();
+      const renderers = { A: renderA, B: renderB, C: renderC };
+      document.getElementById("variantName").textContent = variants[variant].name;
+      document.getElementById("variantHint").textContent = variants[variant].hint;
+      document.getElementById("app").innerHTML = renderers[variant]();
+      renderFeedback();
+
+      // Select jobs from rows, cards, or picker buttons.
+      document.querySelectorAll("[data-job]").forEach(control => control.addEventListener("click", () => {
+        selectedId = control.dataset.job;
+        render();
+      }));
+
+      // Open one consistent confirmation flow from every structural variant.
+      document.querySelectorAll("[data-action]").forEach(control => control.addEventListener("click", () => openConfirmation(control.dataset.action, control.dataset.jobId)));
+    }
+
+    // Present action-specific boundaries, warnings, scope, and confirmation effort.
+    function openConfirmation(action, jobId) {
+      const job = jobs.find(item => item.id === jobId);
+      if (!job) return;
+      pendingAction = { action, jobId };
+      const dialog = document.getElementById("confirmDialog");
+      const body = document.getElementById("dialogBody");
+      const confirm = document.getElementById("confirmAction");
+      const group = job.group ? jobs.filter(item => item.group === job.group) : [job];
+      const definitions = {
+        forget: { title: "Forget local Publication job?", intro: "This removes only the selected local Publication-job state. It does not delete the local Recording and does not delete anything from Speakr.", scope: `${job.id}\nLocal Recording kept: ${job.path}\nRemote recording ID unchanged: ${job.remote}`, phrase: job.id, label: `Type ${job.id} to confirm`, button: "Forget job" },
+        cleanup: { title: "Delete local Recording with Publication cleanup?", intro: "This is irreversible. There is no Trash or application recovery. Cleanup rechecks the complete same-path group, file identity, age, leases, sidecar, and media before removal.", scope: `Complete same-path group: ${group.map(item => item.id).join(", ")}\nRecording: ${job.path}\nSidecar: exact adjacent file, if present\nAfter success: all ${group.length} jobs become local_removed; Speakr data stays`, phrase: "DELETE LOCAL", label: "Type DELETE LOCAL to confirm", button: "Delete local recording" },
+        retry: { title: job.duplicateRisk ? "Retry despite duplicate risk?" : "Retry this Publication job?", intro: job.duplicateRisk ? "The earlier media transfer has an uncertain result and cannot be safely reconciled. A new POST may create a duplicate Speakr Recording." : "This explicit retry continues only the stored resume intent. Metadata-pending retries PATCH only; reconciliation runs before any resend when available.", scope: fullState(job), check: job.duplicateRisk ? "I understand that this retry can create a duplicate Speakr Recording." : null, button: "Retry job" },
+        force: { title: "Retry and bypass the SSID gate?", intro: "This bypasses only allowed-SSID admission for this explicit retry. It does not bypass reconciliation, token authentication, HTTPS, media hashing, file identity checks, or publication and cleanup leases.", scope: `Network gate: bypass once\nResume intent: ${job.resume}\nOrigin: ${job.origin}\n${job.duplicateRisk ? "Duplicate risk: YES - uncertain transfer may be resent" : "Duplicate risk: no known resend risk"}`, check: "I understand that all checks except allowed-SSID admission still apply.", button: "Retry with SSID bypass" }
+      };
+      const definition = definitions[action];
+      document.getElementById("dialogTitle").textContent = definition.title;
+      body.innerHTML = `<p>${esc(definition.intro)}</p><div class="scope">${esc(definition.scope)}</div>${definition.phrase ? `<label class="confirm-input">${esc(definition.label)}<input id="confirmPhrase" type="text" autocomplete="off"></label>` : ""}${definition.check ? `<label class="check"><input id="confirmCheck" type="checkbox"><span>${esc(definition.check)}</span></label>` : ""}`;
+      confirm.textContent = definition.button;
+      confirm.className = action === "forget" || action === "cleanup" ? "danger" : "primary";
+      confirm.disabled = Boolean(definition.phrase || definition.check);
+
+      // Require the visible phrase or acknowledgement before enabling the action.
+      const validator = () => {
+        const phraseOk = !definition.phrase || document.getElementById("confirmPhrase")?.value === definition.phrase;
+        const checkOk = !definition.check || document.getElementById("confirmCheck")?.checked;
+        confirm.disabled = !(phraseOk && checkOk);
+      };
+      body.querySelectorAll("input").forEach(input => input.addEventListener("input", validator));
+      dialog.showModal();
+      body.querySelector("input")?.focus();
+    }
+
+    // Apply a believable in-memory outcome and retain a complete visible result.
+    function executePendingAction() {
+      if (!pendingAction) return;
+      const { action, jobId } = pendingAction;
+      const job = jobs.find(item => item.id === jobId);
+      if (!job) return;
+      const before = fullState(job);
+      let impact = "";
+
+      // Mutate only the selected demo records according to the confirmed operation.
+      if (action === "forget") {
+        jobs = jobs.filter(item => item.id !== jobId);
+        selectedId = jobs[0]?.id;
+        impact = `RESULT: Local Publication job absent\nRecording kept: ${job.path}\nRemote recording unchanged: ${job.remote}\n\nPrevious state:\n${before}`;
+      } else if (action === "cleanup") {
+        const members = jobs.filter(item => item.group === job.group);
+        members.forEach(item => Object.assign(item, { state: "local_removed", action: "none", resume: "none", next: "-", error: "-", http: "-", path: null, tone: "done" }));
+        impact = `RESULT: Publication cleanup completed for ${members.length}-job same-path group.\nLocal Recording and exact adjacent sidecar removed. No remote deletion.\n\n${members.map(fullState).join("\n\n")}`;
+      } else {
+        job.attempts += 1;
+        if (job.state === "metadata_pending") Object.assign(job, { state: "published", action: "none", resume: "none", next: "-", error: "-", http: "-", tone: "done" });
+        else if (job.state === "uncertain" && !job.duplicateRisk) Object.assign(job, { state: "metadata_pending", action: "patch", resume: "patch", next: "due now", remote: "1904", error: "-", http: "-", tone: "waiting" });
+        else Object.assign(job, { state: "queued", action: "post", resume: "post", next: action === "force" ? "running after SSID bypass" : "waiting for allowed SSID", error: "-", http: "-", tone: "waiting" });
+        impact = `RESULT: ${action === "force" ? "Allowed-SSID admission bypassed for this demo retry only." : "Explicit retry authorized in demo state."}${job.duplicateRisk ? " Duplicate risk remains." : ""}\n\n${fullState(job)}\n\nChecks still required: reconciliation where available, auth, HTTPS, hashing, file identity, and leases.`;
+      }
+
+      // Keep the outcome visible after the dialog closes and the active view rerenders.
+      result = { kind: action === "cleanup" || action === "forget" ? "warning" : "success", title: "LAST RESULT", body: impact, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) };
+      pendingAction = null;
+      document.getElementById("confirmDialog").close();
+      render();
+    }
+
+    // Cycle variants without reloading so demo mutations remain available for comparison.
+    function cycleVariant(direction) {
+      const keys = Object.keys(variants);
+      const nextIndex = (keys.indexOf(currentVariant()) + direction + keys.length) % keys.length;
+      const next = keys[nextIndex];
+      history.pushState({}, "", `${location.pathname}?variant=${next}`);
+      render();
+    }
+
+    // Wire global controls once and keep arrow shortcuts away from form interactions.
+    document.getElementById("previousVariant").addEventListener("click", () => cycleVariant(-1));
+    document.getElementById("nextVariant").addEventListener("click", () => cycleVariant(1));
+    document.getElementById("closeDialog").addEventListener("click", () => document.getElementById("confirmDialog").close());
+    document.getElementById("cancelAction").addEventListener("click", () => document.getElementById("confirmDialog").close());
+    document.getElementById("confirmAction").addEventListener("click", executePendingAction);
+    window.addEventListener("popstate", render);
+
+    // Support variant cycling and dense-table selection from the keyboard.
+    document.addEventListener("keydown", event => {
+      const tag = document.activeElement?.tagName;
+      const formFocused = ["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(tag) || document.getElementById("confirmDialog").open;
+      if (!formFocused && event.key === "ArrowLeft") cycleVariant(-1);
+      if (!formFocused && event.key === "ArrowRight") cycleVariant(1);
+      if (!formFocused && currentVariant() === "A" && ["j", "k", "ArrowDown", "ArrowUp"].includes(event.key)) {
+        event.preventDefault();
+        const direction = ["j", "ArrowDown"].includes(event.key) ? 1 : -1;
+        const index = jobs.findIndex(job => job.id === selectedId);
+        selectedId = jobs[(index + direction + jobs.length) % jobs.length].id;
+        render();
+      }
+    });
+
+    // Draw the initial requested variant.
+    render();
+  </script>
+</body>
+</html>
