@@ -297,10 +297,13 @@ def test_allowed_disallowed_and_exact_raw_ssids() -> None:
         assert result.status is expected
 
 
-def test_no_wifi_and_transition_states_are_unknown() -> None:
-    # Non-Wi-Fi and transitional active connections cannot prove a stable SSID.
+def test_active_non_wifi_bypasses_but_wifi_transition_states_are_unknown() -> None:
+    # A confirmed non-Wi-Fi connection does not need SSID admission.
+    ethernet = _adapter(_FakeTransport(_fixture(active_type="802-3-ethernet"))).probe()
+    assert ethernet == NetworkSSIDResult(NetworkSSIDStatus.BYPASSED)
+
+    # Active Wi-Fi transitions remain unsafe because no stable SSID was proven.
     cases = (
-        lambda: _fixture(active_type="802-3-ethernet"),
         lambda: _fixture(active_state=1),
         lambda: _fixture(active_state=3),
     )

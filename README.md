@@ -5,7 +5,7 @@ nothing. Stops automatically when the call ends.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux%20%7C%20X11%20%7C%20Wayland-blue)
-![Version](https://img.shields.io/badge/version-0.4.3-green)
+![Version](https://img.shields.io/badge/version-0.4.4-green)
 
 No more remembering to hit record. The app sits in the background, notices when a call starts, and
 asks:

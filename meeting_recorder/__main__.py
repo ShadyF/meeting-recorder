@@ -626,11 +626,16 @@ def _speakr_network_allowed(cfg: Config, force: bool) -> bool:
     if force:
         return True
 
-    # Missing and empty allowlists fail closed before constructing D-Bus state.
-    allowed = getattr(cfg, "speakr_allowed_ssid_bytes", None)
-    if not allowed:
+    # Invalid policy remains fail-closed even though an empty valid list disables the gate.
+    if not getattr(cfg, "speakr_allowed_ssids_valid", True):
         print("Speakr: waiting for an allowed network.", file=sys.stderr)
         return False
+    allowed = getattr(cfg, "speakr_allowed_ssid_bytes", None)
+    if not isinstance(allowed, (tuple, frozenset)):
+        print("Speakr: waiting for an allowed network.", file=sys.stderr)
+        return False
+    if not allowed:
+        return True
     from .network_manager import NetworkManagerSSIDAdapter, NetworkSSIDStatus
 
     try:
@@ -638,7 +643,7 @@ def _speakr_network_allowed(cfg: Config, force: bool) -> bool:
         status = NetworkSSIDStatus(getattr(result, "status", result))
     except Exception:
         status = NetworkSSIDStatus.UNAVAILABLE
-    if status is NetworkSSIDStatus.ALLOWED:
+    if status in (NetworkSSIDStatus.ALLOWED, NetworkSSIDStatus.BYPASSED):
         return True
     print("Speakr: waiting for an allowed network.", file=sys.stderr)
     return False

@@ -42,11 +42,14 @@ please pay particular attention to:
   Recordings from the daemon or `meeting-recorder record`. Explicit
   `meeting-recorder speakr upload ...` commands remain available in every mode.
   The daemon never scans historical directories to create publication jobs.
-- Normal network attempts (`upload PATH`, `upload --all`, and `upload --retry
-  JOB`) require NetworkManager to report an active Wi-Fi SSID that exactly
-  matches `speakr_allowed_ssids`: entries are case-sensitive raw UTF-8 strings,
-  at most 32 UTF-8 bytes, with no trimming or normalization. Unknown,
-  unavailable, or nonmatching Wi-Fi waits without contacting Speakr. `--force`
+- An empty valid `speakr_allowed_ssids` list disables the SSID safety gate.
+  When the list is nonempty, normal network attempts (`upload PATH`, `upload
+  --all`, and `upload --retry JOB`) require NetworkManager to report an active
+  Wi-Fi SSID that exactly matches it. A confirmed active non-Wi-Fi connection
+  bypasses this SSID-only gate. Entries are case-sensitive raw UTF-8 strings, at
+  most 32 UTF-8 bytes, with no trimming or normalization. Unknown, unavailable,
+  transitional, or nonmatching active Wi-Fi waits without contacting Speakr.
+  Invalid SSID configuration fails closed. `--force`
   is accepted only for those network forms and bypasses only the SSID gate;
   HTTPS, authentication, file identity, lease, reconciliation, and other state
   and file-safety checks still apply. An SSID match is not authentication.

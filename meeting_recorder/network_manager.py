@@ -35,6 +35,7 @@ class NetworkSSIDStatus(str, Enum):
     """The safe outcome of one synchronous SSID probe."""
 
     ALLOWED = "allowed"
+    BYPASSED = "bypassed"
     DISALLOWED = "disallowed"
     UNKNOWN = "unknown"
     UNAVAILABLE = "unavailable"
@@ -463,8 +464,9 @@ class NetworkManagerSSIDAdapter:
             if not active_paths:
                 raise _MalformedReply
 
-            # Resolve only activated Wi-Fi active connections and their devices.
+            # Classify active connections before resolving any active Wi-Fi device.
             device_paths: list[tuple[str, str]] = []
+            non_wifi_active = False
 
             # Read each active connection before deciding whether it is Wi-Fi.
             for active_path in active_paths:
@@ -478,6 +480,8 @@ class NetworkManagerSSIDAdapter:
                 if type(connection_type) is not str or type(state) is not int:
                     raise _MalformedReply
                 if connection_type != "802-11-wireless":
+                    if state == _ACTIVE_STATE:
+                        non_wifi_active = True
                     continue
                 if state != _ACTIVE_STATE:
                     raise _MalformedReply
@@ -490,8 +494,10 @@ class NetworkManagerSSIDAdapter:
                     raise _ProbeLimitExceeded
                 device_paths.extend((device, active_path) for device in devices)
 
-            # No activated Wi-Fi connection is safe to classify as a network.
+            # A confirmed non-Wi-Fi connection needs no SSID admission.
             if not device_paths:
+                if non_wifi_active:
+                    return NetworkSSIDResult(NetworkSSIDStatus.BYPASSED)
                 raise _MalformedReply
 
             # Resolve each Wi-Fi device's active access point without scanning.

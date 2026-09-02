@@ -43,6 +43,7 @@ def test_speakr_defaults_and_publication_modes_are_typed():
     assert config.speakr_publication_mode is PublicationMode.DISABLED
     assert config.speakr_allowed_ssids == ()
     assert config.speakr_allowed_ssid_bytes == ()
+    assert config.speakr_allowed_ssids_valid
     assert [mode.value for mode in PublicationMode] == ["disabled", "manual", "automatic"]
 
     # Each supported spelling maps to its corresponding typed policy.
@@ -95,7 +96,9 @@ def test_invalid_speakr_ssid_lists_fail_closed():
             raise AssertionError(f"invalid SSID list accepted: {value!r}")
 
     for value in invalid:
-        assert load_config_for_test({"speakr_allowed_ssids": value}).speakr_allowed_ssids == ()
+        config = load_config_for_test({"speakr_allowed_ssids": value})
+        assert config.speakr_allowed_ssids == ()
+        assert not config.speakr_allowed_ssids_valid
 
 
 def test_production_speakr_resolver_requires_https_but_normalizer_keeps_http():

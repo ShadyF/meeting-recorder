@@ -132,10 +132,11 @@ disabled. Choose one path **before** the first service start:
   environment variable.
 
 For Speakr, set `speakr_url` to its HTTPS origin and choose
-`manual` or `automatic` for `speakr_publication_mode`. Add exact,
-case-sensitive Wi-Fi SSIDs to `speakr_allowed_ssids`; normal upload attempts are
-admitted only on a matching SSID. `disabled` is the default and retains no
-automatic publication behavior.
+`manual` or `automatic` for `speakr_publication_mode`. An empty
+`speakr_allowed_ssids` list disables SSID gating. Otherwise, add exact,
+case-sensitive Wi-Fi SSIDs; normal upload attempts are admitted only on a
+matching active Wi-Fi SSID, or a confirmed active non-Wi-Fi connection.
+`disabled` is the default and retains no automatic publication behavior.
 
 ## 4. Start and operate the service
 

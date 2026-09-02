@@ -446,8 +446,8 @@ def test_normal_network_admission_fails_closed_without_reading_token() -> None:
         assert any(call[0] == "enqueue" for call in fake.calls)
         assert adapter_calls == [(b"allowed",)]
 
-    # Missing and empty allowlists fail closed before any adapter or token work.
-    for allowlist in (None, ()):
+    # A missing allowlist remains fail-closed before any adapter or token work.
+    for allowlist in (None,):
         fake = FakePublisher()
         with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
                 patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
@@ -461,6 +461,43 @@ def test_normal_network_admission_fails_closed_without_reading_token() -> None:
                 path="recording.mkv",
             )
         assert result == 3 and any(call[0] == "enqueue" for call in fake.calls)
+
+    # An empty valid list disables the SSID gate without constructing an adapter.
+    fake = FakePublisher()
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token", return_value=TOKEN), \
+            patch("meeting_recorder.network_manager.NetworkManagerSSIDAdapter",
+                  side_effect=AssertionError("adapter must not be constructed")):
+        result, _output_text = _output(
+            _cmd_speakr_upload,
+            SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=()),
+            path="recording.mkv",
+        )
+    assert result == 0 and any(call[:3] == ("run_one", ORIGIN, TOKEN) for call in fake.calls)
+
+
+def test_normal_network_admission_accepts_confirmed_non_wifi_bypass() -> None:
+    # A non-Wi-Fi bypass remains an admitted normal operation, not a forced upload.
+    fake = FakePublisher()
+
+    class Adapter:
+        def __init__(self, _allowed):
+            pass
+
+        def probe(self):
+            return SimpleNamespace(status=NetworkSSIDStatus.BYPASSED)
+
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token", return_value=TOKEN), \
+            patch("meeting_recorder.network_manager.NetworkManagerSSIDAdapter", Adapter):
+        result, _output_text = _output(
+            _cmd_speakr_upload,
+            SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=(b"allowed",)),
+            path="recording.mkv",
+        )
+    assert result == 0 and any(call[:3] == ("run_one", ORIGIN, TOKEN) for call in fake.calls)
 
 
 def test_normal_retry_admission_does_not_reset_the_job() -> None:
