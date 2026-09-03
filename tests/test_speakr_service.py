@@ -330,9 +330,8 @@ def test_invalid_origin_is_deduplicated_and_constructs_no_runtime() -> None:
         assert service.stop(2)
 
 
-def test_empty_allowlist_is_action_required_without_network_or_token() -> None:
-    # An empty or invalid allowlist fails closed before any admission attempt.
-    notices: list[PublicationNotice] = []
+def test_empty_allowlist_disables_the_gate_without_network_probe() -> None:
+    # An intentionally empty list lets due work run without constructing NetworkManager.
     calls: list[str] = []
     publisher = FakePublisher([])
     service = PublicationService(
@@ -342,16 +341,33 @@ def test_empty_allowlist_is_action_required_without_network_or_token() -> None:
         network_factory=lambda allowed: (_ for _ in ()).throw(
             AssertionError("NetworkManager must not be constructed")
         ),
-        token_provider=lambda: (_ for _ in ()).throw(AssertionError("token must not be fetched")),
-        notice_callback=notices.append,
+        token_provider=lambda: "token",
         periodic_check_seconds=0.01,
     )
     service.start()
     deadline = time.time() + 2
-    while not notices and time.time() < deadline:
+    while not publisher.calls and time.time() < deadline:
         time.sleep(0.01)
-    assert len(notices) == 1
-    assert (notices[0].action, notices[0].error_code) == ("configuration", "protocol_error")
+    assert publisher.calls == [("run_due", "speakr-publication")]
+    assert service.stop(2)
+
+
+def test_non_wifi_bypass_runs_due_work_after_token_admission() -> None:
+    # A confirmed non-Wi-Fi result follows the same admitted path as an allowed SSID.
+    publisher = FakePublisher([])
+    service = PublicationService(
+        _config(PublicationMode.AUTOMATIC),
+        store_factory=lambda: FakeStore([]),
+        publisher_factory=lambda store, origin: publisher,
+        network_factory=lambda allowed: FakeNetwork(NetworkSSIDStatus.BYPASSED, []),
+        token_provider=lambda: "token",
+        periodic_check_seconds=0.01,
+    )
+    service.start()
+    deadline = time.time() + 2
+    while not publisher.calls and time.time() < deadline:
+        time.sleep(0.01)
+    assert publisher.calls == [("run_due", "speakr-publication")]
     assert service.stop(2)
 
 

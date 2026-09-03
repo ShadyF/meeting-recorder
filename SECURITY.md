@@ -42,23 +42,47 @@ please pay particular attention to:
   Recordings from the daemon or `meeting-recorder record`. Explicit
   `meeting-recorder speakr upload ...` commands remain available in every mode.
   The daemon never scans historical directories to create publication jobs.
-- Normal network attempts (`upload PATH`, `upload --all`, and `upload --retry
-  JOB`) require NetworkManager to report an active Wi-Fi SSID that exactly
-  matches `speakr_allowed_ssids`: entries are case-sensitive raw UTF-8 strings,
-  at most 32 UTF-8 bytes, with no trimming or normalization. Unknown,
-  unavailable, or nonmatching Wi-Fi waits without contacting Speakr. `--force`
+- An empty valid `speakr_allowed_ssids` list disables the SSID safety gate.
+  When the list is nonempty, normal network attempts (`upload PATH`, `upload
+  --all`, and `upload --retry JOB`) require NetworkManager to report an active
+  Wi-Fi SSID that exactly matches it. A confirmed active non-Wi-Fi connection
+  bypasses this SSID-only gate. Entries are case-sensitive raw UTF-8 strings, at
+  most 32 UTF-8 bytes, with no trimming or normalization. Unknown, unavailable,
+  transitional, or nonmatching active Wi-Fi waits without contacting Speakr.
+  Invalid SSID configuration fails closed. `--force`
   is accepted only for those network forms and bypasses only the SSID gate;
   HTTPS, authentication, file identity, lease, reconciliation, and other state
   and file-safety checks still apply. An SSID match is not authentication.
 - Production `speakr_url` must use HTTPS. The bearer token is accepted only from
   `MEETING_RECORDER_SPEAKR_TOKEN`; it is never stored in configuration, CLI
   arguments, or SQLite.
+- Speakr tag discovery targets `v0.10.5-alpha` and is separate from the SSID
+  admission gate for media publication. It uses authenticated `GET /api/v1/tags`
+  with a five-second budget. Its private active-origin cache at
+  `$XDG_CACHE_HOME/meeting-recorder/speakr-tags.json` is atomically written in a
+  `0700` directory as a `0600` file, is deleted when the origin changes or Speakr
+  is disabled, and contains only the normalized origin, fetched time, tag IDs,
+  and display names—never a token. Only transient timeout/network/429/5xx
+  failures may use stale cache data; authentication and incompatible API failures
+  fail closed.
+- Frozen tag ID/name selections are stored in Meeting sidecar schema v2 and
+  public-only Publication state. They are revalidated before the initial upload;
+  successful validation sends only accessible IDs as contiguous `tag_ids[n]`
+  multipart fields. Transient validation sends the frozen IDs and can leave the
+  applied subset unknown, while permanent tag failures omit tags without
+  preventing the Recording or media publication.
+  Meeting Recorder never calls a post-upload Speakr tag mutation endpoint.
 - Speakr's local publication database stores public-only durable progress fields
   plus one protected private filesystem locator for the current Recording path
   as operational state. The locator is kept inside the protected 0700 state
   directory and 0600 SQLite boundary under `XDG_STATE_HOME` (or the user's
   local state directory); the database contains no credentials or copied
   private Meeting title, notes, or participants.
+- The Publication store is schema v4. First startup permanently resets an exact
+  v3 store without an application backup, losing publication jobs, retry state,
+  remote IDs, and cleanup history while retaining local Recordings. Treat this as
+  an irreversible compatibility boundary: it is not an old-database migration and
+  rollback to the prior binary is unsupported.
 - Detection reads audio-stream metadata via `pactl`; it never reads audio content
   to decide whether to record.
 

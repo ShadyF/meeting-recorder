@@ -6,6 +6,24 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- #53 adds optional, non-modal selection of existing Speakr tags for explicitly
+  accepted detected Recordings in automatic publication mode. Selection never
+  delays capture and is attached only during the initial Speakr upload.
+- #53 adds ordered tags to new Meeting sidecar schema v2 while retaining read
+  compatibility with schema v1 sidecars as untagged Recordings.
+- #53 adds private, bounded, active-origin Speakr tag-catalog caching and
+  CLI-only applied/missing/unknown tag status and sidecar-rewrite warnings.
+
+### Changed
+- #53 targets the verified Speakr `v0.10.5-alpha` tag contract: tags are read
+  with `GET /api/v1/tags`, sent only as contiguous initial-upload multipart
+  fields, and are never mutated after upload.
+- #53 advances the Publication store to schema v4. First startup permanently
+  resets an exact v3 store without a backup, losing queued jobs, retries, remote
+  IDs, and cleanup history while retaining local Recordings; rollback to the
+  prior binary is unsupported.
+
 ## [0.4.3] — 2026-08-30
 
 ### Added

@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import replace
 import fcntl
+import json
 import os
 from pathlib import Path
 import re
@@ -16,7 +17,7 @@ from uuid import uuid4
 
 from .speakr_domain import (
     CleanupClaim, CleanupIntent, CleanupPhase, MediaIdentity, PublicationJob, PublicationKey, PublicationOperation,
-    PublicationResult, PublicationState, ResumeIntent, _SAFE_ERROR_CODES,
+    PublicationResult, PublicationState, ResumeIntent, Tag, _MAX_TAGS, _SAFE_ERROR_CODES,
     normalize_speakr_url,
 )
 
@@ -37,7 +38,7 @@ class PublicationStoreSecurityError(PublicationStoreError, ValueError):
     """A state-store path or file does not meet the private-file contract."""
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _DATABASE_NAME = "publications.sqlite3"
 _PRIVATE_DIR_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
@@ -48,6 +49,7 @@ _DEFAULT_LEASE_MS = 60_000
 _MAX_DUE_IDS = 1_000
 _MAX_CLEANUP_GROUP = 100
 _MAX_CLEANUP_INTENTS = 100
+_MAX_TAG_JSON_BYTES = 65_536
 _CLEANUP_PHASE_ORDER = (
     CleanupPhase.PREPARED,
     CleanupPhase.SIDECAR_QUARANTINED,
@@ -93,16 +95,23 @@ _COLUMN_NAMES = (
     "transfer_started_at_ms", "accepted_at_ms", "published_at_ms", "uncertain_at_ms",
     "blocked_at_ms", "missing_at_ms", "local_removed_at_ms", "created_at_ms", "updated_at_ms",
     "cleanup_lease_owner", "cleanup_lease_generation", "cleanup_lease_expires_at_ms",
+    "frozen_tags", "effective_tags", "missing_tags", "upload_tags_unknown", "sidecar_warning",
 )
-_V2_COLUMN_NAMES = _COLUMN_NAMES[:-3]
+_V3_COLUMN_NAMES = _COLUMN_NAMES[:-5]
 _SELECT_COLUMNS = ", ".join(_COLUMN_NAMES)
 
 
-def _schema_sql(table_name: str = "publications") -> str:
+def _schema_sql(table_name: str = "publications", *, include_tags: bool = True) -> str:
     states = ", ".join(f"'{state.value}'" for state in PublicationState)
     operations = ", ".join(f"'{operation.value}'" for operation in PublicationOperation)
     intents = ", ".join(f"'{intent.value}'" for intent in ResumeIntent)
     errors = ", ".join(f"'{code}'" for code in sorted(_ALLOWED_ERROR_CODES))
+    tag_columns = "" if not include_tags else f"""
+            frozen_tags TEXT NOT NULL CHECK(length(CAST(frozen_tags AS BLOB)) <= {_MAX_TAG_JSON_BYTES} AND json_valid(frozen_tags)),
+            effective_tags TEXT NOT NULL CHECK(length(CAST(effective_tags AS BLOB)) <= {_MAX_TAG_JSON_BYTES} AND json_valid(effective_tags)),
+            missing_tags TEXT NOT NULL CHECK(length(CAST(missing_tags AS BLOB)) <= {_MAX_TAG_JSON_BYTES} AND json_valid(missing_tags)),
+            upload_tags_unknown INTEGER NOT NULL CHECK(upload_tags_unknown IN (0, 1)),
+            sidecar_warning INTEGER NOT NULL CHECK(sidecar_warning IN (0, 1)),"""
     return f"""
         CREATE TABLE {table_name} (
             job_id TEXT PRIMARY KEY,
@@ -138,6 +147,7 @@ def _schema_sql(table_name: str = "publications") -> str:
             cleanup_lease_owner TEXT,
             cleanup_lease_generation INTEGER NOT NULL CHECK(cleanup_lease_generation >= 0),
             cleanup_lease_expires_at_ms INTEGER CHECK(cleanup_lease_expires_at_ms IS NULL OR cleanup_lease_expires_at_ms >= 0),
+            {tag_columns}
             UNIQUE (instance_url, recording_sha256),
             CHECK(length(recording_sha256) = 64 AND recording_sha256 NOT GLOB '*[^0-9a-f]*'),
             CHECK((lease_owner IS NULL AND lease_expires_at_ms IS NULL)
@@ -236,27 +246,9 @@ def _table_statement(schema: str, table_name: str) -> str:
     raise PublicationMigrationError(f"generated schema is missing table {table_name}")
 
 
-def _expected_v2_publication_sql() -> str:
-    """Derive the unchanged v2 publication definition without weakening its SQL checks."""
-    statement = _table_statement(_schema_sql(), "publications")
-    statement = re.sub(
-        r"\s+cleanup_lease_owner TEXT,\s+cleanup_lease_generation INTEGER NOT NULL CHECK\(cleanup_lease_generation >= 0\),\s+cleanup_lease_expires_at_ms INTEGER CHECK\(cleanup_lease_expires_at_ms IS NULL OR cleanup_lease_expires_at_ms >= 0\),",
-        "",
-        statement,
-    )
-    statement = re.sub(
-        r"\s+CHECK\(\(cleanup_lease_owner IS NULL AND cleanup_lease_expires_at_ms IS NULL\)\s+OR \(cleanup_lease_owner IS NOT NULL AND cleanup_lease_expires_at_ms IS NOT NULL\s+AND state = 'published'\)\),",
-        "",
-        statement,
-    )
-    statement = re.sub(
-        r"\s+\(state = 'local_removed'.*?published_at_ms <= local_removed_at_ms\)",
-        "\n                (state = 'local_removed' AND operation = 'none' AND resume_intent = 'none')",
-        statement,
-        count=1,
-        flags=re.DOTALL,
-    )
-    return statement
+def _expected_v3_publication_sql() -> str:
+    """Return the exact retired v3 definition used only for reset detection."""
+    return _table_statement(_schema_sql(include_tags=False), "publications")
 
 
 def _now_ms() -> int:
@@ -281,6 +273,35 @@ def _validate_nonnegative_int(value: object, name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
     return value
+
+
+def _encode_tags(tags: tuple[Tag, ...] | None) -> str:
+    """Serialize validated public tag values into a canonical durable snapshot."""
+    value = None if tags is None else [{"tag_id": tag.tag_id, "name": tag.name} for tag in tags]
+    encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    if len(encoded.encode("utf-8")) > _MAX_TAG_JSON_BYTES:
+        raise ValueError("tag snapshot is too large")
+    return encoded
+
+
+def _decode_tags(value: object, name: str) -> tuple[Tag, ...] | None:
+    """Decode one bounded schema-owned tag snapshot without accepting loose JSON shapes."""
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 1_048_576:
+        raise ValueError(f"{name} is invalid")
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} is invalid") from exc
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or len(raw) > _MAX_TAGS:
+        raise ValueError(f"{name} is invalid")
+    tags = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"tag_id", "name"}:
+            raise ValueError(f"{name} is invalid")
+        tags.append(Tag(item["tag_id"], item["name"]))
+    return tuple(tags)
 
 
 def _validate_identity(value: object | None) -> MediaIdentity | None:
@@ -468,7 +489,7 @@ class PublicationStore:
                     pass
 
     def migrate(self) -> None:
-        """Create v3 or perform the one supported v2-to-v3 migration."""
+        """Create v4, discarding only an exact retired v3 database."""
         connection = self._connect()
         created_schema = False
         try:
@@ -484,22 +505,17 @@ class PublicationStore:
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
                 self._ensure_indexes(connection)
                 created_schema = True
-            elif version == 2:
-                self._validate_schema(connection, tables, expected_version=2)
-                try:
-                    self._migrate_v2_to_v3(connection)
-                except PublicationMigrationError:
-                    raise
-                except Exception as exc:
-                    raise PublicationMigrationError("v2 publication rows failed the v3 audit invariants") from exc
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-                self._ensure_indexes(connection)
+            elif version == 3:
+                self._validate_schema(connection, tables, expected_version=3)
+                self._validate_exact_indexes(connection)
+                self._reset_legacy_v3(connection)
+                created_schema = True
             elif version != _SCHEMA_VERSION:
                 raise PublicationMigrationError(
-                    f"publication database schema version {version} is unsupported; expected v3"
+                    f"publication database schema version {version} is unsupported; expected v4"
                 )
             else:
-                self._validate_schema(connection, tables, expected_version=3)
+                self._validate_schema(connection, tables, expected_version=4)
                 self._ensure_indexes(connection)
             connection.commit()
         except Exception:
@@ -521,14 +537,11 @@ class PublicationStore:
         *,
         expected_version: int,
     ) -> None:
-        expected_tables = (
-            (("publications",),) if expected_version == 2 else
-            (("cleanup_intent_members",), ("cleanup_intents",), ("publications",))
-        )
+        expected_tables = (("cleanup_intent_members",), ("cleanup_intents",), ("publications",))
         if tuple(sorted(tables)) != tuple(sorted(expected_tables)):
             raise PublicationMigrationError("publication database tables are incompatible")
         columns = tuple(row[1] for row in connection.execute("PRAGMA table_info(publications)"))
-        expected_columns = _V2_COLUMN_NAMES if expected_version == 2 else _COLUMN_NAMES
+        expected_columns = _V3_COLUMN_NAMES if expected_version == 3 else _COLUMN_NAMES
         if columns != expected_columns:
             raise PublicationMigrationError("publication database columns are incompatible")
         table_list = connection.execute(
@@ -536,15 +549,13 @@ class PublicationStore:
         ).fetchone()
         if table_list != (1, 1):
             raise PublicationMigrationError("publication table is not strict and without rowid")
-        expected_publication_sql = (
-            _expected_v2_publication_sql() if expected_version == 2 else _table_statement(_schema_sql(), "publications")
-        )
+        expected_publication_sql = _expected_v3_publication_sql() if expected_version == 3 else _table_statement(_schema_sql(), "publications")
         actual_publication_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'publications'"
         ).fetchone()
         if not actual_publication_sql or _normalized_sql(actual_publication_sql[0]) != _normalized_sql(expected_publication_sql):
             raise PublicationMigrationError("publication table definition is incompatible")
-        if expected_version == 3:
+        if expected_version in {3, 4}:
             for table_name in ("cleanup_intents", "cleanup_intent_members"):
                 table_list = connection.execute(
                     "SELECT wr, strict FROM pragma_table_list WHERE name = ?", (table_name,)
@@ -559,27 +570,41 @@ class PublicationStore:
                     raise PublicationMigrationError(f"{table_name} definition is incompatible")
 
     @staticmethod
-    def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
-        # Rebuild the single publication table so v3 constraints apply atomically to preserved rows.
-        publication_schema = _schema_sql("publications_v3")
-        cleanup_start = publication_schema.index("CREATE TABLE cleanup_intents")
-        connection.execute(publication_schema[:cleanup_start])
-        old_columns = ", ".join(_V2_COLUMN_NAMES)
-        new_columns = ", ".join(_V2_COLUMN_NAMES + (
-            "cleanup_lease_owner", "cleanup_lease_generation", "cleanup_lease_expires_at_ms",
-        ))
-        connection.execute(
-            f"INSERT INTO publications_v3 ({new_columns}) SELECT {old_columns}, NULL, 0, NULL FROM publications"
-        )
-        connection.execute("DROP TABLE publications")
-        connection.execute("ALTER TABLE publications_v3 RENAME TO publications")
-
-        # Add the cleanup tables only after every publication row has been copied successfully.
-        schema = _schema_sql()
-        cleanup_sql = schema[schema.index("CREATE TABLE cleanup_intents"):]
-        for statement in cleanup_sql.split(";"):
+    def _reset_legacy_v3(connection: sqlite3.Connection) -> None:
+        """Rebuild the verified legacy inode within its exclusive transaction."""
+        # Overwrite retired cells before transactional DDL removes their schema.
+        connection.execute("PRAGMA secure_delete = ON")
+        # Remove children first so foreign keys never leave an intermediate orphan.
+        for name, _, _ in connection.execute(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+        ).fetchall():
+            connection.execute(f"DROP INDEX {name}")
+        for table_name in ("cleanup_intent_members", "cleanup_intents", "publications"):
+            connection.execute(f"DROP TABLE {table_name}")
+        # Publish a fresh v4 schema without changing the database pathname or companions.
+        for statement in _schema_sql().split(";"):
             if statement.strip():
                 connection.execute(statement)
+        connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        PublicationStore._ensure_indexes(connection)
+
+    @staticmethod
+    def _validate_exact_indexes(connection: sqlite3.Connection) -> None:
+        """Confirm a retired database is exact before its irreversible reset."""
+        expected = dict(_INDEX_DEFINITIONS + _CLEANUP_INDEX_DEFINITIONS)
+        rows = connection.execute(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+        ).fetchall()
+        if {row[0] for row in rows} != set(expected):
+            raise PublicationMigrationError("publication indexes are incompatible")
+        for name, table, sql in rows:
+            expected_table = "publications" if name in dict(_INDEX_DEFINITIONS) else (
+                "cleanup_intents" if name == "idx_cleanup_intents_phase" else "cleanup_intent_members"
+            )
+            expected_sql = f"CREATE INDEX {name} ON {expected_table} ({', '.join(expected[name])})"
+            columns = tuple(row[2] for row in connection.execute(f"PRAGMA index_info({name})"))
+            if table != expected_table or columns != expected[name] or _normalized_sql(sql) != _normalized_sql(expected_sql):
+                raise PublicationMigrationError("publication indexes are incompatible")
 
     @staticmethod
     def _ensure_indexes(connection: sqlite3.Connection) -> None:
@@ -625,6 +650,9 @@ class PublicationStore:
     def _row_to_job(row: sqlite3.Row | tuple[object, ...]) -> PublicationJob:
         values = dict(zip(_COLUMN_NAMES, row))
         try:
+            # Reject non-canonical SQLite flag values before converting them to bool.
+            if values["upload_tags_unknown"] not in (0, 1) or values["sidecar_warning"] not in (0, 1):
+                raise ValueError("tag status flags are invalid")
             return PublicationJob(
                 job_id=values["job_id"],
                 key=PublicationKey(values["instance_url"], values["recording_sha256"]),
@@ -648,6 +676,11 @@ class PublicationStore:
                 cleanup_lease_owner=values["cleanup_lease_owner"],
                 cleanup_lease_generation=values["cleanup_lease_generation"],
                 cleanup_lease_expires_at_ms=values["cleanup_lease_expires_at_ms"],
+                frozen_tags=_decode_tags(values["frozen_tags"], "frozen tags") or (),
+                effective_tags=_decode_tags(values["effective_tags"], "effective tags"),
+                missing_tags=_decode_tags(values["missing_tags"], "missing tags"),
+                upload_tags_unknown=bool(values["upload_tags_unknown"]),
+                sidecar_warning=bool(values["sidecar_warning"]),
             )
         except (TypeError, ValueError, KeyError, OverflowError) as exc:
             raise PublicationStoreError("publication row failed public validation") from exc
@@ -1265,6 +1298,7 @@ class PublicationStore:
         *,
         identity: MediaIdentity | None = None,
         job_id: str | None = None,
+        tags: tuple[Tag, ...] = (),
     ) -> PublicationJob:
         """Atomically create a queued job or reuse its normalized URL/SHA identity."""
         if not isinstance(key, PublicationKey):
@@ -1274,6 +1308,10 @@ class PublicationStore:
             private_path = private_path.path
         identity = _validate_identity(identity)
         path = _path_bytes(private_path)
+        if not isinstance(tags, tuple) or len(tags) > _MAX_TAGS or any(not isinstance(tag, Tag) for tag in tags):
+            raise ValueError("tags must be tag values")
+        if len({tag.tag_id for tag in tags}) != len(tags):
+            raise ValueError("tags contain duplicate tag IDs")
         file_last_modified_ms = _validate_nonnegative_int(file_last_modified_ms, "file last modified time")
         if job_id is None:
             job_id = uuid4().hex
@@ -1288,6 +1326,7 @@ class PublicationStore:
             None, None, 0, now, None, 0, None, None, None,
             None, None, None, None, None, None, None, now, now,
             None, 0, None,
+            _encode_tags(tags), _encode_tags(None), _encode_tags(None), 0, 0,
         )
 
         def insert(connection: sqlite3.Connection) -> PublicationJob:
@@ -1302,6 +1341,71 @@ class PublicationStore:
     def create(self, key: PublicationKey, private_path: bytes | str | os.PathLike[str], **kwargs: object) -> PublicationJob:
         """Create or reuse a job; this is the concise integration-facing spelling."""
         return self.create_or_reuse(key, private_path, **kwargs)  # type: ignore[arg-type]
+
+    def update_tag_status(
+        self, reference: PublicationKey | PublicationJob | str, owner: str, generation: int, *, effective_tags: tuple[Tag, ...] | None = None,
+        missing_tags: tuple[Tag, ...] | None = None, upload_tags_unknown: bool | None = None,
+        sidecar_warning: bool | None = None,
+        now_ms: int | None = None,
+    ) -> PublicationJob:
+        """Persist publisher tag outcomes behind the normal lease and generation fence."""
+        for name, tags in (("effective tags", effective_tags), ("missing tags", missing_tags)):
+            if tags is not None and (not isinstance(tags, tuple) or len(tags) > _MAX_TAGS or any(not isinstance(tag, Tag) for tag in tags)):
+                raise ValueError(f"{name} must be tag values")
+        if upload_tags_unknown is not None and type(upload_tags_unknown) is not bool:
+            raise ValueError("upload tag outcome must be bool")
+        if sidecar_warning is not None and type(sidecar_warning) is not bool:
+            raise ValueError("sidecar warning must be bool")
+        now = self._time_ms() if now_ms is None else _validate_nonnegative_int(now_ms, "publication clock")
+
+        def update(connection: sqlite3.Connection) -> PublicationJob:
+            old = self._job_from_reference(connection, reference)
+            self._fence(old, owner, generation, now)
+            # Keep ordinary tag outcomes limited to the pre-upload queued phase.
+            if old.state is not PublicationState.QUEUED:
+                raise self._transition_error("tag status can only be recorded before upload")
+            # Reject partial or contradictory outcome shapes before writing them.
+            if (effective_tags is None) != (missing_tags is None) and not upload_tags_unknown:
+                raise ValueError("known tag outcomes require both tag sets")
+            if upload_tags_unknown and (effective_tags is not None or missing_tags is not None):
+                raise ValueError("unknown tag outcomes cannot contain exact tag sets")
+            # Preserve unchanged status fields while applying the caller's complete outcome.
+            new = replace(
+                old, effective_tags=(None if upload_tags_unknown else old.effective_tags if effective_tags is None else effective_tags),
+                missing_tags=(None if upload_tags_unknown else old.missing_tags if missing_tags is None else missing_tags),
+                upload_tags_unknown=old.upload_tags_unknown if upload_tags_unknown is None else upload_tags_unknown,
+                sidecar_warning=old.sidecar_warning if sidecar_warning is None else sidecar_warning,
+                updated_at_ms=max(now, old.created_at_ms),
+            )
+            return self._update_job(connection, old, new)
+
+        return self._write(update)  # type: ignore[return-value]
+
+    def resolve_reconciled_tags(
+        self, reference: PublicationKey | PublicationJob | str, owner: str, generation: int, *,
+        now_ms: int | None = None,
+    ) -> PublicationJob:
+        """Record that a uniquely reconciled POST accepted its submitted frozen tags."""
+        now = self._time_ms() if now_ms is None else _validate_nonnegative_int(now_ms, "publication clock")
+
+        def update(connection: sqlite3.Connection) -> PublicationJob:
+            # Keep this recovery-only mutation behind the active reconciliation lease.
+            old = self._job_from_reference(connection, reference)
+            self._fence(old, owner, generation, now)
+            # Limit recovery to an actively fenced, reconciliation-eligible uncertain job.
+            if old.state is not PublicationState.UNCERTAIN or not old.reconciliation_eligible:
+                raise self._transition_error("reconciled tag resolution requires active uncertainty")
+            # Preserve known filtering, but resolve an unknown request as its full submitted snapshot.
+            if old.upload_tags_unknown:
+                new = replace(
+                    old, effective_tags=old.frozen_tags, missing_tags=(), upload_tags_unknown=False,
+                    updated_at_ms=max(now, old.created_at_ms),
+                )
+            else:
+                new = replace(old, updated_at_ms=max(now, old.created_at_ms))
+            return self._update_job(connection, old, new)
+
+        return self._write(update)  # type: ignore[return-value]
 
     @staticmethod
     def _owner_generation(owner: str | None, generation: int | None) -> tuple[str | None, int | None]:
@@ -1335,6 +1439,9 @@ class PublicationStore:
         values_by_column.update({
             name: getattr(new, name) for name in _COLUMN_NAMES[3:]
         })
+        # Serialize immutable tag tuples at the SQLite boundary.
+        for name in ("frozen_tags", "effective_tags", "missing_tags"):
+            values_by_column[name] = _encode_tags(getattr(new, name))
         values = tuple(values_by_column[name] for name in _COLUMN_NAMES)
         cursor = connection.execute(
             f"UPDATE publications SET {', '.join(f'{name} = ?' for name in _COLUMN_NAMES)} WHERE job_id = ?",

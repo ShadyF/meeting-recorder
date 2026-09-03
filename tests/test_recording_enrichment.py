@@ -11,6 +11,7 @@ from meeting_recorder.calendar_domain import (
 )
 from meeting_recorder.domain import CaptureMode, CompletedRecording
 from meeting_recorder.meeting_sidecar import MeetingSidecar, load_sidecar, sidecar_path, write_sidecar
+from meeting_recorder.speakr_domain import Tag
 from meeting_recorder.recording_enrichment import (
     CorrectionTransactionError, RecordingCorrectionService, RecordingEnricher,
 )
@@ -31,11 +32,15 @@ def _completed(path: Path, start: datetime = NOW,
     return CompletedRecording(path, "Manual", CaptureMode.AUDIO_VIDEO, True, True, start, end)
 
 
-def _write_capture(path: Path, meeting=None, fallback: str | None = None) -> None:
+def _write_capture(path: Path, meeting=None, fallback: str | None = None,
+                   tags: tuple[Tag, ...] = ()) -> None:
+    # Build an adjacent sidecar through the public v2 writer.
     path.write_bytes(b"recording")
     write_sidecar(
         sidecar_path(path),
-        MeetingSidecar(path.name, fallback or path.name, NOW, NOW + timedelta(minutes=30), meeting),
+        MeetingSidecar(
+            path.name, fallback or path.name, NOW, NOW + timedelta(minutes=30), meeting, tags,
+        ),
     )
 
 
@@ -52,6 +57,21 @@ def test_enrich_visible_match_moves_media_and_writes_snapshot_sidecar() -> None:
         assert metadata.recording_filename == result.path.name
         assert metadata.meeting is not None and metadata.meeting.title == "Design review"
         assert original.path == source
+
+
+def test_enrich_rename_preserves_ordered_frozen_tags_in_the_moved_sidecar() -> None:
+    # Pass controller-frozen tags through enrichment to the renamed sidecar.
+    with TemporaryDirectory() as directory:
+        source = Path(directory) / "capture.mkv"
+        source.write_bytes(b"recording")
+        tags = (Tag(9, "Zulu"), Tag(2, "Alpha"))
+        result = RecordingEnricher([_occurrence()], lambda value: value).enrich(
+            _completed(source), tags=tags,
+        )
+
+        # Read the moved sidecar through its public loader and retain catalog order.
+        assert result.path != source
+        assert load_sidecar(sidecar_path(result.path)).tags == tags
 
 
 def test_enrich_hidden_and_unmatched_keep_fallback_name_but_write_sidecar() -> None:
@@ -145,6 +165,34 @@ def test_correction_discovery_list_order_select_switch_clear_and_missing() -> No
         assert cleared.name == "capture.mkv" and cleared.exists()
         assert not sidecar_path(cleared).exists()
         assert RecordingCorrectionService().clear(cleared) == cleared
+
+
+def test_correction_select_and_clear_preserve_ordered_tags_while_moving_sidecar() -> None:
+    # Start from a tagged v2 sidecar that correction will rename twice.
+    with TemporaryDirectory() as directory:
+        source = Path(directory) / "capture.mkv"
+        tags = (Tag(9, "Zulu"), Tag(2, "Alpha"))
+        _write_capture(source, tags=tags)
+        selected_occurrence = _occurrence("selected", "Selected")
+        service = RecordingCorrectionService((selected_occurrence,), lambda value: value)
+
+        # Select a meeting and retain the ordered tag snapshot in the moved sidecar.
+        selected = service.select(source, selected_occurrence.key)
+        selected_sidecar = load_sidecar(sidecar_path(selected))
+        assert selected_sidecar.tags == tags and selected_sidecar.meeting is not None
+        assert (selected_sidecar.capture_started_at, selected_sidecar.capture_ended_at,
+                selected_sidecar.original_fallback_filename) == (
+                    NOW, NOW + timedelta(minutes=30), source.name,
+                )
+
+        # Clear only Meeting metadata while retaining tags beside the restored fallback name.
+        cleared = service.clear(selected)
+        cleared_sidecar = load_sidecar(sidecar_path(cleared))
+        assert cleared_sidecar.tags == tags and cleared_sidecar.meeting is None
+        assert (cleared_sidecar.capture_started_at, cleared_sidecar.capture_ended_at,
+                cleared_sidecar.original_fallback_filename) == (
+                    NOW, NOW + timedelta(minutes=30), source.name,
+                )
 
 
 def test_correction_hidden_selection_uses_fallback_and_exact_cached_key() -> None:
@@ -354,6 +402,30 @@ def test_correction_clear_sidecar_removal_failure_keeps_moved_media_authoritativ
             assert not source.exists()
     finally:
         enrichment_module.remove_sidecar = original_remove
+
+
+def test_tagged_clear_sidecar_relocation_failure_preserves_recoverable_tags() -> None:
+    # Fail the tagged sidecar relocation after the media fallback move commits.
+    original_relocate = enrichment_module._write_moved_sidecar
+    try:
+        enrichment_module._write_moved_sidecar = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(OSError("relocation failed")))
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "renamed.mkv"
+            tags = (Tag(9, "Zulu"), Tag(2, "Alpha"))
+            _write_capture(source, fallback="fallback.mkv", tags=tags)
+
+            # Preserve the committed intent beside the old name for later recovery.
+            try:
+                RecordingCorrectionService().clear(source)
+                assert False, "post-move sidecar failure must not report success"
+            except CorrectionTransactionError as error:
+                assert error.outcome.partial and error.outcome.committed
+                assert error.outcome.current_path.name == "fallback.mkv"
+            pending = load_sidecar(sidecar_path(source))
+            assert pending.tags == tags and pending.meeting is None
+    finally:
+        enrichment_module._write_moved_sidecar = original_relocate
 
 
 def test_correction_clear_pre_move_sidecar_failure_restores_exact_sidecar() -> None:

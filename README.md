@@ -338,10 +338,12 @@ match. A matched recording is renamed to
 `YYYY-MM-DD_HH-MM-SS_Title.mkv` using the event's local scheduled time; collisions
 receive `-2`, `-3`, and so on. Hidden meetings and unmatched recordings retain
 their fallback filename. Every recording has an adjacent
-`<media filename>.meeting.json` sidecar (schema version 1) containing the capture
-interval, fallback name, stable occurrence selector, and the current visible
-meeting snapshot. Sidecars are written atomically and are not required for the
-media file to remain usable.
+`<media filename>.meeting.json` sidecar (schema version 2) containing the capture
+interval, fallback name, stable occurrence selector, current visible Meeting
+snapshot, and an ordered Speakr tag list (empty when none was selected). Sidecars
+are written atomically and are not required for the media file to remain usable.
+Version-1 sidecars remain readable as having no tags and are not rewritten merely
+to upgrade them.
 
 Use the correction command to inspect or change one recording from the fresh
 offline cache:
@@ -379,6 +381,57 @@ scans historical directories to create jobs. For `meeting-recorder record`, the
 automatic enqueue happens after its GLib loop exits; the daemon worker attempts the
 durable job later.
 
+#### Optional tags for accepted detected Recordings
+
+Only when `speakr_publication_mode` is `automatic`, a detected meeting for which
+you explicitly choose **Video** or **Audio only** can offer a separate **Add tags**
+window. It is not part of the capture-consent prompt and is never shown for
+unattended `auto_record`, `manual` or `disabled` publication modes, or explicit
+`meeting-recorder record` captures. Tag discovery begins alongside capture setup,
+but the window opens only after capture is actually active: after ffmpeg starts for
+audio, or after the Wayland portal succeeds (including its audio-only fallback).
+It never overlaps the portal dialog.
+
+The non-modal window permits any number of existing tags. **Done** saves the shown
+selection; **Skip · use no tags** explicitly saves none. **Not now**, titlebar
+close, Escape, the untouched 15-second timeout, or stopping the Recording discard
+unsaved checkbox changes and retain any earlier Done/Skip choice. The recording's
+Pause and Stop & Save controls remain usable throughout. Reopen **Add tags** (or
+`Tags (N)`) during the Recording to change the in-memory choice; it reuses that
+Recording's catalog snapshot. If no catalog is available, **Retry tags** performs
+one manual retry. There is no background, startup, or periodic retry.
+
+The selection is frozen at Stop & Save, written to the v2 sidecar, and carried to
+the automatic Publication job. Existing v2 sidecar tags are also honored by an
+explicit `speakr upload PATH`. There is no post-capture tag editor or tag-definition
+management in Meeting Recorder.
+
+Meeting Recorder targets Speakr
+[`v0.10.5-alpha`](docs/research/speakr-0.10.5-tag-api-contract.md), not an
+unreleased `v0.10.5`. It obtains the accessible personal-then-group catalog with
+authenticated `GET /api/v1/tags`, preserving Speakr's returned order. Before the
+initial media upload it validates the frozen IDs once against a fresh catalog and
+sends only contiguous `tag_ids[0]`, `tag_ids[1]`, … multipart fields. No tag fields
+are sent for no tags. Tags are initial-upload-only: after a clip is accepted, all
+metadata requests omit tags and Meeting Recorder never calls Speakr's post-upload
+tag mutation endpoint.
+
+Catalog discovery and its pre-upload validation each have a five-second budget.
+A fresh non-empty catalog wins. Only timeout, network, HTTP 429, and HTTP 5xx
+failures may use the active origin's stale catalog; authentication and API-contract
+failures fail closed and do not use it. A valid empty catalog, a cached empty
+catalog, or no usable result suppresses the selection window. The latter produces
+at most one non-blocking **Tags unavailable** notice for that Recording. Discovery
+does not use the Publication SSID gate; that gate still controls media-publication
+attempts.
+
+The catalog cache contains only the normalized active Speakr origin, fetched time,
+integer IDs, and display names. It is atomically stored at
+`$XDG_CACHE_HOME/meeting-recorder/speakr-tags.json` (or
+`~/.cache/meeting-recorder/...`) in a private `0700` directory with a `0600` file.
+It is isolated when corrupt and deleted when the Speakr URL changes or Speakr is
+disabled. It is not keyed by, and never stores, a bearer token.
+
 Configure the production Speakr origin with `speakr_url`; it must use HTTPS. For
 native/source use, provide the bearer token only through
 `MEETING_RECORDER_SPEAKR_TOKEN`:
@@ -398,11 +451,20 @@ Meeting title, notes, or participants. Publication state lives at
 unset). The Bluefin Quadlet instead mounts the token as its fixed mode-`0400`
 secret file; see [Bluefin GNOME / rootless Podman operator guide](docs/BLUEFIN.md).
 
-Automatic and normal explicit network attempts are admitted only when
-NetworkManager reports an active Wi-Fi SSID that exactly matches an entry in
-`speakr_allowed_ssids`. Entries are case-sensitive strings compared as their raw
-UTF-8 bytes: they must be non-empty and at most 32 UTF-8 bytes, with no trimming,
-case folding, or Unicode normalization. For example:
+> **Upgrade warning — Publication store v4:** this feature changes the private
+> Publication store from schema v3 to v4. On first startup, an **exact v3** store
+> is automatically and permanently reset to a new empty v4 store. The application
+> creates no backup: queued jobs, retry schedules, remote recording IDs, and
+> cleanup intents/history are lost. Local Recordings and their sidecars remain in
+> place. This is not a database migration, and rolling back to the prior binary is
+> unsupported. Preserve any information you need before starting the new version.
+
+An empty valid `speakr_allowed_ssids` list disables the SSID safety gate. With a
+nonempty list, automatic and normal explicit network attempts are admitted only
+when NetworkManager reports an active Wi-Fi SSID that exactly matches an entry.
+Entries are case-sensitive strings compared as their raw UTF-8 bytes: they must be
+non-empty and at most 32 UTF-8 bytes, with no trimming, case folding, or Unicode
+normalization. For example:
 
 ```json
 {
@@ -411,11 +473,12 @@ case folding, or Unicode normalization. For example:
 }
 ```
 
-Unknown, unavailable, or nonmatching Wi-Fi is not admission; the worker waits for
-a later check and does not contact Speakr. An SSID match is only an admission
-gate, not authentication. HTTPS, token authentication, recording-hash and file
-identity checks, lease fencing, reconciliation rules, and other file-safety checks
-still apply.
+Unknown, unavailable, transitional, or nonmatching Wi-Fi is not admission; the
+worker waits for a later check and does not contact Speakr. A confirmed active
+non-Wi-Fi connection bypasses this SSID-only gate, while invalid SSID configuration
+fails closed. An SSID match is only an admission gate, not authentication. HTTPS,
+token authentication, recording-hash and file identity checks, lease fencing,
+reconciliation rules, and other file-safety checks still apply.
 
 The normal network forms are `upload PATH`, `upload --all`, and `upload --retry
 JOB`; each is SSID-gated. `--force` is accepted only with those three forms and
@@ -448,6 +511,18 @@ The media POST is non-idempotent: `transfer_unknown` is never automatically
 resent. A rejected transfer may be retried only by explicitly rerunning the
 command. `metadata_pending` retries only the metadata PATCH, while a `published`
 rerun sends no requests.
+
+`meeting-recorder speakr upload --status JOB` and `--status --all` are the only
+places tag application details appear. Their JSON includes `effective_tags`,
+`missing_tags`, `upload_tags_unknown`, and `sidecar_warning`. A fresh validation
+reports the exact accessible selected tags as `effective_tags` and deleted or
+inaccessible selections as `missing_tags`; those missing entries are omitted from
+the initial upload. A transient validation failure sends the frozen IDs, but
+`upload_tags_unknown: true` means Speakr may have silently applied only a subset.
+`sidecar_warning: true` means the known applied set could not be written back to
+the local sidecar; it does not make an otherwise successful publication fail and
+does not create a desktop notification. These fields survive `local_removed` so
+CLI cleanup history retains the warning.
 
 ### Explicit cleanup of published Recordings
 
@@ -572,6 +647,35 @@ volumes at `1.0`; that makes them equal. Nudge `mic_volume` to `1.2` to sit slig
 
 **Changes to settings did nothing** — restart the service (`systemctl --user restart
 meeting-recorder`), and make sure you edited `~/.config/meeting-recorder/config.json`.
+
+**Tags did not appear for a Recording** — tag selection is intentionally limited to
+an explicitly accepted, detected **Video** or **Audio only** capture while
+`speakr_publication_mode` is `automatic`. It does not appear for auto-record,
+manual Recording, disabled/manual publication, a cancelled Wayland portal, or a
+capture that never starts. During an active eligible Recording use **Retry tags**
+when shown; a retry does not pause capture. Check that `speakr_url` is the intended
+HTTPS origin and that a bearer token is available. The tag lookup has only five
+seconds and does not wait for or bypass media publication policy.
+
+**Tags are missing or unknown after publication** — run
+`meeting-recorder speakr upload --status JOB`. `missing_tags` records tags that a
+fresh accessible catalog no longer contained, while `upload_tags_unknown: true`
+means a transient validation failure left Speakr's applied subset unknowable.
+`sidecar_warning: true` concerns only the local sidecar rewrite. None of these
+states changes the saved Recording or calls a remote tag-update endpoint.
+
+**Speakr waits on a network even though tags loaded** — catalog discovery is
+separate from media publication. It intentionally ignores `speakr_allowed_ssids`;
+normal media uploads still require the configured SSID gate unless an explicit
+eligible `--force` command bypasses that gate. A matching SSID is admission only,
+not Speakr authentication.
+
+**Publication stopped working after an upgrade** — a build with Publication store
+v4 permanently resets an exact v3 store on its first startup without a backup.
+The local Recordings remain, but old queued jobs, retry state, remote IDs, and
+cleanup history cannot be restored by the application; do not roll back to the
+prior binary. Re-enqueue a retained local Recording explicitly if publication is
+still required.
 
 ## Remove local source data
 

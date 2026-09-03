@@ -11,7 +11,7 @@ from meeting_recorder.calendar_domain import (
 from meeting_recorder.meeting_sidecar import MeetingSidecar
 from meeting_recorder.speakr_domain import (
     CleanupClaim, CleanupIntent, CleanupPhase, MediaIdentity, PublicationJob, PublicationKey, PublicationOperation, PublicationResult,
-    PublicationState, ResumeIntent, SpeakrMetadata, map_speakr_metadata, normalize_speakr_url,
+    PublicationState, ResumeIntent, SpeakrMetadata, Tag, map_speakr_metadata, normalize_speakr_url,
 )
 
 
@@ -104,6 +104,27 @@ def test_domain_rejects_unsafe_identity_and_inconsistent_operation() -> None:
     assert _job(attempt_count=100_000).attempt_count == 100_000
     _raises(_job, last_error_code="Bearer secret")
     _raises(_job, last_http_status=True)
+
+
+def test_tag_is_immutable_and_publication_status_keeps_a_frozen_snapshot() -> None:
+    tag = Tag(7, "  Engineering  ")
+    assert tag.tag_id == 7 and tag.name == "  Engineering  "
+    assert _job(frozen_tags=(tag,), effective_tags=(tag,), missing_tags=()).effective_tags == (tag,)
+    _raises(Tag, True, "Engineering")
+    _raises(Tag, 7, "")
+    _raises(Tag, 2**63, "Engineering")
+    _raises(Tag, 7, "x" * 256)
+    _raises(_job, frozen_tags=(tag,), missing_tags=(Tag(7, "Renamed"),))
+
+
+def test_tag_outcome_is_explicitly_unresolved_known_or_unknown() -> None:
+    first, second = Tag(1, "First"), Tag(2, "Second")
+    assert _job(frozen_tags=(first, second)).effective_tags is None
+    assert _job(frozen_tags=(first, second), upload_tags_unknown=True).missing_tags is None
+    known = _job(frozen_tags=(first, second), effective_tags=(second,), missing_tags=(first,))
+    assert known.effective_tags == (second,) and known.missing_tags == (first,)
+    _raises(_job, frozen_tags=(first, second), effective_tags=(first,), missing_tags=())
+    _raises(_job, frozen_tags=(first,), effective_tags=(first,), missing_tags=(), upload_tags_unknown=True)
 
 
 def test_media_identity_and_linux_filename_bytes_are_validated() -> None:

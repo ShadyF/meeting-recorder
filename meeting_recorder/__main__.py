@@ -217,7 +217,41 @@ def _cmd_run(cfg) -> int:
                     LOG.warning("Speakr publication service cleanup failed")
             publication_service = None
 
+    # Build capture before optional tag discovery so tag setup cannot block recording.
     recorder = Recorder(cfg)
+
+    # Enable explicit tag discovery only for automatic Speakr publication.
+    tag_service = None
+    tag_requester = None
+    try:
+        mode = PublicationMode.parse(getattr(cfg, "speakr_publication_mode", "disabled"))
+        if mode is PublicationMode.AUTOMATIC:
+            from .speakr_http import StdlibSpeakrTransport
+            from .speakr_tag_cache import SpeakrTagCache
+            from .speakr_tag_service import SpeakrTagService, TagCatalogOutcome, TagCatalogSource
+
+            origin = resolve_speakr_url(cfg)
+            tag_service = SpeakrTagService(
+                StdlibSpeakrTransport(), SpeakrTagCache(), GLib.idle_add,
+            )
+            tag_service.activate(origin)
+
+            def tag_requester(callback: Callable[[Any], None]) -> Any | None:
+                # Resolve credentials per explicit request and never retain them in UI state.
+                try:
+                    token = require_speakr_token(cfg)
+                    return tag_service.request(origin, token, callback)
+                except Exception:
+                    callback(TagCatalogOutcome(
+                        (), TagCatalogSource.UNAVAILABLE, None, True,
+                    ))
+                    return None
+        else:
+            from .speakr_tag_cache import SpeakrTagCache
+            SpeakrTagCache().activate(None)
+    except Exception:
+        LOG.debug("Speakr tag discovery is unavailable", exc_info=True)
+    # Keep recording enrichment independent from optional tag service setup.
     enricher = RecordingEnricher(
         cache_only_occurrence_provider(),
         on_media_renamed=(
@@ -225,7 +259,10 @@ def _cmd_run(cfg) -> int:
             if publication_service is not None else None
         ),
     ).enrich
-    controller = Controller(cfg, notifier, recorder, recording_enricher=enricher)
+    controller = Controller(
+        cfg, notifier, recorder, recording_enricher=enricher,
+        tag_requester=tag_requester,
+    )
 
     def _on_finished(completed: CompletedRecording | None) -> None:
         # Completion callbacks only perform immutable queue admission on GLib.
@@ -299,6 +336,12 @@ def _cmd_run(cfg) -> int:
             controller.shutdown()
         except Exception:
             LOG.warning("Recorder controller cleanup failed", exc_info=True)
+        if tag_service is not None:
+            try:
+                if not tag_service.shutdown(2):
+                    LOG.warning("Speakr tag service did not stop before shutdown timeout")
+            except Exception:
+                LOG.warning("Speakr tag service cleanup failed")
         if publication_service is not None:
             try:
                 if not publication_service.stop(2):
@@ -584,6 +627,20 @@ def _cmd_cleanup(cfg: Config, older_than_days: int, delete: bool = False) -> int
 
 def _speakr_status(job: PublicationJob) -> dict[str, object]:
     """Return only bounded operational fields safe for terminal output."""
+    def tags(value: object) -> list[dict[str, object]] | None:
+        """Project bounded tag values without exposing internal objects."""
+        # Preserve an unresolved status while rejecting malformed tag containers.
+        if value is None:
+            return None
+        if not isinstance(value, tuple):
+            return []
+
+        # Limit terminal output while preserving the frozen tag order.
+        return [
+            {"tag_id": tag.tag_id, "name": tag.name}
+            for tag in tuple(value)[:100]
+        ]
+    # Expose only stable, credential-free job fields to the CLI.
     return {
         "job_id": job.job_id,
         "state": job.state.value,
@@ -596,6 +653,10 @@ def _speakr_status(job: PublicationJob) -> dict[str, object]:
         "remote_recording_id": job.remote_recording_id,
         "last_error_code": job.last_error_code,
         "last_http_status": job.last_http_status,
+        "effective_tags": tags(getattr(job, "effective_tags", None)),
+        "missing_tags": tags(getattr(job, "missing_tags", None)),
+        "upload_tags_unknown": bool(getattr(job, "upload_tags_unknown", False)),
+        "sidecar_warning": bool(getattr(job, "sidecar_warning", False)),
     }
 
 
@@ -626,11 +687,16 @@ def _speakr_network_allowed(cfg: Config, force: bool) -> bool:
     if force:
         return True
 
-    # Missing and empty allowlists fail closed before constructing D-Bus state.
-    allowed = getattr(cfg, "speakr_allowed_ssid_bytes", None)
-    if not allowed:
+    # Invalid policy remains fail-closed even though an empty valid list disables the gate.
+    if not getattr(cfg, "speakr_allowed_ssids_valid", True):
         print("Speakr: waiting for an allowed network.", file=sys.stderr)
         return False
+    allowed = getattr(cfg, "speakr_allowed_ssid_bytes", None)
+    if not isinstance(allowed, (tuple, frozenset)):
+        print("Speakr: waiting for an allowed network.", file=sys.stderr)
+        return False
+    if not allowed:
+        return True
     from .network_manager import NetworkManagerSSIDAdapter, NetworkSSIDStatus
 
     try:
@@ -638,7 +704,7 @@ def _speakr_network_allowed(cfg: Config, force: bool) -> bool:
         status = NetworkSSIDStatus(getattr(result, "status", result))
     except Exception:
         status = NetworkSSIDStatus.UNAVAILABLE
-    if status is NetworkSSIDStatus.ALLOWED:
+    if status in (NetworkSSIDStatus.ALLOWED, NetworkSSIDStatus.BYPASSED):
         return True
     print("Speakr: waiting for an allowed network.", file=sys.stderr)
     return False

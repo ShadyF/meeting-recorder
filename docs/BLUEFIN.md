@@ -132,10 +132,34 @@ disabled. Choose one path **before** the first service start:
   environment variable.
 
 For Speakr, set `speakr_url` to its HTTPS origin and choose
-`manual` or `automatic` for `speakr_publication_mode`. Add exact,
-case-sensitive Wi-Fi SSIDs to `speakr_allowed_ssids`; normal upload attempts are
-admitted only on a matching SSID. `disabled` is the default and retains no
-automatic publication behavior.
+`manual` or `automatic` for `speakr_publication_mode`. An empty
+`speakr_allowed_ssids` list disables SSID gating. Otherwise, add exact,
+case-sensitive Wi-Fi SSIDs; normal upload attempts are admitted only on a
+matching active Wi-Fi SSID, or a confirmed active non-Wi-Fi connection.
+`disabled` is the default and retains no automatic publication behavior.
+
+When publication mode is `automatic`, an explicitly accepted **Video** or
+**Audio only** detected Recording can show a separate non-modal tag checklist
+after capture is active. It is not shown for unattended auto-record, manual or
+disabled publication modes, or `meeting-recorder record`; it never overlaps the
+Wayland portal or blocks Pause/Stop. **Done** freezes zero or more existing tags,
+**Skip** freezes none, and close/Escape/Not now/untouched 15-second timeout discard
+unsaved edits. During that Recording, use its tag control to reopen the frozen
+catalog or manually retry a missing catalog. Discovery and validation each have a
+five-second budget. Tag discovery ignores the SSID gate; only media-publication
+commands use that network admission policy.
+
+Meeting Recorder targets Speakr `v0.10.5-alpha`: it reads the catalog with
+authenticated `GET /api/v1/tags`, sends tags only on the initial upload, and never
+changes remote tags after acceptance. A successful validation sends only accessible
+IDs; a transient validation failure sends frozen IDs and reports the result as
+unknown in CLI status. Its active-origin catalog cache is private under `$MR_CACHE`
+and contains no token. The bearer token remains only the rootless Podman secret
+file. Use
+`podman exec meeting-recorder meeting-recorder speakr upload --status JOB` for
+CLI-only `effective_tags`, `missing_tags`, `upload_tags_unknown`, and
+`sidecar_warning` fields; tag warnings do not change capture or cause desktop
+notifications.
 
 ## 4. Start and operate the service
 
@@ -226,6 +250,15 @@ stored client secret; use `client-secret clear` to remove that secret.
 To update, stop cleanly, pull the desired published version tag, back up the
 unit, change only its `Image=` line, then reload and start. Keep the previous
 image while it is a rollback option.
+
+> **Publication data compatibility warning:** the first start of a build using
+> Publication store v4 automatically and permanently resets an exact v3
+> `publications.sqlite3` store with no application backup. Queued jobs, retries,
+> remote recording IDs, and cleanup intents/history are lost; local Recordings
+> and sidecars remain. This is not an old-database migration. Do not treat the
+> previous image as a rollback option after that reset: rollback to the prior
+> binary is unsupported. Preserve any required Publication information before
+> starting the newer image.
 
 ```fish
 set NEW_IMAGE ghcr.io/shadyf/meeting-recorder:NEW_VERSION

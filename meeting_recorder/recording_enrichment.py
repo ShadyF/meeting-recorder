@@ -27,6 +27,7 @@ from .recording_paths import (
     recording_directory_lock,
     visible_recording_path,
 )
+from .speakr_domain import Tag
 from .utils import LOG
 
 
@@ -102,8 +103,8 @@ def _existing_fallback(media: Path) -> str:
 
 
 def _sidecar_for(media: Path, fallback: str, meeting: MeetingSnapshot | None,
-                 started: datetime, ended: datetime) -> MeetingSidecar:
-    return MeetingSidecar(media.name, fallback, _utc(started), _utc(ended), meeting)
+                  started: datetime, ended: datetime, tags: tuple[Tag, ...] = ()) -> MeetingSidecar:
+    return MeetingSidecar(media.name, fallback, _utc(started), _utc(ended), meeting, tags)
 
 
 def _visible_meeting(occurrence: CalendarOccurrence) -> bool:
@@ -151,7 +152,7 @@ class RecordingEnricher:
         self.to_local = to_local or _to_local_default
         self.on_media_renamed = on_media_renamed
 
-    def enrich(self, completed: CompletedRecording) -> CompletedRecording:
+    def enrich(self, completed: CompletedRecording, tags: tuple[Tag, ...] | None = None) -> CompletedRecording:
         """Write unmatched metadata or transactionally move a uniquely matched recording."""
         source = Path(completed.path)
         with recording_directory_lock(source.parent):
@@ -182,8 +183,6 @@ class RecordingEnricher:
                     _safe_enrichment_error(exc)
                     destination = source
             snapshot = _meeting_snapshot(meeting)
-            intent = _sidecar_for(destination, fallback, snapshot,
-                                  completed.capture_started_at, completed.capture_ended_at)
             source_metadata = sidecar_path(source)
             original_metadata = None
             if os.path.lexists(source_metadata):
@@ -192,6 +191,10 @@ class RecordingEnricher:
                 except (OSError, ValueError) as exc:
                     _safe_enrichment_error(exc)
                     return completed
+            # Preserve existing tags unless a confirmed selection was supplied.
+            selected_tags = original_metadata.tags if tags is None and original_metadata is not None else (tags or ())
+            intent = _sidecar_for(destination, fallback, snapshot,
+                                  completed.capture_started_at, completed.capture_ended_at, selected_tags)
             try:
                 # Publish intent beside the authoritative media before changing its name.
                 write_sidecar(source_metadata, intent)
@@ -523,29 +526,45 @@ class RecordingCorrectionService:
                                 "precommit-failed", exc) from exc
 
     def _commit_clear(self, source: Path, sidecar_file: Path,
-                      original: MeetingSidecar, destination: Path,
-                      intent: MeetingSidecar) -> None:
+                       original: MeetingSidecar, destination: Path,
+                       intent: MeetingSidecar) -> None:
         moved = False
         try:
+            # Persist the metadata-free intent before changing the media name.
             write_sidecar(sidecar_file, intent)
+
+            # Publish the collision-safe fallback media before relocating its sidecar.
             if destination != source:
                 move_regular_file_no_replace(source, destination)
                 moved = True
-            try:
-                remove_sidecar(sidecar_file)
-            except Exception as exc:
-                if destination == source:
-                    try:
-                        self._restore_exact(sidecar_file, original)
-                    except Exception as repair_error:
-                        _safe_enrichment_error(repair_error)
-                    raise self._failure("clear", source, False, False,
+
+            # Retain tagged v2 metadata while removing only its Meeting snapshot.
+            if intent.tags:
+                _write_moved_sidecar(sidecar_file, sidecar_path(destination), intent)
+                actual = load_sidecar(sidecar_path(destination))
+                if actual != intent:
+                    raise ValueError("clear sidecar was not committed")
+            else:
+                # Keep legacy clears sidecar-free once the media move has succeeded.
+                try:
+                    remove_sidecar(sidecar_file)
+                except Exception as exc:
+                    if destination == source:
+                        try:
+                            self._restore_exact(sidecar_file, original)
+                        except Exception as repair_error:
+                            _safe_enrichment_error(repair_error)
+                        raise self._failure("clear", source, False, False,
+                                            "sidecar-removal-failed", exc) from exc
+                    raise self._failure("clear", destination, True, True,
                                         "sidecar-removal-failed", exc) from exc
-                raise self._failure("clear", destination, True, True,
-                                    "sidecar-removal-failed", exc) from exc
+
+                # Reject a remaining legacy sidecar after its explicit removal.
+                if os.path.lexists(sidecar_path(destination)):
+                    raise ValueError("clear sidecar still exists")
+
+            # Verify the media remains authoritative for either clear representation.
             _ensure_regular_media(destination)
-            if os.path.lexists(sidecar_path(destination)):
-                raise ValueError("clear sidecar still exists")
         except MoveCommittedError as exc:
             raise self._failure("clear", destination, True, True,
                                 "media-directory-sync-failed", exc) from exc

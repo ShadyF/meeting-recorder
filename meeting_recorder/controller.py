@@ -20,6 +20,8 @@ from typing import Any, Callable
 
 from .config import Config
 from .domain import CaptureMode, CompletedRecording
+from .speakr_domain import Tag
+from .speakr_tag_service import TagCatalogOutcome, TagCatalogSource
 from .notifier import Notifier
 from .recorder import FinalizationHandle, Recorder
 from .recording_paths import (RecordingPathReservation, collision_safe_path,
@@ -35,8 +37,16 @@ class State(enum.Enum):
 
 
 class Controller:
-    def __init__(self, cfg: Config, notifier: Notifier, recorder: Recorder,
-                 recording_enricher: Callable[[CompletedRecording], CompletedRecording] | None = None):
+    def __init__(
+        self,
+        cfg: Config,
+        notifier: Notifier,
+        recorder: Recorder,
+        recording_enricher: Callable[..., CompletedRecording] | None = None,
+        tag_requester: Callable[[Callable[[TagCatalogOutcome], None]], object | None] | None = None,
+        tag_prompt_factory: Callable[..., Any] | None = None,
+    ):
+        # Keep core capture state separate from optional tag interaction state.
         self.cfg = cfg
         self.notifier = notifier
         self.recorder = recorder
@@ -55,6 +65,20 @@ class Controller:
         self._active_path: Path | None = None
         self._manual = False         # started by `record`, not by the detector
         self.recording_enricher = recording_enricher
+
+        # Track one recording-scoped catalog and its UI callback generations.
+        self._tag_requester = tag_requester
+        self._tag_prompt_factory = tag_prompt_factory or self._default_tag_prompt
+        self._tag_request_handle = None
+        self._tag_request_generation = 0
+        self._tag_outcome: TagCatalogOutcome | None = None
+        self._tag_catalog: tuple[Tag, ...] = ()
+        self._tag_confirmed: tuple[Tag, ...] = ()
+        self._tag_prompt = None
+        self._tag_prompt_generation = 0
+        self._tag_notice_shown = False
+        self._handle_tags: dict[FinalizationHandle, tuple[Tag, ...]] = {}
+
         # Called with the saved Path (or None) once a recording is fully
         # finalized. `record` uses it to know when it can exit.
         self.on_finished: Callable[[CompletedRecording | None], None] | None = None
@@ -113,7 +137,7 @@ class Controller:
     # -- notification callbacks --------------------------------------------
     def _on_user_capture_mode(self, capture_mode: CaptureMode) -> None:
         if self.state is State.PROMPTING:
-            self._begin_recording(capture_mode)
+            self._begin_recording(capture_mode, discover_tags=True)
 
     def _on_user_ignore(self) -> None:
         if self.state is State.PROMPTING:
@@ -122,7 +146,8 @@ class Controller:
             self.state = State.IDLE
 
     # -- recording helpers -------------------------------------------------
-    def _begin_recording(self, capture_mode: CaptureMode | None = None) -> None:
+    def _begin_recording(self, capture_mode: CaptureMode | None = None,
+                         discover_tags: bool = False) -> None:
         path = build_output_path(self.cfg.output_dir, self._app or "Meeting",
                                  self.cfg.container)
         path = self._reserve_path(path)
@@ -132,6 +157,9 @@ class Controller:
                 capture_mode = (CaptureMode.AUDIO_VIDEO if self.cfg.record_screen
                                 else CaptureMode.AUDIO_ONLY)
             self.state = State.RECORDING
+            # Start discovery only for explicit detected-meeting acceptance.
+            if discover_tags:
+                self._request_tags()
             # Show the controls straight away, before any capture starts. On Wayland
             # the portal handshake happens first and can take seconds (or stall on a
             # dialog), and leaving the screen empty in the meantime reads as "Record
@@ -147,6 +175,7 @@ class Controller:
             self._start_capture(path, capture_mode)
         except Exception:
             LOG.exception("Recording setup failed")
+            self._end_tag_context()
             self._release_path(path)
             self._active_path = None
             self._close_widget()
@@ -213,6 +242,7 @@ class Controller:
             LOG.exception("Recorder start failed")
             started = False
         if not started:
+            self._end_tag_context()
             self._release_path(path)
             self._active_path = None
             self._close_widget()
@@ -222,8 +252,153 @@ class Controller:
             return
         self.state = State.RECORDING
         self._show_widget()  # no-op when _begin_recording already showed it
+        self._maybe_show_tag_prompt()
+
+    def _default_tag_prompt(self, **kwargs: Any) -> Any:
+        """Lazily create the optional prompt after capture has started."""
+        # Keep GTK imports out of manual and headless controller construction.
+        from .tag_prompt import TagPrompt
+
+        # Convert confirmed domain tags to the prompt's integer selection IDs.
+        kwargs["initial_confirmed"] = tuple(
+            tag.tag_id for tag in kwargs["initial_confirmed"]
+        )
+        return TagPrompt(**kwargs)
+
+    def _request_tags(self) -> None:
+        """Start one explicit discovery request for the accepted detected meeting."""
+        # A new request fences callbacks from an earlier retry or recording.
+        if self._tag_requester is None:
+            return
+        # Fence callbacks before the requester can synchronously complete.
+        self._tag_request_generation += 1
+        generation = self._tag_request_generation
+        # Reset the per-recording notice budget before its first request or retry.
+        if self._tag_outcome is None and not self._tag_catalog:
+            self._tag_notice_shown = False
+        # Hide the action while the explicit request is unresolved.
+        self._set_tag_action(None)
+        try:
+            self._tag_request_handle = self._tag_requester(
+                lambda outcome: self._on_tag_outcome(generation, outcome),
+            )
+        except Exception:
+            self._on_tag_outcome(generation, TagCatalogOutcome(
+                (), TagCatalogSource.UNAVAILABLE, None, True,
+            ))
+
+    def _on_tag_outcome(self, generation: int, outcome: TagCatalogOutcome) -> None:
+        """Store one marshalled result and expose its action only while recording."""
+        # Ignore late callbacks after retry, stop, setup failure, or a new recording.
+        if generation != self._tag_request_generation or self.state is not State.RECORDING:
+            return
+        # Retire the completed request before exposing its result to controls.
+        self._tag_request_handle = None
+        self._tag_outcome = outcome
+        if outcome.source in {TagCatalogSource.FRESH, TagCatalogSource.STALE} and outcome.tags:
+            self._tag_catalog = outcome.tags
+            self._set_tag_action(
+                f"Tags ({len(self._tag_confirmed)})" if self._tag_confirmed else "Add tags",
+            )
+            self._maybe_show_tag_prompt()
+            return
+        # A successful empty response is a complete catalog, not a retry failure.
+        if outcome.source in {TagCatalogSource.FRESH, TagCatalogSource.STALE}:
+            self._set_tag_action(None)
+            return
+        self._set_tag_action("Retry tags")
+        if outcome.unavailable_notice and not self._tag_notice_shown:
+            self._tag_notice_shown = True
+            try:
+                self.notifier.info("Tags unavailable", "Tags could not be loaded for this recording.")
+            except Exception:
+                LOG.debug("Could not show tag discovery notice", exc_info=True)
+
+    def _maybe_show_tag_prompt(self) -> None:
+        """Open the tag prompt only after Recorder.start has succeeded."""
+        # Portal setup and failed starts never set is_recording, so they cannot prompt.
+        if not self.recorder.is_recording or not self._tag_catalog or self._tag_prompt is not None:
+            return
+        # Fence callbacks from an earlier prompt before opening this one.
+        self._tag_prompt_generation += 1
+        generation = self._tag_prompt_generation
+        # Give the prompt a frozen catalog and callbacks tied to this generation.
+        self._tag_prompt = self._tag_prompt_factory(
+            tags=self._tag_catalog,
+            initial_confirmed=self._tag_confirmed,
+            on_confirmed=lambda ids: self._on_tags_confirmed(generation, ids),
+            on_dismissed=lambda: self._on_tags_dismissed(generation),
+            status_text=self._tag_status_text(),
+        )
+        self._tag_prompt.show()
+
+    def _tag_status_text(self) -> str:
+        """Return bounded source wording without locale-sensitive formatting."""
+        # A stale catalog names only its fixed UTC fetch instant.
+        if self._tag_outcome and self._tag_outcome.source is TagCatalogSource.STALE:
+            fetched = self._tag_outcome.fetched_at_utc
+            if fetched is not None:
+                return f"Using cached tags from {fetched.isoformat().replace('+00:00', 'Z')[:32]}"
+        return "Tags loaded"
+
+    def _on_tags(self) -> None:
+        """Reopen frozen tags or request an explicit retry when none are usable."""
+        # Reopening a known catalog intentionally does not issue another request.
+        if self._tag_catalog:
+            self._maybe_show_tag_prompt()
+        elif self._tag_request_handle is None:
+            self._request_tags()
+
+    def _on_tags_confirmed(self, generation: int, ids: object) -> None:
+        """Map selected IDs back to frozen canonical tags in API order."""
+        # Only the active prompt can commit a selection.
+        if generation != self._tag_prompt_generation or not isinstance(ids, tuple):
+            return
+        # Preserve API order while reducing confirmed IDs to canonical Tag objects.
+        selected = set(ids)
+        self._tag_confirmed = tuple(
+            tag for tag in self._tag_catalog if tag.tag_id in selected
+        )
+        # Clear the closed prompt before controls expose its confirmed count.
+        self._tag_prompt = None
+        self._set_tag_action(f"Tags ({len(self._tag_confirmed)})")
+
+    def _on_tags_dismissed(self, generation: int) -> None:
+        """Discard prompt edits while retaining the prior confirmed selection."""
+        if generation == self._tag_prompt_generation:
+            self._tag_prompt = None
+
+    def _set_tag_action(self, label: str | None) -> None:
+        """Apply the stable control seam only when a widget is active."""
+        if self._widget is not None and hasattr(self._widget, "set_tag_action"):
+            self._widget.set_tag_action(label)
+
+    def _end_tag_context(self) -> tuple[Tag, ...]:
+        """Close UI work and freeze confirmed tags for one finalization handle."""
+        # Closing the prompt first discards unsaved edits before the recording snapshot.
+        if self._tag_prompt is not None:
+            try:
+                self._tag_prompt.close()
+            except Exception:
+                pass
+        # Invalidate prompt work before cancelling a possible discovery callback.
+        self._tag_prompt = None
+        self._tag_prompt_generation += 1
+        if self._tag_request_handle is not None and hasattr(self._tag_request_handle, "cancel"):
+            self._tag_request_handle.cancel()
+        self._tag_request_handle = None
+        self._tag_request_generation += 1
+        # Copy the final confirmed selection before clearing this recording context.
+        tags = self._tag_confirmed
+        self._tag_catalog = ()
+        self._tag_confirmed = ()
+        self._tag_outcome = None
+        self._tag_notice_shown = False
+        return tags
 
     def _finish_recording(self, trim_end: float = 0.0) -> bool:
+        # Freeze tags before stopping so unsaved prompt edits cannot reach a handle.
+        confirmed_tags = self._end_tag_context()
         self._close_widget()
         if not self.recorder.is_recording:
             # The call ended while the portal dialog was still up.
@@ -250,7 +425,7 @@ class Controller:
                 return False
             self._close_portal()
             LOG.info("Discarded: call was shorter than min_recording_seconds")
-            self._register_handle(handle)
+            self._register_handle(handle, confirmed_tags)
             if handle is None and self._active_path is not None:
                 self._release_path(self._active_path)
                 self._active_path = None
@@ -265,7 +440,7 @@ class Controller:
             return False
         # After stop(): capture is torn down, so the portal stream is free to go.
         self._close_portal()
-        self._register_handle(handle)
+        self._register_handle(handle, confirmed_tags)
         if handle is None and self._active_path is not None:
             self._release_path(self._active_path)
         self._active_path = None
@@ -280,10 +455,12 @@ class Controller:
         if session is not None:
             session.close()
 
-    def _register_handle(self, handle: FinalizationHandle | None) -> None:
+    def _register_handle(self, handle: FinalizationHandle | None,
+                         tags: tuple[Tag, ...] = ()) -> None:
         if handle is None:
             return
         self._handles.add(handle)
+        self._handle_tags[handle] = tags
         try:
             from gi.repository import GLib
             GLib.timeout_add(1000, lambda: self._poll_handle(handle))
@@ -317,7 +494,9 @@ class Controller:
             return
         if completed is not None and self.recording_enricher is not None:
             try:
-                enriched = self.recording_enricher(completed)
+                enriched = self.recording_enricher(
+                    completed, tags=self._handle_tags.get(handle, ()),
+                )
                 if (not isinstance(enriched, CompletedRecording)
                         or not isinstance(enriched.path, Path)):
                     raise TypeError("recording enricher returned an invalid result")
@@ -325,6 +504,7 @@ class Controller:
             except Exception:
                 LOG.exception("Recording enrichment failed; using the original result")
         self._handles.remove(handle)
+        self._handle_tags.pop(handle, None)
         self._release_path(handle.target_path)
         # These stay on screen until dismissed: "saved" is clickable (opening the
         # folder), and a failure needs to be seen.
@@ -380,6 +560,16 @@ class Controller:
         self._widget = self._build_controls()
         if self._widget is None:
             return
+        # Apply an outcome that may have arrived before controls were constructed.
+        if self._tag_requester is not None:
+            if self._tag_request_handle is not None:
+                self._set_tag_action(None)
+            elif self._tag_catalog:
+                self._set_tag_action(
+                    f"Tags ({len(self._tag_confirmed)})" if self._tag_confirmed else "Add tags",
+                )
+            elif self._tag_outcome is not None:
+                self._set_tag_action("Retry tags")
         try:
             from gi.repository import GLib
             self._widget.show()
@@ -392,7 +582,8 @@ class Controller:
         """Prefer the top-bar tray icon; fall back to the floating pill."""
         kwargs = dict(on_pause=self.recorder.pause,
                       on_resume=self.recorder.resume,
-                      on_stop=self._on_widget_stop)
+                      on_stop=self._on_widget_stop,
+                      on_tags=self._on_tags)
         try:
             from .tray_indicator import RecordingTray
 

@@ -14,7 +14,7 @@ import meeting_recorder.recording_paths as recording_paths_module
 import meeting_recorder.speakr_cleanup as speakr_cleanup_module
 from meeting_recorder.meeting_sidecar import MeetingSidecar, write_sidecar
 from meeting_recorder.speakr_cleanup import CleanupReason, CleanupReport, CleanupStatus, PublicationCleanup
-from meeting_recorder.speakr_domain import CleanupPhase, MediaIdentity, PublicationKey, PublicationState
+from meeting_recorder.speakr_domain import CleanupPhase, MediaIdentity, PublicationKey, PublicationState, Tag
 from meeting_recorder.speakr_store import PublicationStore
 
 
@@ -34,8 +34,8 @@ def _publish(store: PublicationStore, key: PublicationKey, media: Path, *, job_i
     store.transition(key, PublicationState.PUBLISHED, remote_recording_id=1, now_ms=1_002)
 
 
-def test_preview_is_read_only_and_delete_removes_media_and_sidecar() -> None:
-    # Create one old published recording with its adjacent sidecar.
+def test_preview_is_read_only_and_delete_removes_tagged_v2_sidecar() -> None:
+    # Create one old published recording with a valid adjacent tagged v2 sidecar.
     with TemporaryDirectory() as directory:
         root = Path(directory) / "recordings"
         root.mkdir()
@@ -45,13 +45,16 @@ def test_preview_is_read_only_and_delete_removes_media_and_sidecar() -> None:
         digest = hashlib.sha256(payload).hexdigest()
         now = datetime(2026, 8, 22, tzinfo=timezone.utc)
         ended = now - timedelta(days=5)
-        write_sidecar(media, MeetingSidecar(media.name, media.name, ended - timedelta(seconds=1), ended, None))
+        tags = (Tag(9, "Zulu"), Tag(2, "Alpha"))
+        write_sidecar(media, MeetingSidecar(
+            media.name, media.name, ended - timedelta(seconds=1), ended, None, tags,
+        ))
         store = PublicationStore(Path(directory) / "state.sqlite3", clock=lambda: 1_000)
         key = PublicationKey("https://cleanup.example", digest)
         _publish(store, key, media)
         cleanup = PublicationCleanup(store, root, clock=lambda: now)
 
-        # Preview reports eligibility without changing either file.
+        # Preview treats the tagged sidecar as valid without changing either file.
         preview = cleanup.preview(5)
         assert preview.results[0].status is CleanupStatus.ELIGIBLE
         assert media.exists() and (root / (media.name + ".meeting.json")).exists()

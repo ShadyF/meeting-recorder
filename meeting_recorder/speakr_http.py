@@ -10,10 +10,10 @@ import json
 import math
 import secrets
 import ssl
-from typing import BinaryIO, Callable, Protocol, runtime_checkable
+from typing import BinaryIO, Callable, Protocol, Sequence, runtime_checkable
 from urllib.parse import parse_qs, quote, urlsplit
 
-from .speakr_domain import SpeakrMetadata, normalize_speakr_url
+from .speakr_domain import SpeakrMetadata, Tag, normalize_speakr_url
 
 
 class SpeakrError(Exception):
@@ -124,6 +124,38 @@ class ReconciliationUnavailable(SpeakrError):
         self.args = ("Speakr reconciliation result is unavailable",)
 
 
+class TagDiscoveryRejected(SpeakrHTTPError):
+    """Speakr completed tag discovery with a non-success status."""
+
+    def __init__(self, status: int, retry_after: float | None = None) -> None:
+        super().__init__(status, retry_after)
+        self.args = (f"Speakr tag discovery was rejected (HTTP {self.status})",)
+
+
+class TagDiscoveryUnavailable(SpeakrError):
+    """Tag discovery could not obtain a complete response from Speakr."""
+
+    classification = "network"
+    is_transient = True
+    is_permanent = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.args = ("Speakr tag discovery is unavailable",)
+
+
+class InvalidTagCatalog(SpeakrError):
+    """A successful tag response did not meet the pinned API contract."""
+
+    classification = "contract"
+    is_transient = False
+    is_permanent = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.args = ("Speakr returned an invalid tag catalog",)
+
+
 class InvalidSpeakrResponse(TransferOutcomeUnknown):
     """A successful upload response was not the required JSON shape."""
 
@@ -146,7 +178,11 @@ class SpeakrTransport(Protocol):
         file_last_modified_ms: int,
         meeting_date: datetime,
         title: str | None = None,
+        tag_ids: Sequence[int] = (),
     ) -> int:
+        ...
+
+    def list_tags(self, instance_url: str, token: str) -> tuple[Tag, ...]:
         ...
 
     def patch_metadata(
@@ -169,6 +205,7 @@ class SpeakrTransport(Protocol):
 
 _UPLOAD_PATH = "/api/v1/recordings/upload"
 _RECORDINGS_PATH = "/api/v1/recordings"
+_TAGS_PATH = "/api/v1/tags"
 _MULTIPART_CONTENT_TYPE = "multipart/form-data; boundary="
 _BEARER_PREFIX = "Bearer "
 _MAX_TITLE_CHARS = 4096
@@ -177,6 +214,7 @@ _MAX_RETRY_AFTER_SECONDS = 21600.0
 _DEFAULT_RECONCILIATION_PAGE_SIZE = 100
 _DEFAULT_RECONCILIATION_PAGES = 16
 _DEFAULT_RECONCILIATION_ITEMS = 1000
+_DEFAULT_TAG_TIMEOUT_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -301,6 +339,22 @@ def _validate_nonnegative_int(value: object, name: str) -> int:
     return value
 
 
+def _validate_tag_ids(value: object) -> tuple[int, ...]:
+    """Validate ordered upload-time tag IDs without accepting text iterables."""
+    # Materialize the caller's ordered selection before opening a connection.
+    if isinstance(value, (str, bytes, bytearray, memoryview)):
+        raise ValueError("Speakr tag IDs are invalid")
+    try:
+        tag_ids = tuple(value)  # type: ignore[arg-type]
+    except TypeError:
+        raise ValueError("Speakr tag IDs are invalid") from None
+
+    # Keep each value suitable for Speakr's integer multipart parser.
+    if any(type(tag_id) is not int or tag_id <= 0 for tag_id in tag_ids):
+        raise ValueError("Speakr tag IDs are invalid")
+    return tag_ids
+
+
 def _origin(value: object) -> _Origin:
     try:
         normalized = normalize_speakr_url(value)
@@ -396,8 +450,9 @@ def _multipart_parts(
     title: str,
     file_last_modified_ms: int,
     meeting_date: datetime,
+    tag_ids: tuple[int, ...],
 ) -> tuple[
-    bytes, bytes, bytes, bytes, bytes, bytes, bytes, str,
+    bytes, bytes, bytes, bytes, bytes, bytes, bytes, bytes, str,
 ]:
     """Build the fixed multipart sections for one bounded upload."""
     # Create one boundary and preserve the existing filename encoding rules.
@@ -445,11 +500,22 @@ def _multipart_parts(
         "false\r\n"
     ).encode("ascii")
 
+    # Number tags from zero without gaps because Speakr stops at a missing index.
+    tag_parts = b"".join(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="tag_ids[{index}]"\r\n'
+            "\r\n"
+            f"{tag_id}\r\n"
+        ).encode("ascii")
+        for index, tag_id in enumerate(tag_ids)
+    )
+
     # Close the multipart body after all fields have been emitted.
     closing = f"--{boundary}--\r\n".encode("ascii")
     return (
         file_prefix, file_suffix, title_part, modified_part, meeting_date_part,
-        keep_audio_only_part, closing, boundary,
+        keep_audio_only_part, tag_parts, closing, boundary,
     )
 
 
@@ -539,6 +605,7 @@ class StdlibSpeakrTransport:
         max_reconciliation_pages: int = _DEFAULT_RECONCILIATION_PAGES,
         max_reconciliation_items: int = _DEFAULT_RECONCILIATION_ITEMS,
         reconciliation_page_size: int = _DEFAULT_RECONCILIATION_PAGE_SIZE,
+        tag_timeout_seconds: float = _DEFAULT_TAG_TIMEOUT_SECONDS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         # Validate all transport and reconciliation bounds before storing them.
@@ -553,6 +620,9 @@ class StdlibSpeakrTransport:
         )
         self.reconciliation_page_size = _validate_positive_int(
             reconciliation_page_size, "reconciliation page size",
+        )
+        self.tag_timeout_seconds = _validate_positive_number(
+            tag_timeout_seconds, "tag timeout",
         )
 
         # Accept a clock only when it can supply operation-scoped HTTP dates.
@@ -570,6 +640,7 @@ class StdlibSpeakrTransport:
         file_last_modified_ms: int,
         meeting_date: datetime,
         title: str | None = None,
+        tag_ids: Sequence[int] = (),
     ) -> int:
         # Validate endpoint, credentials, and upload metadata before opening media.
         origin = _origin(instance_url)
@@ -581,6 +652,7 @@ class StdlibSpeakrTransport:
             file_last_modified_ms, "file last modified time"
         )
         meeting_date = _validate_meeting_date(meeting_date)
+        safe_tag_ids = _validate_tag_ids(tag_ids)
 
         # Rewind seekable media and build the bounded multipart sections.
         initial_position = self._prepare_media(media)
@@ -591,10 +663,12 @@ class StdlibSpeakrTransport:
             modified_part,
             meeting_date_part,
             keep_audio_only_part,
+            tag_parts,
             closing,
             boundary,
         ) = _multipart_parts(
             safe_filename, safe_title, file_last_modified_ms, meeting_date,
+            safe_tag_ids,
         )
 
         # Compute the exact request length before sending any bytes.
@@ -602,6 +676,7 @@ class StdlibSpeakrTransport:
             len(file_prefix) + media_size + len(file_suffix)
             + len(modified_part) + len(title_part)
             + len(meeting_date_part) + len(keep_audio_only_part)
+            + len(tag_parts)
             + len(closing)
         )
 
@@ -636,6 +711,7 @@ class StdlibSpeakrTransport:
                 self._send_bytes(connection, modified_part)
                 self._send_bytes(connection, meeting_date_part)
                 self._send_bytes(connection, keep_audio_only_part)
+                self._send_bytes(connection, tag_parts)
                 self._send_bytes(connection, closing)
                 response = connection.getresponse()
                 status = _response_status(response)
@@ -820,6 +896,75 @@ class StdlibSpeakrTransport:
     ) -> tuple[int, ...]:
         """Compatibility spelling for the reconciliation transport boundary."""
         return self.reconcile_recordings(instance_url, token, marker_token)
+
+    def list_tags(self, instance_url: str, token: str) -> tuple[Tag, ...]:
+        """Return the caller's accessible tags in Speakr's response order."""
+        # Validate credentials before making the fixed tag discovery request.
+        origin = _origin(instance_url)
+        safe_token = _validate_token(token)
+        connection: http.client.HTTPConnection | None = None
+        try:
+            # Use the short discovery timeout so a stale catalog can be useful.
+            try:
+                connection = _connection_for(origin, self.tag_timeout_seconds)
+                connection.connect()
+                connection.putrequest("GET", _TAGS_PATH, skip_accept_encoding=True)
+                connection.putheader("Authorization", _BEARER_PREFIX + safe_token)
+                connection.putheader("Accept", "application/json")
+                connection.putheader("Connection", "close")
+                connection.endheaders()
+                response = connection.getresponse()
+                status = _response_status(response)
+            except _ResponseReadError:
+                raise TagDiscoveryUnavailable from None
+            except Exception:
+                raise TagDiscoveryUnavailable from None
+
+            # Preserve HTTP status without reading an untrusted rejection body.
+            if status != 200:
+                retry_after = _response_retry_after(response, self._clock)
+                _close_response(response)
+                raise TagDiscoveryRejected(status, retry_after)
+
+            # Parse only a complete bounded JSON document before exposing tags.
+            try:
+                body = _read_bounded(response, self.max_response_bytes)
+                payload = json.loads(body.decode("utf-8"))
+            except (_ResponseReadError, UnicodeDecodeError, json.JSONDecodeError):
+                raise InvalidTagCatalog from None
+            except Exception:
+                raise InvalidTagCatalog from None
+            finally:
+                _close_response(response)
+            return self._parse_tag_catalog(payload)
+        finally:
+            # Release a short-lived discovery connection on every outcome.
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _parse_tag_catalog(payload: object) -> tuple[Tag, ...]:
+        """Validate the exact tag container while retaining its original order."""
+        # Reject alternate containers and partial entries as contract failures.
+        if not isinstance(payload, dict) or set(payload) != {"tags"}:
+            raise InvalidTagCatalog
+        raw_tags = payload["tags"]
+        if not isinstance(raw_tags, list):
+            raise InvalidTagCatalog
+
+        # Build a typed immutable catalog only after every entry is valid.
+        tags: list[Tag] = []
+        for raw_tag in raw_tags:
+            if not isinstance(raw_tag, dict):
+                raise InvalidTagCatalog
+            tag_id, name = raw_tag.get("id"), raw_tag.get("name")
+            if type(tag_id) is not int or tag_id <= 0 or not isinstance(name, str) or not name.strip():
+                raise InvalidTagCatalog
+            tags.append(Tag(tag_id, name))
+        return tuple(tags)
 
     def _get_reconciliation_page(
         self, origin: _Origin, token: str, path: str,
@@ -1069,6 +1214,7 @@ class StdlibSpeakrTransport:
 
 __all__ = [
     "InvalidSpeakrResponse",
+    "InvalidTagCatalog",
     "MetadataRejected",
     "MetadataUnavailable",
     "ReconciliationRejected",
@@ -1080,4 +1226,6 @@ __all__ = [
     "TransferNotSent",
     "TransferOutcomeUnknown",
     "TransferRejected",
+    "TagDiscoveryRejected",
+    "TagDiscoveryUnavailable",
 ]

@@ -128,6 +128,7 @@ class Config:
     speakr_publication_mode: PublicationMode
     speakr_allowed_ssids: tuple[str, ...]
     allowlist: list[AllowEntry] = field(default_factory=list)
+    speakr_allowed_ssids_valid: bool = True
 
     @property
     def speakr_allowed_ssid_bytes(self) -> tuple[bytes, ...]:
@@ -150,12 +151,14 @@ class Config:
         # cannot prevent the recorder from starting.
         publication_mode = PublicationMode.parse(
             data.get("speakr_publication_mode", "disabled"))
-        # Treat the entire allowlist as unavailable when one SSID is invalid.
+        # Keep invalid policy distinct from an intentionally disabled SSID gate.
         try:
             allowed_ssids = validate_speakr_allowed_ssids(
                 data.get("speakr_allowed_ssids", []))
+            allowed_ssids_valid = True
         except ValueError:
             allowed_ssids = ()
+            allowed_ssids_valid = False
         return cls(
             output_dir=expand_path(data["output_dir"]),
             record_screen=bool(data["record_screen"]),
@@ -190,6 +193,7 @@ class Config:
             speakr_publication_mode=publication_mode,
             speakr_allowed_ssids=allowed_ssids,
             allowlist=allow,
+            speakr_allowed_ssids_valid=allowed_ssids_valid,
         )
 
 

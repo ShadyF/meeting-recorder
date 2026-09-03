@@ -12,6 +12,7 @@ from meeting_recorder.meeting_sidecar import (
     MeetingSidecar, decode_sidecar, encode_sidecar, load_sidecar, load_sidecar_fd, remove_sidecar,
     sidecar_path, write_sidecar,
 )
+from meeting_recorder.speakr_domain import Tag
 
 
 NOW = datetime(2026, 3, 29, 0, 30, tzinfo=timezone.utc)
@@ -31,7 +32,8 @@ def _sidecar(name: str = "capture.mkv", meeting=None) -> MeetingSidecar:
 def test_sidecar_schema_round_trip_contains_selector_and_current_metadata() -> None:
     sidecar = _sidecar(meeting=_meeting())
     payload = encode_sidecar(sidecar)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
+    assert payload["tags"] == []
     assert payload["recording_filename"] == "capture.mkv"
     assert payload["meeting"]["selector"]
     assert payload["meeting"]["title"] == "Review"
@@ -48,6 +50,25 @@ def test_sidecar_rejects_paths_bad_intervals_and_malformed_schema() -> None:
     try:
         MeetingSidecar("capture.mkv", "capture.mkv", NOW, NOW - timedelta(seconds=1), None)
         assert False, "reversed capture interval must be rejected"
+    except ValueError:
+        pass
+
+
+def test_sidecar_v1_reads_as_empty_tags_and_v2_requires_ordered_tag_pairs() -> None:
+    legacy = encode_sidecar(_sidecar())
+    legacy.pop("tags")
+    legacy["schema_version"] = 1
+    assert decode_sidecar(legacy).tags == ()
+    tagged = _sidecar()
+    tagged = MeetingSidecar(tagged.recording_filename, tagged.original_fallback_filename,
+                            tagged.capture_started_at, tagged.capture_ended_at, tagged.meeting,
+                            (Tag(2, "Second"), Tag(1, "First")))
+    assert decode_sidecar(encode_sidecar(tagged)).tags == tagged.tags
+    malformed = encode_sidecar(tagged)
+    malformed["tags"] = [{"tag_id": True, "name": "bad"}]
+    try:
+        decode_sidecar(malformed)
+        assert False, "boolean tag IDs must be rejected"
     except ValueError:
         pass
     try:

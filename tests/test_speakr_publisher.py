@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
 import hashlib
 import os
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
 import time
 
-from meeting_recorder.speakr_domain import PublicationKey, PublicationState
+from meeting_recorder.speakr_domain import PublicationKey, PublicationState, Tag
 from meeting_recorder.speakr_http import (
     MetadataRejected, MetadataUnavailable, ReconciliationRejected,
     ReconciliationUnavailable, TransferNotSent, TransferOutcomeUnknown,
     TransferRejected,
+    TagDiscoveryUnavailable,
+    InvalidTagCatalog,
 )
 from meeting_recorder.speakr_publisher import SpeakrPublisher
 from meeting_recorder.speakr_store import PublicationStore
+from meeting_recorder.meeting_sidecar import MeetingSidecar, sidecar_path, write_sidecar
 
 
 ORIGIN = "https://example.com"
@@ -37,10 +41,13 @@ class FakeTransport:
         self.upload_started = Event()
         self.release_upload = Event()
         self.block_upload = False
+        self.tags: tuple[Tag, ...] = ()
+        self.tag_error: Exception | None = None
+        self.tag_calls = 0
 
     def upload(
         self, instance_url, token, media, media_size, filename, file_last_modified_ms, meeting_date,
-        title=None,
+        title=None, tag_ids=(),
     ) -> int:
         # Signal the caller before optionally pausing the fake request.
         self.upload_started.set()
@@ -60,6 +67,7 @@ class FakeTransport:
         self.uploads.append({
             "origin": instance_url, "token": token, "body": body, "size": media_size,
             "filename": filename, "title": title,
+            "tag_ids": tuple(tag_ids),
         })
         error = (
             self.first_upload_error
@@ -69,6 +77,12 @@ class FakeTransport:
         if error is not None:
             raise error
         return 7
+
+    def list_tags(self, instance_url, token) -> tuple[Tag, ...]:
+        self.tag_calls += 1
+        if self.tag_error is not None:
+            raise self.tag_error
+        return self.tags
 
     def patch_metadata(self, instance_url, token, remote_recording_id, metadata) -> None:
         # Record each metadata request before applying its configured failure.
@@ -116,6 +130,60 @@ def test_enqueue_reuses_normalized_origin_and_sha_without_credentials() -> None:
         assert b"bearer-secret" not in raw and b"private meeting" not in raw
     finally:
         # Remove the isolated database and recording.
+        directory.cleanup()
+
+
+def test_tag_validation_filters_catalog_order_and_transient_reconciliation_assumes_submission() -> None:
+    directory, root, media, now, store, transport, publisher = _setup()
+    try:
+        tags = (Tag(1, "One"), Tag(2, "Two"))
+        stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        write_sidecar(sidecar_path(media), MeetingSidecar(media.name, media.name, stamp, stamp, None, tags))
+        transport.tags = (Tag(2, "Two"),)
+        result = publisher.publish(media, ORIGIN, TOKEN)
+        assert result.job.state is PublicationState.PUBLISHED
+        assert transport.uploads[0]["tag_ids"] == (2,)
+        assert result.job.effective_tags == (tags[1],) and result.job.missing_tags == (tags[0],)
+
+        second = root / "second.mkv"
+        second.write_bytes(b"second")
+        write_sidecar(sidecar_path(second), MeetingSidecar(second.name, second.name, stamp, stamp, None, tags))
+        transport.tag_error = TagDiscoveryUnavailable()
+        transport.upload_error = TransferOutcomeUnknown()
+        transport.reconcile_ids = (9,)
+        recovered = publisher.publish(second, ORIGIN, TOKEN)
+        assert recovered.job.state is PublicationState.PUBLISHED
+        assert recovered.job.effective_tags == tags and not recovered.job.upload_tags_unknown
+        assert transport.uploads[-1]["tag_ids"] == (1, 2)
+    finally:
+        directory.cleanup()
+
+
+def test_permanent_catalog_failure_sends_no_tags_and_known_reconciliation_keeps_warning() -> None:
+    directory, root, media, now, store, transport, publisher = _setup()
+    try:
+        tags = (Tag(1, "One"), Tag(2, "Two"))
+        stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        write_sidecar(sidecar_path(media), MeetingSidecar(media.name, media.name, stamp, stamp, None, tags))
+        transport.tag_error = InvalidTagCatalog()
+        result = publisher.publish(media, ORIGIN, TOKEN)
+        assert result.job.state is PublicationState.PUBLISHED
+        assert transport.uploads[0]["tag_ids"] == ()
+        assert result.job.missing_tags == tags
+
+        recovered_media = root / "recovered.mkv"
+        recovered_media.write_bytes(b"recovered")
+        write_sidecar(sidecar_path(recovered_media), MeetingSidecar(
+            recovered_media.name, recovered_media.name, stamp, stamp, None, tags,
+        ))
+        transport.tag_error = None
+        transport.tags = (tags[0],)
+        transport.upload_error = TransferOutcomeUnknown()
+        transport.reconcile_ids = (11,)
+        recovered = publisher.publish(recovered_media, ORIGIN, TOKEN)
+        assert recovered.job.effective_tags == (tags[0],) and recovered.job.missing_tags == (tags[1],)
+        assert transport.uploads[-1]["tag_ids"] == (1,)
+    finally:
         directory.cleanup()
 
 
@@ -451,11 +519,20 @@ def test_known_id_is_persisted_before_patch_and_never_posts_again() -> None:
     # Verify a known remote ID resumes through PATCH without another POST.
     directory, root, media, now, store, transport, publisher = _setup()
     try:
+        # Attach a validated tag so the initial accepted upload carries tag IDs.
+        tag = Tag(1, "One")
+        stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        write_sidecar(sidecar_path(media), MeetingSidecar(
+            media.name, media.name, stamp, stamp, None, (tag,),
+        ))
+        transport.tags = (tag,)
+
         # Leave the remote ID durable while the first PATCH is unavailable.
         transport.patch_error = MetadataUnavailable()
         first = publisher.publish(media, ORIGIN, TOKEN)
         assert first.job.state is PublicationState.METADATA_PENDING
         assert first.job.remote_recording_id == 7
+        assert transport.uploads[0]["tag_ids"] == (1,)
 
         # Resume the pending PATCH and confirm no second upload occurs.
         transport.patch_error = None
@@ -463,6 +540,7 @@ def test_known_id_is_persisted_before_patch_and_never_posts_again() -> None:
         assert second is not None and second.job.state is PublicationState.PUBLISHED
         assert len(transport.uploads) == 1
         assert len(transport.patches) == 2
+        assert all(not hasattr(metadata, "tag_ids") for _, metadata in transport.patches)
     finally:
         # Remove the isolated database and recording.
         directory.cleanup()

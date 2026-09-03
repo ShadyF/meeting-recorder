@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import meeting_recorder.speakr_http as speakr_http
 from meeting_recorder.speakr_domain import SpeakrMetadata
+from meeting_recorder.speakr_domain import Tag
 from tests.speakr_fake_server import fake_speakr_server, multipart_parts
 from meeting_recorder.speakr_http import (
     InvalidSpeakrResponse,
@@ -23,11 +24,14 @@ from meeting_recorder.speakr_http import (
     MetadataUnavailable,
     ReconciliationRejected,
     ReconciliationUnavailable,
+    InvalidTagCatalog,
     SpeakrHTTPError,
     StdlibSpeakrTransport,
     TransferNotSent,
     TransferOutcomeUnknown,
     TransferRejected,
+    TagDiscoveryRejected,
+    TagDiscoveryUnavailable,
 )
 
 
@@ -248,6 +252,73 @@ def test_upload_sends_exact_streamed_multipart_request() -> None:
         assert "filename*=UTF-8''caf%C3%A9%20%22clip%22.mkv" in parts["file"][0]
         assert "\r" not in parts["file"][0] and "\n" not in parts["file"][0]
         assert max(media.read_sizes) <= 3
+
+
+def test_upload_emits_only_contiguous_ordered_tag_fields() -> None:
+    # Exercise empty, one, and multiple selections through the real multipart stream.
+    for tag_ids, expected in (((), {}), ((9,), {"tag_ids[0]": b"9"}), ((9, 3), {"tag_ids[0]": b"9", "tag_ids[1]": b"3"})):
+        with _server() as (server, state):
+            StdlibSpeakrTransport(timeout_seconds=2).upload(
+                _url(server), TOKEN, io.BytesIO(b"x"), 1, "x.mkv", 0, NOW,
+                tag_ids=tag_ids,
+            )
+            request = cast(dict[str, object], state.requests[0])
+            headers = cast(dict[str, str], request["headers"])
+            parts = _multipart_parts(headers["content-type"], cast(bytes, request["body"]))
+            actual = {name: value for name, (_, value) in parts.items() if name.startswith("tag_ids[")}
+            assert actual == expected
+
+
+def test_tag_discovery_uses_exact_path_auth_order_and_short_timeout() -> None:
+    # Preserve the API's personal-then-group ordering instead of sorting locally.
+    with fake_speakr_server(tag_pages=({"tags": [{"id": 9, "name": "Zulu"}, {"id": 2, "name": "Alpha"}]},)) as (url, state):
+        transport = StdlibSpeakrTransport(timeout_seconds=60)
+        assert transport.list_tags(url, TOKEN) == (
+            Tag(9, "Zulu"), Tag(2, "Alpha"),
+        )
+        request = state.requests[0]
+        assert request.method == "GET" and request.path == "/api/v1/tags"
+        assert request.headers["authorization"] == "Bearer " + TOKEN
+        assert request.headers["accept"] == "application/json"
+        assert transport.tag_timeout_seconds == 5
+
+
+def test_tag_discovery_has_sanitized_transient_and_contract_failures() -> None:
+    # Keep HTTP rejections typed so callers can choose cache fallback correctly.
+    for status, expected in ((401, "auth"), (429, "rate_limited"), (503, "server")):
+        with fake_speakr_server(tag_statuses=(status,), tag_pages=(b"private token=test-token",)) as (url, _):
+            try:
+                StdlibSpeakrTransport(timeout_seconds=2).list_tags(url, TOKEN)
+            except TagDiscoveryRejected as exc:
+                assert exc.classification == expected
+                assert "test-token" not in repr(exc)
+            else:
+                raise AssertionError("tag rejection was accepted")
+
+    for payload, response_limit in (
+        (b"not-json", 8),
+        (b'{"tags":[{"id":0,"name":"private"}]}', 1024),
+        (b'{"tags":[{"id":1,"name":"  "}]}', 1024),
+        (b"x" * 20, 8),
+    ):
+        with fake_speakr_server(tag_pages=(payload,)) as (url, _):
+            try:
+                StdlibSpeakrTransport(timeout_seconds=2, max_response_bytes=response_limit).list_tags(url, TOKEN)
+            except InvalidTagCatalog as exc:
+                assert "private" not in repr(exc)
+            else:
+                raise AssertionError("invalid tag catalog was accepted")
+
+    # Network failure stays transient and does not expose the socket detail.
+    response = _ScriptedResponse(200, declared_length=0)
+    with _scripted_connection(response) as connection:
+        connection.connect = lambda: (_ for _ in ()).throw(socket.timeout("private timeout"))  # type: ignore[method-assign]
+        try:
+            StdlibSpeakrTransport().list_tags("http://scripted.invalid", TOKEN)
+        except TagDiscoveryUnavailable as exc:
+            assert exc.is_transient and "private timeout" not in repr(exc)
+        else:
+            raise AssertionError("tag timeout was accepted")
 
 
 def test_upload_accepts_only_positive_integer_id() -> None:

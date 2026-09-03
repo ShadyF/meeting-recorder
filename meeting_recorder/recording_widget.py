@@ -26,6 +26,7 @@ _CSS = b"""
             font-weight: bold; }
 .rec-pill button { padding: 2px 8px; min-height: 0; min-width: 0;
                    border-radius: 8px; }
+.tag-action { margin-left: 4px; }
 """
 
 _MARGIN = 16
@@ -41,14 +42,20 @@ def _fmt(seconds: float) -> str:
 class RecordingWidget:
     def __init__(self, on_pause: Callable[[], None],
                  on_resume: Callable[[], None],
-                 on_stop: Callable[[], None]) -> None:
+                 on_stop: Callable[[], None],
+                 on_tags: Callable[[], None] | None = None) -> None:
+        # Store callbacks and state for this recording session.
         self.on_pause = on_pause
         self.on_resume = on_resume
         self.on_stop = on_stop
+        self.on_tags = on_tags
         self.paused = False
+        self._tag_action_label: str | None = None
+        self._shown = False
         self._blink_on = True
         self._blink_source: int | None = None
 
+        # Create a focus-safe utility window for the floating controls.
         self.win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         self.win.set_decorated(False)
         self.win.set_keep_above(True)
@@ -56,7 +63,8 @@ class RecordingWidget:
         self.win.set_skip_pager_hint(True)
         self.win.set_resizable(False)
         self.win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
-        self.win.set_accept_focus(False)
+        self.win.set_accept_focus(True)
+        self.win.set_focus_on_map(False)
 
         # Transparent window so the rounded pill reads cleanly.
         self.win.set_app_paintable(True)
@@ -65,11 +73,13 @@ class RecordingWidget:
         if visual is not None:
             self.win.set_visual(visual)
 
+        # Apply the compact pill treatment on the current screen.
         provider = Gtk.CssProvider()
         provider.load_from_data(_CSS)
         Gtk.StyleContext.add_provider_for_screen(
             screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
+        # Build the fixed horizontal control surface.
         pill = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         pill.get_style_context().add_class("rec-pill")
         self.win.add(pill)
@@ -81,6 +91,19 @@ class RecordingWidget:
         self.time_label = Gtk.Label(label="00:00")
         self.time_label.get_style_context().add_class("rec-time")
         pill.pack_start(self.time_label, False, False, 4)
+
+        # Keep optional tagging visually separate and hidden until discovery resolves.
+        self.tag_btn = Gtk.Button(label="")
+        self.tag_btn.get_style_context().add_class("tag-action")
+        self.tag_btn.set_no_show_all(True)
+        self.tag_btn.set_sensitive(False)
+        self.tag_btn.set_tooltip_text("Choose Speakr tags for this recording")
+        self.tag_btn.connect("clicked", self._on_tags_clicked)
+        tag_accessible = self.tag_btn.get_accessible()
+        tag_accessible.set_name("Recording tags")
+        tag_accessible.set_description(
+            "Choose or retry Speakr tags without affecting recording controls.")
+        pill.pack_start(self.tag_btn, False, False, 0)
 
         self.pause_btn = Gtk.Button(label="⏸")  # ⏸
         self.pause_btn.set_tooltip_text("Pause")
@@ -94,15 +117,24 @@ class RecordingWidget:
 
     # -- lifecycle ---------------------------------------------------------
     def show(self) -> None:
+        # Reveal the controls without taking focus from the active application.
+        self._shown = True
         self.win.show_all()
+
         # Position after realize so the true size is known.
         GLib.idle_add(self._position)
         self._blink_source = GLib.timeout_add(600, self._blink)
 
     def close(self) -> None:
+        # Clear optional state before destroying this recording's controls.
+        self._shown = False
+        self.set_tag_action(None)
+
+        # Remove the visual timer before destroying the window.
         if self._blink_source is not None:
             GLib.source_remove(self._blink_source)
             self._blink_source = None
+
         self.win.destroy()
 
     def _position(self) -> bool:
@@ -129,7 +161,42 @@ class RecordingWidget:
         prefix = "❚❚ " if self.paused else ""  # ❚❚ when paused
         self.time_label.set_text(prefix + _fmt(seconds))
 
+    def set_tag_action(self, label: str | None) -> None:
+        """Show, update, or hide the optional recording tag action."""
+        # Store the state so a stale synthetic activation remains harmless.
+        self._tag_action_label = label
+        if label is None:
+            self.tag_btn.set_sensitive(False)
+            self.tag_btn.hide()
+
+            # Restore the top-right position after the pill shrinks.
+            if self._shown:
+                GLib.idle_add(self._position)
+            return
+
+        # Explicit show and hide calls keep updates working after window.show_all().
+        self.tag_btn.set_label(label)
+        self.tag_btn.get_accessible().set_name(label)
+        self.tag_btn.set_sensitive(self.on_tags is not None)
+        self.tag_btn.show()
+
+        # Restore the top-right position after the pill grows.
+        if self._shown:
+            GLib.idle_add(self._position)
+
+    def _on_tags_clicked(self, _button: Gtk.Button) -> None:
+        # Ignore hidden, stale, or callback-free activation.
+        if self._tag_action_label is None or self.on_tags is None:
+            return
+
+        # Isolate optional tag UI failures from Pause and Stop controls.
+        try:
+            self.on_tags()
+        except Exception:
+            LOG.exception("Tag action failed")
+
     def _on_pause_clicked(self, _btn: Gtk.Button) -> None:
+        # Toggle recording state through the matching callback.
         if self.paused:
             self.paused = False
             self.on_resume()
@@ -139,12 +206,14 @@ class RecordingWidget:
         self._refresh_pause_visual()
 
     def _refresh_pause_visual(self) -> None:
+        # Keep the pause control and recording dot aligned with current state.
         self.pause_btn.set_label("▶" if self.paused else "⏸")  # ▶ / ⏸
         self.pause_btn.set_tooltip_text("Resume" if self.paused else "Pause")
         if self.paused:
             self.dot.set_opacity(0.4)
 
     def _blink(self) -> bool:
+        # Hold the dot dim while paused or alternate its recording opacity.
         if self.paused:
             self.dot.set_opacity(0.4)
         else:

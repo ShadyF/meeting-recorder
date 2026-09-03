@@ -17,6 +17,8 @@ from meeting_recorder.config import load_config
 from meeting_recorder.controller import Controller
 from meeting_recorder.domain import CaptureMode, VideoSource
 from meeting_recorder.domain import CompletedRecording
+from meeting_recorder.speakr_domain import Tag
+from meeting_recorder.speakr_tag_service import TagCatalogOutcome, TagCatalogSource
 
 
 def test_build_controls_calls_the_tray_with_arguments_it_accepts():
@@ -274,7 +276,8 @@ def test_controller_enriches_before_releasing_reservation_and_dispatches_replace
     notifier = Notifier()
     observed = []
 
-    def enrich(completed):
+    def enrich(completed, *, tags):
+        assert tags == ()
         observed.append(handle.target_path in controller._reserved_paths)
         return replace(completed, path=enriched_path)
 
@@ -440,3 +443,159 @@ def test_requested_video_mode_survives_portal_failure():
         "Recording audio only",
         "Screen capture was unavailable. Recording continued with audio only.",
     )]
+
+
+def test_detected_capture_requests_and_freezes_tags_without_manual_or_auto_fetch() -> None:
+    class Recorder:
+        is_recording = False
+
+        def start(self, _path, _app, _mode):
+            self.is_recording = True
+            return True
+
+        def attach_session(self, _session):
+            pass
+
+    class Notifier:
+        def prompt_capture_mode(self, _app, _timeout, **callbacks):
+            self.callbacks = callbacks
+
+        def info(self, *_args, **_kwargs):
+            pass
+
+    class Prompt:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.shown = False
+
+        def show(self):
+            self.shown = True
+
+        def close(self):
+            self.closed = True
+
+    cfg = load_config()
+    callbacks = []
+    prompts = []
+    controller = Controller(
+        cfg, Notifier(), Recorder(),
+        tag_requester=lambda callback: callbacks.append(callback) or None,
+        tag_prompt_factory=lambda **kwargs: prompts.append(Prompt(**kwargs)) or prompts[-1],
+    )
+    controller._show_widget = lambda: None
+    controller._needs_portal = lambda _mode: False
+    controller.on_meeting_start("Zoom")
+    assert callbacks == []
+    controller.notifier.callbacks["on_audio_only"]()
+    assert len(callbacks) == 1
+    callbacks[0](TagCatalogOutcome((Tag(2, "Two"), Tag(1, "One")), TagCatalogSource.FRESH, datetime.now(timezone.utc), False))
+    assert prompts[0].shown and prompts[0].kwargs["tags"] == (Tag(2, "Two"), Tag(1, "One"))
+    prompts[0].kwargs["on_confirmed"]((1,))
+    assert controller._tag_confirmed == (Tag(1, "One"),)
+
+    manual = Controller(cfg, Notifier(), Recorder(), tag_requester=lambda callback: (_ for _ in ()).throw(AssertionError()))
+    manual._show_widget = lambda: None
+    manual._needs_portal = lambda _mode: False
+    manual.start_manual()
+
+
+def test_default_tag_prompt_uses_the_current_tag_prompt_keyword_contract() -> None:
+    class Prompt:
+        def __init__(self, tags, initial_confirmed, on_confirmed, on_dismissed, *, status_text):
+            self.tags = tags
+            self.initial_confirmed = initial_confirmed
+            self.on_confirmed = on_confirmed
+            self.on_dismissed = on_dismissed
+            self.status_text = status_text
+
+    class Recorder:
+        pass
+
+    # Replace the visual module so this backend test remains headless.
+    module_name = "meeting_recorder.tag_prompt"
+    fake_module = types.ModuleType(module_name)
+    fake_module.TagPrompt = Prompt
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = fake_module
+    try:
+        controller = Controller(load_config(), object(), Recorder())
+        prompt = controller._default_tag_prompt(
+            tags=(Tag(4, "Four"),), initial_confirmed=(Tag(4, "Four"),),
+            on_confirmed=lambda _ids: None, on_dismissed=lambda: None,
+            status_text="Tags loaded",
+        )
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+
+    assert prompt.tags == (Tag(4, "Four"),)
+    assert prompt.initial_confirmed == (4,)
+    assert prompt.status_text == "Tags loaded"
+
+
+def test_empty_catalogs_hide_actions_and_unavailable_notices_reset_per_recording() -> None:
+    class Recorder:
+        is_recording = True
+
+    class Notifier:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def info(self, *args, **kwargs) -> None:
+            self.calls.append((args, kwargs))
+
+    class Controls:
+        def __init__(self) -> None:
+            self.actions = []
+
+        def set_tag_action(self, label: str | None) -> None:
+            self.actions.append(label)
+
+    # Feed outcomes directly because the service has already marshalled callbacks.
+    notifier = Notifier()
+    controller = Controller(load_config(), notifier, Recorder())
+    controller.state = controller.state.RECORDING
+    controller._widget = Controls()
+    # Keep an empty fresh catalog silent because it is a complete response.
+    controller._tag_request_generation += 1
+    controller._on_tag_outcome(
+        controller._tag_request_generation,
+        TagCatalogOutcome((), TagCatalogSource.FRESH, datetime.now(timezone.utc), False),
+    )
+    assert controller._widget.actions[-1] is None
+
+    # Keep an empty stale catalog equally silent instead of offering a retry.
+    controller._tag_request_generation += 1
+    controller._on_tag_outcome(
+        controller._tag_request_generation,
+        TagCatalogOutcome((), TagCatalogSource.STALE, datetime.now(timezone.utc), False),
+    )
+    assert controller._widget.actions[-1] is None
+    assert notifier.calls == []
+
+    # Show Retry for unavailable catalogs but limit its notice to one recording.
+    controller._tag_request_generation += 1
+    controller._on_tag_outcome(
+        controller._tag_request_generation,
+        TagCatalogOutcome((), TagCatalogSource.UNAVAILABLE, None, True),
+    )
+    assert controller._widget.actions[-1] == "Retry tags" and len(notifier.calls) == 1
+
+    # A second unavailable outcome keeps Retry visible without repeating the notice.
+    controller._tag_request_generation += 1
+    controller._on_tag_outcome(
+        controller._tag_request_generation,
+        TagCatalogOutcome((), TagCatalogSource.UNAVAILABLE, None, True),
+    )
+    assert controller._widget.actions[-1] == "Retry tags" and len(notifier.calls) == 1
+
+    # A new recording context receives one new unavailable notice.
+    controller._end_tag_context()
+    controller._tag_request_generation += 1
+    controller._on_tag_outcome(
+        controller._tag_request_generation,
+        TagCatalogOutcome((), TagCatalogSource.UNAVAILABLE, None, True),
+    )
+    assert len(notifier.calls) == 2

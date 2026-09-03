@@ -492,7 +492,7 @@ class PublicationService:
         if origin is None:
             self._wait_for_wake(self._periodic_seconds)
             return
-        if not tuple(getattr(config, "speakr_allowed_ssid_bytes", ())):
+        if not getattr(config, "speakr_allowed_ssids_valid", True):
             self._emit_configuration_notice()
             self._wait_for_wake(self._periodic_seconds)
             return
@@ -526,16 +526,18 @@ class PublicationService:
     def _run_due_after_network(
         self, publisher: _PublicationPublisher, origin: str, due_ids: tuple[str, ...],
     ) -> None:
-        # Probe admission only when a bounded due snapshot proves work exists.
-        network_result = self._network_call(lambda cancellation: self._probe(cancellation))
-        network_status = getattr(network_result, "status", network_result)
-        try:
-            network_status = NetworkSSIDStatus(network_status)
-        except (TypeError, ValueError):
-            network_status = NetworkSSIDStatus.UNAVAILABLE
-        if network_status is not NetworkSSIDStatus.ALLOWED:
-            self._wait_for_wake(self._periodic_seconds)
-            return
+        # Skip D-Bus only when the configured valid list intentionally disables the gate.
+        allowed = tuple(getattr(self._config, "speakr_allowed_ssid_bytes", ()))
+        if allowed:
+            network_result = self._network_call(lambda cancellation: self._probe(cancellation))
+            network_status = getattr(network_result, "status", network_result)
+            try:
+                network_status = NetworkSSIDStatus(network_status)
+            except (TypeError, ValueError):
+                network_status = NetworkSSIDStatus.UNAVAILABLE
+            if network_status not in (NetworkSSIDStatus.ALLOWED, NetworkSSIDStatus.BYPASSED):
+                self._wait_for_wake(self._periodic_seconds)
+                return
 
         # Fetch credentials after admission and never retain them between cycles.
         if self._is_stopping():

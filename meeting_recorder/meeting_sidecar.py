@@ -10,6 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .calendar_domain import (
     CalendarOccurrence,
@@ -18,13 +19,16 @@ from .calendar_domain import (
     encode_occurrence_selector,
     meeting_snapshot,
 )
+if TYPE_CHECKING:
+    from .speakr_domain import Tag
 
-SIDECAR_SCHEMA_VERSION = 1
+SIDECAR_SCHEMA_VERSION = 2
 _SIDECAR_SUFFIX = ".meeting.json"
-_TOP_LEVEL_KEYS = frozenset({
+_V1_TOP_LEVEL_KEYS = frozenset({
     "schema_version", "recording_filename", "original_fallback_filename",
     "capture_started_at", "capture_ended_at", "meeting",
 })
+_TOP_LEVEL_KEYS = _V1_TOP_LEVEL_KEYS | {"tags"}
 _MEETING_KEYS = frozenset({
     "selector", "title", "scheduled_start_utc", "scheduled_end_utc",
     "participant_labels", "description", "location", "details_visible",
@@ -56,6 +60,7 @@ class MeetingSidecar:
     capture_started_at: datetime
     capture_ended_at: datetime
     meeting: MeetingSnapshot | None
+    tags: tuple[Tag, ...] = ()
 
     def __post_init__(self) -> None:
         _basename(self.recording_filename, "recording filename")
@@ -66,6 +71,11 @@ class MeetingSidecar:
             raise ValueError("capture end must not precede capture start")
         if self.meeting is not None and not isinstance(self.meeting, MeetingSnapshot):
             raise ValueError("meeting must be a MeetingSnapshot or None")
+        from .speakr_domain import Tag, _MAX_TAGS
+        if not isinstance(self.tags, tuple) or any(not isinstance(tag, Tag) for tag in self.tags):
+            raise ValueError("sidecar tags must be tag values")
+        if len(self.tags) > _MAX_TAGS or len({tag.tag_id for tag in self.tags}) != len(self.tags):
+            raise ValueError("sidecar tags contain duplicate tag IDs")
 
 
 def sidecar_path(media: Path | str) -> Path:
@@ -124,6 +134,7 @@ def encode_sidecar(sidecar: MeetingSidecar) -> dict[str, object]:
     """Encode a validated sidecar into the strict JSON object schema."""
     if not isinstance(sidecar, MeetingSidecar):
         raise ValueError("sidecar is invalid")
+    # Store the frozen tags as public ID-name pairs beside recording metadata.
     return {
         "schema_version": SIDECAR_SCHEMA_VERSION,
         "recording_filename": sidecar.recording_filename,
@@ -131,23 +142,37 @@ def encode_sidecar(sidecar: MeetingSidecar) -> dict[str, object]:
         "capture_started_at": _stamp(sidecar.capture_started_at),
         "capture_ended_at": _stamp(sidecar.capture_ended_at),
         "meeting": _occurrence_payload(sidecar.meeting) if sidecar.meeting else None,
+        "tags": [{"tag_id": tag.tag_id, "name": tag.name} for tag in sidecar.tags],
     }
 
 
 def decode_sidecar(value: object) -> MeetingSidecar:
     """Decode only the exact supported sidecar schema."""
-    if not isinstance(value, dict) or set(value) != _TOP_LEVEL_KEYS:
+    if not isinstance(value, dict):
         raise ValueError("sidecar schema is malformed")
-    if (not isinstance(value["schema_version"], int)
-            or isinstance(value["schema_version"], bool)
-            or value["schema_version"] != SIDECAR_SCHEMA_VERSION):
+    version = value.get("schema_version")
+    if type(version) is not int or version not in {1, SIDECAR_SCHEMA_VERSION}:
         raise ValueError("sidecar schema version is unsupported")
+    if set(value) != (_V1_TOP_LEVEL_KEYS if version == 1 else _TOP_LEVEL_KEYS):
+        raise ValueError("sidecar schema is malformed")
+    # Project legacy sidecars to an empty tag list before strict tag decoding.
+    tags_value = [] if version == 1 else value["tags"]
+    if not isinstance(tags_value, list):
+        raise ValueError("sidecar tags are malformed")
+    # Rebuild only complete canonical tags in their persisted order.
+    from .speakr_domain import Tag
+    tags: list[Tag] = []
+    for item in tags_value:
+        if not isinstance(item, dict) or set(item) != {"tag_id", "name"}:
+            raise ValueError("sidecar tags are malformed")
+        tags.append(Tag(item["tag_id"], item["name"]))
+    # Decode meeting metadata after the complete tag list is known valid.
     meeting_value = value["meeting"]
     meeting = None if meeting_value is None else _occurrence_from_payload(meeting_value)
     return MeetingSidecar(
         value["recording_filename"], value["original_fallback_filename"],
         _parse_stamp(value["capture_started_at"], "capture start"),
-        _parse_stamp(value["capture_ended_at"], "capture end"), meeting,
+        _parse_stamp(value["capture_ended_at"], "capture end"), meeting, tuple(tags),
     )
 
 
@@ -190,12 +215,8 @@ def load_sidecar(path: Path | str) -> MeetingSidecar:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("sidecar is not a regular file")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            descriptor = -1
-            try:
-                value = json.load(handle)
-            except (UnicodeError, json.JSONDecodeError) as exc:
-                raise ValueError("sidecar JSON is malformed") from exc
+        # Reuse the descriptor reader so path-based loads retain the byte bound.
+        return load_sidecar_fd(descriptor)
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.EMLINK}:
             raise ValueError("sidecar must not be a symlink") from exc
@@ -203,7 +224,6 @@ def load_sidecar(path: Path | str) -> MeetingSidecar:
     finally:
         if descriptor != -1:
             os.close(descriptor)
-    return decode_sidecar(value)
 
 
 def _fsync_directory(directory: Path) -> None:

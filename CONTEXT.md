@@ -24,10 +24,25 @@ _Avoid_: Event guess, calendar lookup
 
 **Meeting sidecar**:
 A versioned `<media filename>.meeting.json` file adjacent to a Recording. Schema
-version 1 stores the capture interval, original fallback filename, stable
-occurrence selector, and current Meeting metadata. It is written atomically;
-the Recording remains authoritative if sidecar or rename work fails.
+version 2 stores the capture interval, original fallback filename, stable
+occurrence selector, current Meeting metadata, and an ordered selected Speakr tag
+list (including an empty list). Schema v1 remains readable as no tags and is not
+rewritten only to upgrade it. A sidecar is written atomically; the Recording
+remains authoritative if sidecar or rename work fails.
 _Avoid_: Metadata file, recording JSON
+
+**Speakr tag**:
+An existing Speakr tag represented by its stable positive integer ID and the
+display name shown when it was selected. IDs are authoritative. A frozen ordered
+selection is offered only for an explicitly accepted detected Recording while
+automatic Publication is configured; it never delays or controls capture.
+_Avoid_: Label, category
+
+**Tag catalog**:
+The caller's accessible Speakr tags returned in the personal-then-group API order.
+It is fetched from `GET /api/v1/tags` for the exact `v0.10.5-alpha` integration
+and may use only a transient-failure stale cache for the active normalized origin.
+The cache contains no token and is not a publication-admission decision.
 
 **Recording correction**:
 An explicit cache-only operation under `meeting-recorder calendar correct` that
@@ -64,8 +79,14 @@ publication policy. A visible matched Meeting supplies current title/details and
 scheduled start; a hidden matched Meeting supplies the current filename title and
 non-private scheduled start without private notes/participants; an unmatched
 Recording with a valid sidecar supplies the current filename title and capture
-start; without a valid sidecar, file mtime is the date fallback. The current path
-and sidecar are reread after transfer before the authoritative metadata PATCH.
+start; without a valid sidecar, file mtime is the date fallback. Before the first
+media POST, it validates frozen tag IDs once against the fresh accessible catalog
+within five seconds, then sends only the known IDs as contiguous multipart fields.
+Transient tag validation preserves frozen IDs but records their result as unknown;
+permanent or incompatible responses fail tags closed without blocking media
+publication. The current path and sidecar are reread after transfer before the
+authoritative metadata PATCH, which always omits tags. The publisher never changes
+remote tags after upload.
 _Avoid_: Speakr plugin, Speakr connector
 
 **Publication job**:
@@ -75,9 +96,11 @@ filesystem locator for the current Recording path, protected by the private
 0700 directory and 0600 SQLite boundary; that locator is operational state,
 not public publication data. It contains no API credentials and no copied or
 frozen Meeting title, notes, or participants. Metadata is reread from the
-Meeting sidecar at attempt time. Uncertain media transfers are not
-automatically resent, metadata-pending jobs retry PATCH only, and published
-reruns send nothing.
+Meeting sidecar at attempt time. Its frozen tag snapshot and CLI-only tag outcome
+are public: known `effective` and `missing` tag sets, an unknown upload outcome,
+and a non-blocking local-sidecar rewrite warning. These warning fields persist
+through `local_removed`. Uncertain media transfers are not automatically resent,
+metadata-pending jobs retry PATCH only, and published reruns send nothing.
 _Avoid_: Upload record, queue item
 
 **Publication cleanup**:
@@ -99,9 +122,12 @@ not provide local-file recovery.
 
 ## Publication cleanup invariants
 
-The private publication store uses schema v3. Its cleanup journal contains one
+The private publication store uses schema v4. Its cleanup journal contains one
 `cleanup_intents` record and exact `cleanup_intent_members` for each in-progress
-operation; publication rows also carry the cleanup lease fence.
+operation; publication rows also carry the cleanup lease fence. An exact v3 store
+is permanently reset without an application backup on first v4 startup: queued
+jobs, retries, remote IDs, and cleanup history are lost, but local Recordings
+remain. This is not a migration and rollback to the prior binary is unsupported.
 The journal is bounded to a complete same-path group, and the member set cannot
 be replaced by a partial or newly added group while cleanup is in progress.
 

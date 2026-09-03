@@ -57,12 +57,17 @@ class RecordingTray:
 
     def __init__(self, on_pause: Callable[[], None],
                  on_resume: Callable[[], None],
-                 on_stop: Callable[[], None]) -> None:
+                 on_stop: Callable[[], None],
+                 on_tags: Callable[[], None] | None = None) -> None:
+        # Store callbacks and state for this recording session.
         self.on_pause = on_pause
         self.on_resume = on_resume
         self.on_stop = on_stop
+        self.on_tags = on_tags
         self.paused = False
+        self._tag_action_label: str | None = None
 
+        # Create the panel indicator in a passive state until recording starts.
         self.ind = AppIndicator3.Indicator.new(
             _ID, _icon_name(_ICON_RECORDING),
             AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
@@ -75,6 +80,22 @@ class RecordingTray:
         self.header.set_sensitive(False)
         self._add(self.header)
         self._add(Gtk.SeparatorMenuItem())
+
+        # Reserve a separate optional section without leaving a blank separator.
+        self.tag_item = Gtk.MenuItem(label="")
+        self.tag_item.set_no_show_all(True)
+        self.tag_item.set_sensitive(False)
+        self.tag_item.connect("activate", self._on_tags_activate)
+        tag_accessible = self.tag_item.get_accessible()
+        tag_accessible.set_name("Recording tags")
+        tag_accessible.set_description(
+            "Choose or retry Speakr tags without affecting recording controls.")
+        self._add(self.tag_item)
+        self.tag_item.hide()
+        self.tag_separator = Gtk.SeparatorMenuItem()
+        self.tag_separator.set_no_show_all(True)
+        self._add(self.tag_separator)
+        self.tag_separator.hide()
 
         self.pause_item = Gtk.MenuItem(label="Pause")
         self.pause_item.connect("activate", self._on_pause_activate)
@@ -93,21 +114,47 @@ class RecordingTray:
 
     # -- lifecycle (same surface as RecordingWidget) -----------------------
     def show(self) -> None:
+        # Reset pause state before exposing the active indicator.
         self.paused = False
         self._refresh()
         self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
 
     def close(self) -> None:
+        # Reused indicators must not expose an action from the prior recording.
+        self.set_tag_action(None)
+
+        # Remove this recording's indicator from the panel.
         self.ind.set_status(AppIndicator3.IndicatorStatus.PASSIVE)
 
     def update_time(self, seconds: float) -> None:
+        # Update both the menu status and optional shell label.
         state = "Paused" if self.paused else "● Recording"
         self.header.set_label(f"{state} — {_fmt(seconds)}")
         # Some shells render a label next to the icon; harmless if ignored.
         self.ind.set_label(f" {_fmt(seconds)}", "00:00")
 
+    def set_tag_action(self, label: str | None) -> None:
+        """Show, update, or hide the optional tag menu section."""
+        # Store the state so a stale synthetic activation remains harmless.
+        self._tag_action_label = label
+        if label is None:
+            self.tag_item.set_sensitive(False)
+            self.tag_item.hide()
+            self.tag_separator.hide()
+            self.menu.queue_resize()
+            return
+
+        # Explicit visibility changes update an AppIndicator menu already in use.
+        self.tag_item.set_label(label)
+        self.tag_item.get_accessible().set_name(label)
+        self.tag_item.set_sensitive(self.on_tags is not None)
+        self.tag_item.show()
+        self.tag_separator.show()
+        self.menu.queue_resize()
+
     # -- menu actions ------------------------------------------------------
     def _on_pause_activate(self, _item: Gtk.MenuItem) -> None:
+        # Toggle recording state through the matching callback.
         if self.paused:
             self.paused = False
             self.on_resume()
@@ -116,9 +163,20 @@ class RecordingTray:
             self.on_pause()
         self._refresh()
 
+    def _on_tags_activate(self, _item: Gtk.MenuItem) -> None:
+        # Ignore hidden, stale, or callback-free activation.
+        if self._tag_action_label is None or self.on_tags is None:
+            return
+
+        # Isolate optional tag UI failures from the recording menu lifecycle.
+        try:
+            self.on_tags()
+        except Exception:
+            LOG.exception("Tag action failed")
+
     def _refresh(self) -> None:
+        # Keep the action label and panel icon aligned with pause state.
         self.pause_item.set_label("Resume" if self.paused else "Pause")
         self.ind.set_icon_full(
             _icon_name(_ICON_PAUSED if self.paused else _ICON_RECORDING),
             "Paused" if self.paused else "Recording")
-

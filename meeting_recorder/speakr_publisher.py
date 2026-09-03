@@ -22,17 +22,18 @@ import time
 from typing import BinaryIO, Callable, List, Sequence, cast
 from uuid import uuid4
 
-from .meeting_sidecar import MeetingSidecar, load_sidecar, sidecar_path
+from .meeting_sidecar import MeetingSidecar, load_sidecar, sidecar_path, write_sidecar
 from .recording_paths import recording_directory_lock
 from .speakr_domain import (
     MediaIdentity, PublicationJob, PublicationKey, PublicationOperation,
     PublicationResult, PublicationState, ResumeIntent, SpeakrMetadata,
-    map_speakr_metadata, normalize_speakr_url,
+    Tag, map_speakr_metadata, normalize_speakr_url,
 )
 from .speakr_http import (
     MetadataRejected, MetadataUnavailable, ReconciliationRejected,
     ReconciliationUnavailable, SpeakrTransport, TransferNotSent,
     TransferOutcomeUnknown, TransferRejected,
+    InvalidTagCatalog, TagDiscoveryRejected, TagDiscoveryUnavailable,
 )
 from .speakr_store import PublicationStore, PublicationTransitionError
 
@@ -308,8 +309,15 @@ class SpeakrPublisher:
             staged, source_descriptor = self._stage(source)
             key = PublicationKey(instance_url, staged.digest)
             path_bytes = os.fsencode(source)
+            # A missing, v1, or malformed adjacent sidecar must not block explicit media enqueue.
+            try:
+                sidecar = load_sidecar(sidecar_path(source))
+                tags = sidecar.tags
+            except (OSError, ValueError):
+                tags = ()
             job = self.store.create_or_reuse(
                 key, path_bytes, staged.file_last_modified_ms, identity=staged.identity,
+                tags=tags,
             )
             return job
         finally:
@@ -574,6 +582,8 @@ class SpeakrPublisher:
                 staged, source_descriptor, job, owner=True,
             )
             job = self._renew(job)
+            tag_ids = self._resolve_upload_tags(job, origin, token, discovered)
+            job = self.store.get(job.job_id) or job
             self._require_unchanged(source_descriptor, staged.descriptor_info)
             self._require_staged_unchanged(staged)
             marker = self._new_marker()
@@ -594,7 +604,7 @@ class SpeakrPublisher:
             try:
                 remote_id = self._upload(
                     origin, token, _safe_filename(discovered.path), staged,
-                    metadata.meeting_date, _safe_title(metadata.title, marker),
+                    metadata.meeting_date, _safe_title(metadata.title, marker), tag_ids,
                 )
             except Exception as exc:
                 upload_error = exc
@@ -657,6 +667,10 @@ class SpeakrPublisher:
             # A zero or multiple marker match cannot identify one remote row;
             # terminal uncertainty is safer than authorizing another POST.
             return self._terminal_uncertain(job, "reconciliation_failed", None)
+        # A unique marker match proves the initial request reached Speakr with its submitted tags.
+        job = self.store.resolve_reconciled_tags(
+            job.job_id, self.worker_id, job.lease_generation, now_ms=self._now(),
+        )
         self._prepare_transition()
         pending = self.store.transition(
             job.job_id, PublicationState.METADATA_PENDING,
@@ -798,6 +812,70 @@ class SpeakrPublisher:
                 generation=job.lease_generation, now_ms=self._now(),
             )
 
+    def _resolve_upload_tags(
+        self, job: PublicationJob, origin: str, token: str, discovered: _DiscoveredMedia,
+    ) -> tuple[int, ...]:
+        """Freeze the one pre-POST tag decision while the queued lease is active."""
+        # Skip catalog work when enqueue captured no tags.
+        if not job.frozen_tags:
+            return ()
+
+        # Fail closed when the transport cannot perform the required catalog check.
+        method = getattr(self.transport, "list_tags", None)
+        if not callable(method):
+            updated = self.store.update_tag_status(
+                job.job_id, self.worker_id, job.lease_generation,
+                effective_tags=(), missing_tags=job.frozen_tags, upload_tags_unknown=False,
+                now_ms=self._now(),
+            )
+            return tuple(tag.tag_id for tag in updated.effective_tags or ())
+        # Classify catalog failures without changing the media publication path.
+        try:
+            catalog = method(origin, token)
+            if not isinstance(catalog, tuple) or any(not isinstance(tag, Tag) for tag in catalog):
+                raise InvalidTagCatalog()
+        except TagDiscoveryRejected as exc:
+            if exc.status == 429 or 500 <= exc.status <= 599:
+                catalog = None
+            else:
+                catalog = ()
+        except (TagDiscoveryUnavailable, TimeoutError, OSError, socket.timeout):
+            catalog = None
+        except Exception:
+            catalog = ()
+        # Preserve submitted IDs when the catalog outcome is transient and unknown.
+        if catalog is None:
+            self.store.update_tag_status(
+                job.job_id, self.worker_id, job.lease_generation,
+                upload_tags_unknown=True, now_ms=self._now(),
+            )
+            return tuple(tag.tag_id for tag in job.frozen_tags)
+        # Partition the frozen snapshot before recording the known local outcome.
+        catalog_ids = {tag.tag_id for tag in catalog}
+        effective = tuple(tag for tag in job.frozen_tags if tag.tag_id in catalog_ids)
+        missing = tuple(tag for tag in job.frozen_tags if tag.tag_id not in catalog_ids)
+        updated = self.store.update_tag_status(
+            job.job_id, self.worker_id, job.lease_generation,
+            effective_tags=effective, missing_tags=missing, upload_tags_unknown=False, now_ms=self._now(),
+        )
+        # Rewrite only the tag list; failed local correction is a non-blocking warning.
+        if discovered.sidecar is not None:
+            try:
+                write_sidecar(sidecar_path(discovered.path),
+                              MeetingSidecar(discovered.sidecar.recording_filename,
+                                             discovered.sidecar.original_fallback_filename,
+                                             discovered.sidecar.capture_started_at,
+                                             discovered.sidecar.capture_ended_at,
+                                             discovered.sidecar.meeting, effective))
+            except Exception:
+                self.store.update_tag_status(
+                    job.job_id, self.worker_id, job.lease_generation,
+                    sidecar_warning=True, now_ms=self._now(),
+                )
+        # Preserve API catalog order in the submitted multipart IDs.
+        effective_ids = {tag.tag_id for tag in updated.effective_tags or ()}
+        return tuple(tag.tag_id for tag in catalog if tag.tag_id in effective_ids)
+
     def _upload(
         self,
         origin: str,
@@ -806,6 +884,7 @@ class SpeakrPublisher:
         staged: _StagedMedia,
         meeting_date: datetime,
         title: str,
+        tag_ids: Sequence[int] = (),
     ) -> int:
         os.lseek(staged.descriptor, 0, os.SEEK_SET)
         duplicate = os.dup(staged.descriptor)
@@ -814,6 +893,11 @@ class SpeakrPublisher:
                 duplicate = -1
                 media = _TrackingMedia(raw_media)
                 try:
+                    if tag_ids:
+                        return self.transport.upload(
+                            origin, token, cast(BinaryIO, media), staged.identity.size, filename,
+                            staged.file_last_modified_ms, meeting_date, title=title, tag_ids=tag_ids,
+                        )
                     return self.transport.upload(
                         origin, token, cast(BinaryIO, media), staged.identity.size, filename,
                         staged.file_last_modified_ms, meeting_date, title=title,

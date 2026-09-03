@@ -142,6 +142,27 @@ def _nonnegative_int(value: object, name: str) -> int:
     return value
 
 
+_MAX_TAG_NAME_LENGTH = 255
+_MAX_TAGS = 100
+
+
+@dataclass(frozen=True)
+class Tag:
+    """A stable public tag identity captured without credentials."""
+
+    tag_id: int
+    name: str
+
+    def __post_init__(self) -> None:
+        # Keep persisted and remote tag identities within one database-safe range.
+        if type(self.tag_id) is not int or not 0 < self.tag_id <= 2**63 - 1:
+            raise ValueError("tag ID must be a positive integer")
+
+        # Reject blank or unbounded display names before they enter durable state.
+        if not isinstance(self.name, str) or not self.name.strip() or len(self.name) > _MAX_TAG_NAME_LENGTH:
+            raise ValueError("tag name must be non-empty")
+
+
 def _normalize_line(value: object, name: str, *, required: bool) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
@@ -411,6 +432,11 @@ class PublicationJob:
     local_removed_at_ms: int | None = None
     created_at_ms: int = 0
     updated_at_ms: int = 0
+    frozen_tags: tuple[Tag, ...] = ()
+    effective_tags: tuple[Tag, ...] | None = None
+    missing_tags: tuple[Tag, ...] | None = None
+    upload_tags_unknown: bool = False
+    sidecar_warning: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.job_id, str) or _SAFE_JOB_ID.fullmatch(self.job_id) is None:
@@ -419,6 +445,32 @@ class PublicationJob:
             raise ValueError("publication key is invalid")
         if not isinstance(self.state, PublicationState):
             raise ValueError("publication state is invalid")
+        # Preserve the enqueue snapshot while allowing later effective-tag warnings.
+        for field_name in ("frozen_tags", "effective_tags", "missing_tags"):
+            tags = getattr(self, field_name)
+            if tags is None and field_name != "frozen_tags":
+                continue
+            if not isinstance(tags, tuple) or any(not isinstance(tag, Tag) for tag in tags):
+                raise ValueError(f"{field_name} must be tag values")
+            if len(tags) > _MAX_TAGS or len({tag.tag_id for tag in tags}) != len(tags):
+                raise ValueError(f"{field_name} contains duplicate tag IDs")
+        # Keep tag-status flags explicit before evaluating their dependent fields.
+        if type(self.upload_tags_unknown) is not bool or type(self.sidecar_warning) is not bool:
+            raise ValueError("tag status flags must be bool")
+        # Keep an enqueue snapshot unresolved until upload supplies one complete outcome.
+        if self.upload_tags_unknown:
+            if self.effective_tags is not None or self.missing_tags is not None:
+                raise ValueError("unknown tag outcomes cannot contain exact tag sets")
+        elif (self.effective_tags is None) != (self.missing_tags is None):
+            raise ValueError("known tag outcomes require both tag sets")
+        elif self.effective_tags is not None and self.missing_tags is not None:
+            resolved = self.effective_tags + self.missing_tags
+            if len(resolved) != len(self.frozen_tags) or {tag.tag_id for tag in resolved} != {tag.tag_id for tag in self.frozen_tags}:
+                raise ValueError("known tag outcomes must cover frozen tags")
+            expected_effective = tuple(tag for tag in self.frozen_tags if tag in self.effective_tags)
+            expected_missing = tuple(tag for tag in self.frozen_tags if tag in self.missing_tags)
+            if self.effective_tags != expected_effective or self.missing_tags != expected_missing:
+                raise ValueError("known tag outcomes must retain frozen tag order")
         for numeric_value, name in (
             (self.media_device, "media device"), (self.media_inode, "media inode"),
             (self.media_size, "media size"), (self.source_mtime_ns, "source mtime"),
@@ -634,6 +686,6 @@ def map_speakr_metadata(
 
 __all__ = [
     "CleanupClaim", "CleanupIntent", "CleanupPhase", "MediaIdentity", "PublicationJob", "PublicationKey", "PublicationOperation",
-    "PublicationResult", "PublicationState", "ResumeIntent", "SpeakrMetadata",
+    "PublicationResult", "PublicationState", "ResumeIntent", "SpeakrMetadata", "Tag",
     "map_speakr_metadata", "normalize_speakr_url",
 ]

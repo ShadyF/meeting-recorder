@@ -28,11 +28,17 @@ class FakeSpeakrState:
         recording_pages: tuple[object, ...] = (),
         recording_statuses: tuple[int, ...] = (),
         recording_headers: tuple[dict[str, str], ...] = (),
+        tag_pages: tuple[object, ...] = (),
+        tag_statuses: tuple[int, ...] = (),
+        tag_headers: tuple[dict[str, str], ...] = (),
     ) -> None:
         self.patch_statuses = list(patch_statuses)
         self.recording_pages = list(recording_pages)
         self.recording_statuses = list(recording_statuses)
         self.recording_headers = list(recording_headers)
+        self.tag_pages = list(tag_pages)
+        self.tag_statuses = list(tag_statuses)
+        self.tag_headers = list(tag_headers)
         self.requests: list[Request] = []
         self.request_received = Event()
         self._lock = Lock()
@@ -52,6 +58,17 @@ class FakeSpeakrState:
             self.request_received.set()
 
             # Serve the next scripted reconciliation page for each GET.
+            if request.command == "GET" and request.path == "/api/v1/tags":
+                # Keep tag scripts independent from recording reconciliation GETs.
+                index = sum(item.path == "/api/v1/tags" for item in self.requests) - 1
+                status = self.tag_statuses[index] if index < len(self.tag_statuses) else 200
+                page = self.tag_pages[index] if index < len(self.tag_pages) else {"tags": []}
+                response_body = page if isinstance(page, bytes) else json.dumps(
+                    page, separators=(",", ":"),
+                ).encode("utf-8")
+                response_headers = self.tag_headers[index] if index < len(self.tag_headers) else {}
+                return status, response_body, response_headers
+
             if request.command == "GET":
                 # Select the response by the number of GETs already recorded.
                 index = sum(item.method == "GET" for item in self.requests) - 1
@@ -134,6 +151,9 @@ def fake_speakr_server(
     recording_pages: tuple[object, ...] = (),
     recording_statuses: tuple[int, ...] = (),
     recording_headers: tuple[dict[str, str], ...] = (),
+    tag_pages: tuple[object, ...] = (),
+    tag_statuses: tuple[int, ...] = (),
+    tag_headers: tuple[dict[str, str], ...] = (),
 ) -> Iterator[tuple[str, FakeSpeakrState]]:
     """Start a loopback server and wait for its serving thread without polling sleeps."""
     # Keep all response scripts in one state object shared by the handler.
@@ -142,6 +162,9 @@ def fake_speakr_server(
         recording_pages=recording_pages,
         recording_statuses=recording_statuses,
         recording_headers=recording_headers,
+        tag_pages=tag_pages,
+        tag_statuses=tag_statuses,
+        tag_headers=tag_headers,
     )
 
     # Start the local server before yielding its normalized origin.
