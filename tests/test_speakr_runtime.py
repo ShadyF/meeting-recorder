@@ -264,6 +264,94 @@ def test_daemon_publication_start_failure_does_not_block_recording() -> None:
     assert events.count("publication-stop") == 1
 
 
+def test_daemon_tag_requester_resolves_operation_token_without_passing_config() -> None:
+    # Capture the real daemon requester through a controller that performs no GTK work.
+    events = []
+    received = []
+
+    class Service:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self, _timeout):
+            return True
+
+    class Controller:
+        instance = None
+
+        def __init__(self, *_args, tag_requester, **_kwargs):
+            self.on_finished = None
+            self.tag_requester = tag_requester
+            Controller.instance = self
+
+        def on_meeting_start(self, *_args):
+            pass
+
+        def on_meeting_stop(self, *_args):
+            pass
+
+        def shutdown(self):
+            pass
+
+    class TagService:
+        instance = None
+
+        def __init__(self, *_args):
+            self.requests = []
+            TagService.instance = self
+
+        def activate(self, origin):
+            self.origin = origin
+
+        def request(self, origin, token, callback):
+            self.requests.append((origin, token, callback))
+            return object()
+
+        def shutdown(self, _timeout):
+            return True
+
+    class TagCache:
+        def activate(self, _origin):
+            pass
+
+    # Invoke one credentialed request and then one failed request from the captured seam.
+    def request_tags() -> None:
+        assert Controller.instance is not None
+        assert Controller.instance.tag_requester is not None
+        assert Controller.instance.tag_requester(received.append) is not None
+        assert Controller.instance.tag_requester(received.append) is None
+
+    token_calls = 0
+
+    def resolve_token() -> str:
+        nonlocal token_calls
+        token_calls += 1
+        if token_calls == 1:
+            return "token-placeholder"
+        raise ValueError("credential unavailable")
+
+    with ExitStack() as stack:
+        # Replace catalog boundaries while leaving _cmd_run's requester construction real.
+        stack.enter_context(patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN))
+        stack.enter_context(patch("meeting_recorder.__main__.require_speakr_token", side_effect=resolve_token))
+        stack.enter_context(patch("meeting_recorder.speakr_http.StdlibSpeakrTransport", lambda: object()))
+        stack.enter_context(patch("meeting_recorder.speakr_tag_cache.SpeakrTagCache", TagCache))
+        stack.enter_context(patch("meeting_recorder.speakr_tag_service.SpeakrTagService", TagService))
+        result, _glib, _notifier = _run_daemon(Service, Controller, request_tags, events)
+
+    # The service receives the one operation-scoped token and original callback.
+    assert result == 0 and TagService.instance is not None
+    assert TagService.instance.origin == ORIGIN
+    assert TagService.instance.requests == [(ORIGIN, "token-placeholder", received.append)]
+
+    # Credential failure maps to the controller's existing safe unavailable outcome.
+    assert len(received) == 1
+    assert received[0].tags == () and received[0].unavailable_notice
+
+
 def test_daemon_shutdown_isolated_when_publication_stop_raises() -> None:
     # A worker stop exception must not hide controller cleanup or change the exit code.
     events = []

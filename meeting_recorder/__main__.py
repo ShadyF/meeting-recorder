@@ -239,7 +239,7 @@ def _cmd_run(cfg) -> int:
             def tag_requester(callback: Callable[[Any], None]) -> Any | None:
                 # Resolve credentials per explicit request and never retain them in UI state.
                 try:
-                    token = require_speakr_token(cfg)
+                    token = require_speakr_token()
                     return tag_service.request(origin, token, callback)
                 except Exception:
                     callback(TagCatalogOutcome(
