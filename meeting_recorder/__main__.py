@@ -945,8 +945,10 @@ def _cmd_calendar_correct(cfg, recording: str, refresh: bool,
         try:
             before = service.discover(Path(recording))
             final = service.clear(Path(recording))
-            if service.discover(final) is not None:
-                raise OSError("clear did not remove recording metadata")
+            # Legacy clears remove sidecars, while tagged v2 clears retain tag-only metadata.
+            retained = service.discover(final)
+            if retained is not None and retained.meeting is not None:
+                raise OSError("clear did not remove meeting metadata")
             print(f"Recording: {'already clear' if before is None else final}")
             return 0
         except CorrectionTransactionError as exc:

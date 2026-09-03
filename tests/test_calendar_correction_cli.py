@@ -10,8 +10,9 @@ from tempfile import TemporaryDirectory
 from meeting_recorder.__main__ import _cmd_calendar_correct, build_parser
 from meeting_recorder.calendar_domain import CalendarOccurrence, OccurrenceKey, meeting_snapshot
 from meeting_recorder.domain import CaptureMode, CompletedRecording
-from meeting_recorder.meeting_sidecar import MeetingSidecar, sidecar_path, write_sidecar
+from meeting_recorder.meeting_sidecar import MeetingSidecar, load_sidecar, sidecar_path, write_sidecar
 from meeting_recorder.recording_enrichment import RecordingCorrectionService
+from meeting_recorder.speakr_domain import Tag
 
 
 NOW = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
@@ -24,11 +25,12 @@ def _occurrence(event_id: str, title: str | None, visible: bool = True,
         summary=title, details_visible=visible)
 
 
-def _recording(root: Path) -> Path:
+def _recording(root: Path, tags: tuple[Tag, ...] = ()) -> Path:
+    # Write a valid adjacent sidecar through the public v2 writer.
     path = root / "capture.mkv"
     path.write_bytes(b"recording")
     write_sidecar(sidecar_path(path), MeetingSidecar(
-        path.name, path.name, NOW, NOW + timedelta(minutes=30), None))
+        path.name, path.name, NOW, NOW + timedelta(minutes=30), None, tags))
     return path
 
 
@@ -125,6 +127,25 @@ def test_correction_cli_selects_visible_and_hidden_and_clear_needs_no_config():
         with redirect_stdout(output):
             assert _cmd_calendar_correct(None, str(selected), False, None, True) == 0
         assert "Recording:" in output.getvalue() and not sidecar_path(selected).exists()
+
+
+def test_correction_cli_clear_retains_tagged_sidecar_without_meeting_metadata():
+    # Clear a tagged v2 sidecar through the real CLI correction path.
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        tags = (Tag(9, "Zulu"), Tag(2, "Alpha"))
+        recording = _recording(root, tags)
+        visible = _occurrence("visible", "Visible")
+        service = RecordingCorrectionService((visible,), lambda value: value)
+        selected = service.select(recording, visible.key)
+
+        # The CLI must accept the retained tag-only sidecar after restoring fallback media.
+        output = io.StringIO()
+        with redirect_stdout(output):
+            assert _cmd_calendar_correct(None, str(selected), False, None, True) == 0
+        final = Path(output.getvalue().strip().split(": ", 1)[1])
+        metadata = load_sidecar(sidecar_path(final))
+        assert final.name == "capture.mkv" and metadata.meeting is None and metadata.tags == tags
 
 
 def test_correction_cli_rejects_missing_or_stale_selection_without_mutating_media():
