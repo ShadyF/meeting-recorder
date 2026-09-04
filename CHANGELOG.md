@@ -24,6 +24,14 @@ All notable changes to this project are documented here. Format follows
   IDs, and cleanup history while retaining local Recordings; rollback to the
   prior binary is unsupported.
 
+## [0.4.4] — 2026-09-02
+
+### Fixed
+- An empty valid Speakr SSID allowlist now disables SSID gating, while malformed
+  SSID configuration remains fail-closed.
+- Confirmed active non-Wi-Fi connections now bypass the SSID-only gate without
+  weakening exact-match and fail-closed behavior for active Wi-Fi connections.
+
 ## [0.4.3] — 2026-08-30
 
 ### Added
@@ -433,6 +441,7 @@ First release.
   apply to new recordings only.
 - Drag-selecting a capture region needs the optional `slop` package.
 
+[0.4.4]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.4
 [0.4.3]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.3
 [0.4.2]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.2
 [0.4.1]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.1
