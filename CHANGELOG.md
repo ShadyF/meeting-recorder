@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-04
+
 ### Added
 - #53 adds optional, non-modal selection of existing Speakr tags for explicitly
   accepted detected Recordings in automatic publication mode. Selection never
@@ -441,6 +443,8 @@ First release.
   apply to new recordings only.
 - Drag-selecting a capture region needs the optional `slop` package.
 
+[Unreleased]: https://github.com/ShadyF/meeting-recorder/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ShadyF/meeting-recorder/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.4
 [0.4.3]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.3
 [0.4.2]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.2
