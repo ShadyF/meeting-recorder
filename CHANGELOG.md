@@ -6,6 +6,12 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-09-15
+
+### Fixed
+- Speakr reconciliation now accepts consistent empty first-page search results
+  with zero records and zero pages without weakening pagination validation.
+
 ## [0.5.0] — 2026-09-04
 
 ### Added
@@ -443,7 +449,8 @@ First release.
   apply to new recordings only.
 - Drag-selecting a capture region needs the optional `slop` package.
 
-[Unreleased]: https://github.com/ShadyF/meeting-recorder/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ShadyF/meeting-recorder/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/ShadyF/meeting-recorder/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ShadyF/meeting-recorder/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.4
 [0.4.3]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.3
