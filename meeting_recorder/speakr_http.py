@@ -1128,7 +1128,21 @@ class StdlibSpeakrTransport:
         # Use declared page counts when available.
         total_pages = metadata.get("total_pages", metadata.get("pages"))
         if total_pages is not None:
-            if type(total_pages) is not int or total_pages < requested_page:
+            # Accept the API's zero-match sentinel only when every count agrees.
+            has_prev = metadata.get("has_prev", metadata.get("hasPrev"))
+            zero_match_page = (
+                requested_page == 1
+                and not raw_items
+                and type(total_pages) is int
+                and total_pages == 0
+                and type(metadata.get("total")) is int
+                and metadata["total"] == 0
+                and has_next is False
+                and (has_prev is None or has_prev is False)
+            )
+            if type(total_pages) is not int:
+                raise ReconciliationUnavailable
+            if total_pages < requested_page and not zero_match_page:
                 raise ReconciliationUnavailable
             derived_next = (
                 requested_page + 1

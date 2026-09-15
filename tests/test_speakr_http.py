@@ -655,6 +655,149 @@ def test_reconciliation_returns_exact_zero_one_or_multiple_matches() -> None:
             ) == expected
 
 
+def test_reconciliation_accepts_empty_first_page_zero_total_zero_pages() -> None:
+    payload = {
+        "recordings": [],
+        "pagination": {
+            "has_next": False,
+            "has_prev": False,
+            "page": 1,
+            "per_page": 100,
+            "total": 0,
+            "total_pages": 0,
+        },
+    }
+
+    # Exercise the exact authenticated HTTP response through reconciliation.
+    with fake_speakr_server(recording_pages=(payload,)) as (url, _):
+        assert StdlibSpeakrTransport(timeout_seconds=2).reconcile_recordings(
+            url, TOKEN, "abc",
+        ) == ()
+
+
+def test_reconciliation_rejects_each_invalid_zero_match_sentinel_condition() -> None:
+    valid_pagination = {
+        "has_next": False,
+        "has_prev": False,
+        "page": 1,
+        "per_page": 100,
+        "total": 0,
+        "total_pages": 0,
+    }
+
+    # Change one zero-match sentinel condition in each case.
+    cases = (
+        ("nonempty recordings", [{"id": 7, "title": "other"}], {}),
+        ("total one", [], {"total": 1}),
+        ("missing total", [], {"total": None}),
+        ("boolean total", [], {"total": False}),
+        ("float total", [], {"total": 0.0}),
+        ("boolean total pages", [], {"total_pages": False}),
+        ("float total pages", [], {"total_pages": 0.0}),
+        ("numeric has next", [], {"has_next": 0}),
+        ("numeric has prev", [], {"has_prev": 0}),
+    )
+
+    # Omit total for its missing-value case while preserving every other field.
+    for name, recordings, changes in cases:
+        # Copy the valid metadata before changing one condition.
+        pagination = valid_pagination.copy()
+
+        # Remove total only for the missing-value case.
+        if "total" in changes and changes["total"] is None:
+            del pagination["total"]
+        else:
+            pagination.update(changes)
+
+        # Reject the changed response through the real reconciliation path.
+        payload = {"recordings": recordings, "pagination": pagination}
+        with fake_speakr_server(recording_pages=(payload,)) as (url, _):
+            try:
+                StdlibSpeakrTransport(timeout_seconds=2).reconcile_recordings(
+                    url, TOKEN, "abc",
+                )
+            except ReconciliationUnavailable:
+                pass
+            else:
+                raise AssertionError(f"{name} zero-match sentinel was accepted")
+
+
+def test_reconciliation_rejects_inconsistent_zero_page_metadata() -> None:
+    inconsistent_pages = (
+        {
+            "recordings": [{"id": 7, "title": "[mr:abc] one"}],
+            "pagination": {
+                "has_next": False,
+                "page": 1,
+                "total": 1,
+                "total_pages": 0,
+            },
+        },
+        {
+            "recordings": [],
+            "pagination": {
+                "has_next": False,
+                "has_prev": True,
+                "page": 1,
+                "total": 0,
+                "total_pages": 0,
+            },
+        },
+        {
+            "recordings": [],
+            "pagination": {
+                "has_next": True,
+                "page": 1,
+                "total": 0,
+                "total_pages": 0,
+            },
+        },
+    )
+
+    # Reject zero-page metadata unless it describes the one safe empty result.
+    for payload in inconsistent_pages:
+        with fake_speakr_server(recording_pages=(payload,)) as (url, _):
+            try:
+                StdlibSpeakrTransport(timeout_seconds=2).reconcile_recordings(
+                    url, TOKEN, "abc",
+                )
+            except ReconciliationUnavailable:
+                pass
+            else:
+                raise AssertionError("inconsistent zero-page metadata was accepted")
+
+    # Reject the same zero-page sentinel when it appears on an advertised later page.
+    first_page = {
+        "recordings": [{"id": 7, "title": "other"}],
+        "pagination": {
+            "has_next": True,
+            "page": 1,
+            "total": 101,
+            "total_pages": 2,
+        },
+    }
+    later_empty_page = {
+        "recordings": [],
+        "pagination": {
+            "has_next": False,
+            "page": 2,
+            "total": 0,
+            "total_pages": 0,
+        },
+    }
+    with fake_speakr_server(
+        recording_pages=(first_page, later_empty_page),
+    ) as (url, _):
+        try:
+            StdlibSpeakrTransport(timeout_seconds=2).reconcile_recordings(
+                url, TOKEN, "abc",
+            )
+        except ReconciliationUnavailable:
+            pass
+        else:
+            raise AssertionError("later zero-page metadata was accepted")
+
+
 def test_reconciliation_rejects_unsafe_marker_and_bounds_pages_items_and_body(
 ) -> None:
     # Reject marker input that could change the server-side search semantics.
