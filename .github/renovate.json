@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "dependencyDashboard": true,
+  "automerge": false,
+  "enabledManagers": ["dockerfile", "github-actions"],
+  "dockerfile": {
+    "managerFilePatterns": [
+      "/^Containerfile$/",
+      "/^\\.devcontainer/Dockerfile$/"
+    ]
+  },
+  "ignorePaths": ["deploy/bluefin/meeting-recorder.container"],
+  "packageRules": [
+    {
+      "description": "Group GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "Group container image updates",
+      "matchManagers": ["dockerfile"],
+      "groupName": "container images"
+    }
+  ]
+}
