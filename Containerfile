@@ -1,5 +1,5 @@
 # Keep the runtime base stable so image rebuilds use the reviewed Ubuntu image.
-FROM docker.io/library/ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
+FROM docker.io/library/ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4
 
 # Keep release metadata overridable without adding a publishing step to the image build.
 ARG OCI_TITLE="Smart Meeting Recorder"
