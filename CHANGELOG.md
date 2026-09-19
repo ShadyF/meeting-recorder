@@ -6,6 +6,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-19
+
+### Added
+- `speakr upload --retry-all` retries a fixed snapshot of action-required jobs
+  after origin, network, and bearer-token preflight; terminal uncertain jobs emit
+  one duplicate-risk warning before sequential processing.
+
 ## [0.5.1] — 2026-09-15
 
 ### Fixed
@@ -449,7 +456,8 @@ First release.
   apply to new recordings only.
 - Drag-selecting a capture region needs the optional `slop` package.
 
-[Unreleased]: https://github.com/ShadyF/meeting-recorder/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/ShadyF/meeting-recorder/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ShadyF/meeting-recorder/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/ShadyF/meeting-recorder/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ShadyF/meeting-recorder/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/ShadyF/meeting-recorder/releases/tag/v0.4.4

@@ -340,6 +340,22 @@ class SpeakrPublisher:
         origin = self._origin(instance_url)
         return [job for job in jobs if job.key.instance_url == origin]
 
+    def action_required_jobs(self, instance_url: str) -> tuple[PublicationJob, ...]:
+        """Snapshot operator-retryable jobs for one origin in stable store order."""
+        origin = self._origin(instance_url)
+
+        # Read the selected states once so later retries cannot enter this command's snapshot.
+        candidates = self.list(
+            (PublicationState.BLOCKED, PublicationState.MISSING, PublicationState.UNCERTAIN),
+            instance_url=origin,
+        )
+
+        # Keep active reconciliation with the normal worker instead of authorizing a duplicate POST.
+        return tuple(
+            job for job in candidates
+            if job.state is not PublicationState.UNCERTAIN or not job.reconciliation_eligible
+        )
+
     def due_job_ids(
         self,
         instance_url: str,

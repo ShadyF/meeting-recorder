@@ -480,10 +480,11 @@ fails closed. An SSID match is only an admission gate, not authentication. HTTPS
 token authentication, recording-hash and file identity checks, lease fencing,
 reconciliation rules, and other file-safety checks still apply.
 
-The normal network forms are `upload PATH`, `upload --all`, and `upload --retry
-JOB`; each is SSID-gated. `--force` is accepted only with those three forms and
-bypasses only the SSID gate. The local forms `upload --status JOB`, `upload
---status --all`, `upload --relink JOB NEW_PATH`, and `upload --forget JOB` do not
+The normal network forms are `upload PATH`, `upload --all`, `upload --retry
+JOB`, and `upload --retry-all`; each is SSID-gated. `--force` is accepted only
+with those forms and bypasses only the SSID gate. The local forms
+`upload --status JOB`, `upload --status --all`, `upload --relink JOB NEW_PATH`,
+and `upload --forget JOB` do not
 perform network publication and do not use the SSID gate.
 
 The daemon's publication worker keeps hashing, SQLite access, token reads,
@@ -493,7 +494,14 @@ whether a Recording succeeded. Publication jobs retain the durable recovery
 semantics described below: uncertain media transfers are not automatically resent,
 `metadata_pending` retries only the metadata PATCH, and a `published` rerun sends
 nothing. Use explicit `--retry` when an action-required state requires operator
-authorization.
+authorization. Use `--retry-all` to take one fixed snapshot of the configured
+origin's `blocked`, `missing`, and terminal `uncertain` jobs, then retry them in
+order. It does not include an `uncertain` job still eligible for safe
+reconciliation. The command validates the origin, SSID admission, and bearer token
+before changing any selected job. It prints one safe job ID and outcome per selected
+job plus attempted/published/unresolved totals; it returns success only when every
+selected job publishes (or when no jobs match). A terminal-uncertain match emits one
+duplicate-risk warning because its retry can resend a non-idempotent media POST.
 
 For a matched visible Meeting, the publisher sends the current title, scheduled
 time, description/location notes, and participants. A hidden matched Meeting

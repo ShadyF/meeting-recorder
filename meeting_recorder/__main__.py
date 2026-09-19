@@ -740,6 +740,7 @@ def _cmd_speakr_upload(
     status_job: str | None = None,
     status_all: bool = False,
     retry_job: str | None = None,
+    retry_all: bool = False,
     relink_job: str | None = None,
     relink_path: str | None = None,
     forget_job: str | None = None,
@@ -748,9 +749,11 @@ def _cmd_speakr_upload(
     """Run one explicit Speakr operation without exposing private values."""
     from .speakr_domain import PublicationState
 
+    # Count operation selectors before rejecting combinations with path and batch forms.
     operation_count = sum(item is not None for item in (
         status_job, retry_job, relink_job, forget_job,
     ))
+    operation_count += retry_all
     if status_all and status_job is not None:
         print("Speakr: --status JOB cannot be combined with --status --all.", file=sys.stderr)
         return 2
@@ -765,7 +768,7 @@ def _cmd_speakr_upload(
         return 2
     if force and (status_all or status_job is not None or relink_job is not None
                   or forget_job is not None):
-        print("Speakr: --force is allowed only with PATH, --all, or --retry JOB.",
+        print("Speakr: --force is allowed only with PATH, --all, --retry JOB, or --retry-all.",
               file=sys.stderr)
         return 2
     if not any((path is not None, all_jobs, status_all, operation_count)):
@@ -819,6 +822,57 @@ def _cmd_speakr_upload(
         instance_url = _speakr_origin(cfg)
         if instance_url is None:
             return 2
+        if retry_all:
+            # Snapshot all action-required jobs before network or credential preflight.
+            snapshot = publisher.action_required_jobs(instance_url)
+
+            # Stop locally when the configured origin has no matching work.
+            if not snapshot:
+                print("Speakr: no action-required publication jobs.")
+                return 0
+
+            # Warn once when the fixed snapshot authorizes potentially duplicate media transfers.
+            if any(job.state is PublicationState.UNCERTAIN for job in snapshot):
+                print(
+                    "WARNING: retrying terminal uncertain jobs may create duplicate Speakr recordings.",
+                    file=sys.stderr,
+                )
+
+            # Validate shared publication prerequisites before changing any selected job.
+            if not _speakr_network_allowed(cfg, force):
+                return _SPEAKR_WAIT_CODE
+            token = _speakr_token()
+            if token is None:
+                return 1
+
+            # Count every selected job once, including jobs that become unavailable before reset.
+            attempted = 0
+            published = 0
+            unresolved = 0
+            for job in snapshot:
+                attempted += 1
+                try:
+                    # Reset only the job about to run so interruption preserves later snapshot rows.
+                    reset = publisher.retry(job.job_id)
+                    result = publisher.run_one(instance_url, token, reset.job_id)
+                except Exception:
+                    result = None
+                if result is not None and result.job.state is PublicationState.PUBLISHED:
+                    published += 1
+                    print(f"Speakr: {job.job_id}: published")
+                    continue
+
+                # Report only the safe job ID and public state when a job cannot complete.
+                unresolved += 1
+                if result is None:
+                    print(f"Speakr: {job.job_id}: unresolved")
+                else:
+                    print(f"Speakr: {job.job_id}: unresolved ({result.job.state.value})")
+            print(
+                "Speakr: retry-all totals: "
+                f"attempted={attempted} published={published} unresolved={unresolved}"
+            )
+            return 0 if unresolved == 0 else 1
         if retry_job is not None:
             retry_result = publisher.get(retry_job)
             if retry_result is None:
@@ -1185,7 +1239,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print one job status, or use --status --all")
     action_group = upload.add_mutually_exclusive_group()
     action_group.add_argument("--retry", dest="retry_job", metavar="JOB",
-                              help="explicitly authorize and retry one job")
+                               help="explicitly authorize and retry one job")
+    action_group.add_argument("--retry-all", action="store_true",
+                              help="retry every action-required job for the configured origin")
     action_group.add_argument("--relink", dest="relink_args", nargs=2,
                               metavar=("JOB", "NEW_PATH"), help="securely relink one job")
     action_group.add_argument("--forget", dest="forget_job", metavar="JOB",
@@ -1197,11 +1253,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
 
     args = parser.parse_args(argv)
+    # Reject ambiguous Speakr upload forms before configuration loading or command dispatch.
     if args.command == "speakr" and args.speakr_command == "upload":
         if args.status == "" and not args.all_jobs:
             parser.error("speakr upload --status requires --all when JOB is omitted")
         if args.status not in (None, "") and args.all_jobs:
             parser.error("speakr upload --status JOB cannot be combined with --all")
+        if args.retry_all and (args.path is not None or args.all_jobs or args.status is not None):
+            parser.error("speakr upload --retry-all cannot be combined with another upload form")
     setup_logging(args.verbose)
     if (args.command == "calendar" and args.calendar_command == "correct"):
         try:
@@ -1243,6 +1302,7 @@ def main(argv: list[str] | None = None) -> int:
                 status_job=status_job,
                 status_all=status_all,
                 retry_job=args.retry_job,
+                retry_all=args.retry_all,
                 relink_job=relink_args[0],
                 relink_path=relink_args[1],
                 forget_job=args.forget_job,

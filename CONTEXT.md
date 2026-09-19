@@ -103,6 +103,11 @@ through `local_removed`. Uncertain media transfers are not automatically resent,
 metadata-pending jobs retry PATCH only, and published reruns send nothing.
 _Avoid_: Upload record, queue item
 
+**Action-required Publication job**:
+A Publication job in `blocked`, `missing`, or terminal `uncertain` state that
+requires an operator decision or correction before publication can continue.
+_Avoid_: Failed upload, failing upload
+
 **Publication cleanup**:
 An explicit CLI-only operation that previews or irreversibly removes a local
 Recording and, when present, its exact adjacent Meeting sidecar after the

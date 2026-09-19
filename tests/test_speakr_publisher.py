@@ -133,6 +133,46 @@ def test_enqueue_reuses_normalized_origin_and_sha_without_credentials() -> None:
         directory.cleanup()
 
 
+def test_action_required_jobs_snapshots_terminal_states_for_one_origin() -> None:
+    # Build terminal blocked and missing rows without contacting Speakr.
+    directory, root, media, now, store, transport, publisher = _setup()
+    try:
+        blocked = publisher.enqueue(media, ORIGIN)
+        store.transition(blocked.job_id, PublicationState.BLOCKED, error_code="protocol_error")
+
+        missing_path = root / "missing.mkv"
+        missing_path.write_bytes(b"missing")
+        missing = publisher.enqueue(missing_path, ORIGIN)
+        store.transition(missing.job_id, PublicationState.MISSING, error_code="local_missing")
+
+        # Produce one terminal uncertainty and one active reconciliation row.
+        terminal_path = root / "terminal.mkv"
+        terminal_path.write_bytes(b"terminal")
+        transport.upload_error = TransferOutcomeUnknown()
+        transport.reconcile_ids = ()
+        terminal = publisher.publish(terminal_path, ORIGIN, TOKEN).job
+
+        active_path = root / "active.mkv"
+        active_path.write_bytes(b"active")
+        transport.reconcile_error = ReconciliationUnavailable()
+        active = publisher.publish(active_path, ORIGIN, TOKEN).job
+
+        # Ignore matching states stored under another configured Speakr origin.
+        other_path = root / "other.mkv"
+        other_path.write_bytes(b"other")
+        other = publisher.enqueue(other_path, "https://other.example")
+        store.transition(other.job_id, PublicationState.BLOCKED, error_code="protocol_error")
+
+        # Keep only terminal action-required jobs from the configured origin.
+        snapshot = publisher.action_required_jobs(ORIGIN)
+        assert {job.job_id for job in snapshot} == {blocked.job_id, missing.job_id, terminal.job_id}
+        assert terminal.state is PublicationState.UNCERTAIN and not terminal.reconciliation_eligible
+        assert active.reconciliation_eligible
+    finally:
+        # Remove the isolated database and recordings.
+        directory.cleanup()
+
+
 def test_tag_validation_filters_catalog_order_and_transient_reconciliation_assumes_submission() -> None:
     directory, root, media, now, store, transport, publisher = _setup()
     try:

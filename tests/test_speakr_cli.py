@@ -65,10 +65,24 @@ class FakePublisher:
         self.calls.append(("get", reference))
         return self.jobs.get(reference)
 
-    def list(self):
+    def list(self, states=None, instance_url=None):
         # Record local list requests and return the current fake rows.
-        self.calls.append(("list",))
-        return list(self.jobs.values())
+        self.calls.append(("list", states, instance_url))
+        return [
+            job for job in self.jobs.values()
+            if (states is None or job.state in states)
+            and (instance_url is None or job.key.instance_url == instance_url)
+        ]
+
+    def action_required_jobs(self, origin):
+        # Return the command-start action-required snapshot in insertion order.
+        self.calls.append(("action_required_jobs", origin))
+        return tuple(
+            job for job in self.jobs.values()
+            if job.key.instance_url == origin
+            and job.state in {PublicationState.BLOCKED, PublicationState.MISSING, PublicationState.UNCERTAIN}
+            and not (job.state is PublicationState.UNCERTAIN and job.reconciliation_eligible)
+        )
 
     def enqueue(self, path, origin):
         # Create a fake queued row for path-form command tests.
@@ -127,7 +141,8 @@ def _output(callable_object, *args, **kwargs) -> tuple[int, str]:
 def _run_with_fake(fake: FakePublisher, **kwargs) -> tuple[int, str]:
     # Replace configuration and construction so each test observes only CLI calls.
     # These legacy routing tests use force; focused runtime tests cover NetworkManager admission.
-    if kwargs.get("path") is not None or kwargs.get("all_jobs") or kwargs.get("retry_job"):
+    if (kwargs.get("path") is not None or kwargs.get("all_jobs") or kwargs.get("retry_job")
+            or kwargs.get("retry_all")):
         kwargs.setdefault("force", True)
     with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
             patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
@@ -144,7 +159,7 @@ def test_speakr_parser_exposes_all_decision_forms_and_rejects_credential_flags()
     parser = build_parser()
     forms = (
         ["recording.mkv"], ["--all"], ["--status", "JOB"],
-        ["--status", "--all"], ["--retry", "JOB"],
+        ["--status", "--all"], ["--retry", "JOB"], ["--retry-all"],
         ["--relink", "JOB", "new.mkv"], ["--forget", "JOB"],
     )
 
@@ -525,6 +540,91 @@ def test_normal_retry_admission_does_not_reset_the_job() -> None:
 
     assert result == 3
     assert not any(call[0] in ("retry", "run_one") for call in fake.calls)
+
+
+def test_retry_all_preflight_and_empty_snapshot_do_not_mutate_jobs() -> None:
+    # A missing shared token leaves every selected action-required job untouched.
+    selected = _job("selected", PublicationState.BLOCKED)
+    fake = FakePublisher((selected,))
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=ValueError):
+        result, output = _output(
+            _cmd_speakr_upload,
+            SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=ALLOWED_SSIDS),
+            retry_all=True, force=True,
+        )
+    assert result == 1 and "token" in output
+    assert not any(call[0] in {"retry", "run_one", "block_configuration"} for call in fake.calls)
+
+    # An empty local snapshot avoids both the network gate and bearer-token lookup.
+    empty = FakePublisher()
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=empty), \
+            patch("meeting_recorder.__main__.resolve_speakr_url", return_value=ORIGIN), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=AssertionError), \
+            patch("meeting_recorder.network_manager.NetworkManagerSSIDAdapter", side_effect=AssertionError):
+        result, output = _output(
+            _cmd_speakr_upload,
+            SimpleNamespace(speakr_url=ORIGIN, speakr_allowed_ssid_bytes=ALLOWED_SSIDS),
+            retry_all=True,
+        )
+    assert result == 0 and "no action-required" in output
+    assert ("action_required_jobs", ORIGIN) in empty.calls
+
+
+def test_retry_all_warns_once_continues_after_unresolved_and_uses_human_output() -> None:
+    # Include a terminal uncertain job and a blocked job in the fixed command snapshot.
+    uncertain = _job("uncertain", PublicationState.UNCERTAIN, operation="none", resume_intent="reconcile")
+    blocked = _job("blocked", PublicationState.BLOCKED)
+    fake = FakePublisher((uncertain, blocked))
+
+    # Let the first job remain unresolved while the second one publishes.
+    outcomes = {
+        uncertain.job_id: None,
+        blocked.job_id: _result(_job(blocked.job_id, PublicationState.PUBLISHED)),
+    }
+
+    def run_one(origin, token, reference):
+        # Capture sequential execution and return the configured public result.
+        fake.calls.append(("run_one", origin, token, reference))
+        return outcomes[reference]
+
+    fake.run_one = run_one  # type: ignore[method-assign]
+    result, output = _run_with_fake(fake, retry_all=True)
+
+    # The command warns once, continues, and does not emit status JSON or private paths.
+    assert result == 1
+    assert output.lower().count("duplicate") == 1
+    assert "Speakr: uncertain: unresolved" in output
+    assert "Speakr: blocked: published" in output
+    assert "attempted=2 published=1 unresolved=1" in output
+    assert "{" not in output and TOKEN not in output
+    assert [call[0:2] for call in fake.calls if call[0] in {"retry", "run_one"}] == [
+        ("retry", uncertain.job_id), ("run_one", ORIGIN),
+        ("retry", blocked.job_id), ("run_one", ORIGIN),
+    ]
+
+
+def test_retry_all_parser_rejects_ambiguous_upload_forms_and_allows_force() -> None:
+    # Force remains available for the new network operation.
+    parser = build_parser()
+    assert parser.parse_args(["speakr", "upload", "--retry-all", "--force"]).force
+
+    # Main applies cross-argument ambiguity rules before configuration loading.
+    for argv in (
+        ["speakr", "upload", "recording.mkv", "--retry-all"],
+        ["speakr", "upload", "--all", "--retry-all"],
+        ["speakr", "upload", "--status", "JOB", "--retry-all"],
+        ["speakr", "upload", "--retry", "JOB", "--retry-all"],
+        ["speakr", "upload", "--relink", "JOB", "new.mkv", "--retry-all"],
+        ["speakr", "upload", "--forget", "JOB", "--retry-all"],
+    ):
+        try:
+            main(argv)
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError("ambiguous retry-all form was accepted")
 
 
 def test_no_due_all_skips_network_adapter_and_token() -> None:
