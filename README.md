@@ -251,8 +251,8 @@ meeting-recorder calendar connect|status|disconnect  # manage Calendar credentia
 meeting-recorder calendar client-secret set|status|clear  # manage a required client secret
 meeting-recorder speakr upload PATH [--force]         # publish one Recording
 meeting-recorder speakr upload --all [--force]       # attempt all due jobs
-meeting-recorder speakr upload --status JOB
-meeting-recorder speakr upload --status --all
+meeting-recorder speakr upload --status JOB [--json]
+meeting-recorder speakr upload --status --all [--json]
 meeting-recorder speakr upload --retry JOB [--force]
 meeting-recorder speakr upload --relink JOB NEW_PATH
 meeting-recorder speakr upload --forget JOB
@@ -520,8 +520,10 @@ resent. A rejected transfer may be retried only by explicitly rerunning the
 command. `metadata_pending` retries only the metadata PATCH, while a `published`
 rerun sends no requests.
 
-`meeting-recorder speakr upload --status JOB` and `--status --all` are the only
-places tag application details appear. Their JSON includes `effective_tags`,
+`meeting-recorder speakr upload --status JOB` and `--status --all` print a plain
+table with `Job`, `State`, `Attempts`, and `Issue` columns. Job IDs shorten to
+fit the terminal and long issues wrap. Use `--json` for the exact one-object
+or one-object-per-line JSON output; it includes `effective_tags`,
 `missing_tags`, `upload_tags_unknown`, and `sidecar_warning`. A fresh validation
 reports the exact accessible selected tags as `effective_tags` and deleted or
 inaccessible selections as `missing_tags`; those missing entries are omitted from

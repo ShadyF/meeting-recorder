@@ -6,6 +6,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-09-19
+
+### Changed
+- `speakr upload --status JOB` and `--status --all` now default to a compact,
+  width-aware status table; use `--json` to retain the prior machine-readable
+  output.
+
 ## [0.6.0] — 2026-09-19
 
 ### Added
@@ -456,7 +463,8 @@ First release.
   apply to new recordings only.
 - Drag-selecting a capture region needs the optional `slop` package.
 
-[Unreleased]: https://github.com/ShadyF/meeting-recorder/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ShadyF/meeting-recorder/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/ShadyF/meeting-recorder/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ShadyF/meeting-recorder/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/ShadyF/meeting-recorder/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ShadyF/meeting-recorder/compare/v0.4.4...v0.5.0

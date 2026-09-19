@@ -22,9 +22,11 @@ import getpass
 import json
 import os
 import signal
+import shutil
 import stat
 import subprocess
 import sys
+import textwrap
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -660,6 +662,149 @@ def _speakr_status(job: PublicationJob) -> dict[str, object]:
     }
 
 
+def _speakr_humanize(value: object) -> str:
+    """Turn a stored underscore value into a short table label."""
+    text = str(value).replace("_", " ")
+    return text[:1].upper() + text[1:]
+
+
+def _speakr_issue(status: dict[str, object]) -> str:
+    """Combine every actionable status detail into one wrapped table cell."""
+    parts: list[str] = []
+    error_code = status.get("last_error_code")
+    http_status = status.get("last_http_status")
+
+    # Keep the error and its HTTP response together so neither explains the other away.
+    if error_code is not None and http_status is not None:
+        parts.append(f"{_speakr_humanize(error_code)} (HTTP {http_status})")
+    elif error_code is not None:
+        parts.append(_speakr_humanize(error_code))
+    elif http_status is not None:
+        parts.append(f"HTTP {http_status}")
+
+    # Report only a non-zero missing-tag count; an empty known set is healthy.
+    missing_tags = status.get("missing_tags")
+    if isinstance(missing_tags, (list, tuple)) and missing_tags:
+        count = len(missing_tags)
+        parts.append(f"{count} missing tag" if count == 1 else f"{count} missing tags")
+
+    # Preserve both independent warnings because each needs a different operator action.
+    if status.get("upload_tags_unknown"):
+        parts.append("Upload tags unknown")
+    if status.get("sidecar_warning"):
+        parts.append("Sidecar warning")
+
+    return "; ".join(parts) if parts else "—"
+
+
+def _speakr_short_job_id(job_id: str, width: int) -> str:
+    """Shorten a job ID with a visible ellipsis while preserving both ends."""
+    # Keep the complete ID whenever the selected column can hold it.
+    if len(job_id) <= width:
+        return job_id
+    # Use the narrowest visible marker when the terminal leaves almost no space.
+    if width <= 1:
+        return "…"[:width]
+    prefix_width = (width - 1) // 2
+    suffix_width = width - prefix_width - 1
+    return f"{job_id[:prefix_width]}…{job_id[-suffix_width:]}"
+
+
+def _speakr_color(text: str, code: str | None, enabled: bool) -> str:
+    """Apply one semantic ANSI color only when stdout is interactive."""
+    # Never add control sequences to redirected or captured output.
+    if not enabled or code is None:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _speakr_state_color(state: str) -> str | None:
+    """Choose a semantic color for one publication state."""
+    # Use green for success, red for terminal failure, and bright colors for work in progress.
+    if state == "published":
+        return "32"
+    if state in {"blocked", "missing", "uncertain"}:
+        return "31"
+    if state == "transferring":
+        return "36"
+    return "33"
+
+
+def _speakr_issue_color(status: dict[str, object]) -> str | None:
+    """Choose warning or error color without changing issue text."""
+    # Prioritize a recorded transport failure over secondary tag warnings.
+    if status.get("last_error_code") is not None or status.get("last_http_status") is not None:
+        return "31"
+    # Tag and sidecar conditions need attention but are not media transfer failures.
+    if status.get("missing_tags") or status.get("upload_tags_unknown") or status.get("sidecar_warning"):
+        return "33"
+    return None
+
+
+def _speakr_status_table(jobs: list[PublicationJob]) -> None:
+    """Print status rows as a width-aware, plain aligned table."""
+    # Project each job once so width calculation and rendering use the same details.
+    rows = [
+        (_speakr_status(job), _speakr_humanize(job.state.value), str(job.attempt_count))
+        for job in jobs
+    ]
+    job_width = max([len(str(row[0]["job_id"])) for row in rows] + [len("Job")])
+    state_width = max([len(row[1]) for row in rows] + [len("State")])
+    attempts_width = max([len(row[2]) for row in rows] + [len("Attempts")])
+    issue_width_min = len("Issue")
+    fixed_width = state_width + attempts_width + 6
+
+    # Reserve the fixed columns first, then decide whether the full IDs fit.
+    terminal_width = max(1, shutil.get_terminal_size(fallback=(80, 24)).columns)
+    if not rows:
+        # Keep an empty table compact instead of stretching its unused Issue column.
+        issue_width = issue_width_min
+    elif fixed_width + job_width + issue_width_min <= terminal_width:
+        issue_width = max(issue_width_min, terminal_width - fixed_width - job_width)
+    else:
+        # Give long issue text room to wrap before shortening an over-wide ID.
+        desired_issue_width = min(
+            max([len(_speakr_issue(row[0])) for row in rows] + [issue_width_min]), 24,
+        )
+        job_width = max(
+            len("Job"),
+            min(job_width, terminal_width - fixed_width - desired_issue_width),
+        )
+        issue_width = max(issue_width_min, terminal_width - fixed_width - job_width)
+
+    # Keep the header and its separator stable, including for an empty job list.
+    print(f"{'Job':<{job_width}}  {'State':<{state_width}}  "
+          f"{'Attempts':<{attempts_width}}  {'Issue':<{issue_width}}".rstrip())
+    print(f"{'-' * job_width}  {'-' * state_width}  "
+          f"{'-' * attempts_width}  {'-' * issue_width}".rstrip())
+    color_enabled = bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+    # Render each wrapped issue as continuation lines under the same issue column.
+    for status, state, attempts in rows:
+        issue = _speakr_issue(status)
+        issue_lines = textwrap.wrap(
+            issue, width=max(1, issue_width), break_long_words=True, break_on_hyphens=False,
+        ) or [""]
+        shortened_job_id = _speakr_short_job_id(str(status["job_id"]), job_width)
+        # Print the issue continuation below the first line without repeating row metadata.
+        for index, issue_line in enumerate(issue_lines):
+            job_cell = shortened_job_id if index == 0 else ""
+            state_cell = state if index == 0 else ""
+            attempts_cell = attempts if index == 0 else ""
+            colored_state = _speakr_color(
+                state_cell, _speakr_state_color(str(status["state"])), color_enabled,
+            )
+            colored_issue = _speakr_color(
+                issue_line, _speakr_issue_color(status), color_enabled,
+            )
+            state_padding = " " * max(0, state_width - len(state_cell))
+            issue_padding = " " * max(0, issue_width - len(issue_line))
+            print(
+                f"{job_cell:<{job_width}}  {colored_state}{state_padding}  "
+                f"{attempts_cell:<{attempts_width}}  {colored_issue}{issue_padding}".rstrip()
+            )
+
+
 def _print_speakr_status(job: PublicationJob) -> None:
     print(json.dumps(_speakr_status(job), sort_keys=True))
 
@@ -739,6 +884,7 @@ def _cmd_speakr_upload(
     all_jobs: bool = False,
     status_job: str | None = None,
     status_all: bool = False,
+    json_output: bool = False,
     retry_job: str | None = None,
     retry_all: bool = False,
     relink_job: str | None = None,
@@ -766,6 +912,10 @@ def _cmd_speakr_upload(
     if status_all and operation_count:
         print("Speakr: Speakr upload options are ambiguous.", file=sys.stderr)
         return 2
+    # Keep JSON as an explicit status-only presentation choice.
+    if json_output and status_job is None and not status_all:
+        print("Speakr: --json requires --status.", file=sys.stderr)
+        return 2
     if force and (status_all or status_job is not None or relink_job is not None
                   or forget_job is not None):
         print("Speakr: --force is allowed only with PATH, --all, --retry JOB, or --retry-all.",
@@ -787,15 +937,23 @@ def _cmd_speakr_upload(
     # Local inspection and mutations intentionally do not resolve credentials.
     if status_job is not None or status_all:
         if status_all:
-            for job in publisher.list():
-                _print_speakr_status(job)
+            # Batch status retains publisher order in either presentation format.
+            jobs = publisher.list()
+            if json_output:
+                for job in jobs:
+                    _print_speakr_status(job)
+            else:
+                _speakr_status_table(jobs)
             return 0
         assert status_job is not None
         status_result = publisher.get(status_job)
         if status_result is None:
             print("Speakr: publication job was not found.", file=sys.stderr)
             return 2
-        _print_speakr_status(status_result)
+        if json_output:
+            _print_speakr_status(status_result)
+        else:
+            _speakr_status_table([status_result])
         return 0
     if relink_job is not None:
         try:
@@ -1236,7 +1394,9 @@ def build_parser() -> argparse.ArgumentParser:
     upload.add_argument("--force", action="store_true",
                         help="skip the allowed-SSID check for this explicit operation")
     upload.add_argument("--status", nargs="?", const="", default=None, metavar="JOB",
-                        help="print one job status, or use --status --all")
+                        help="print one job in the status table, or use --status --all")
+    upload.add_argument("--json", dest="json_output", action="store_true",
+                        help="emit status as the legacy sorted-key JSON format")
     action_group = upload.add_mutually_exclusive_group()
     action_group.add_argument("--retry", dest="retry_job", metavar="JOB",
                                help="explicitly authorize and retry one job")
@@ -1259,6 +1419,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("speakr upload --status requires --all when JOB is omitted")
         if args.status not in (None, "") and args.all_jobs:
             parser.error("speakr upload --status JOB cannot be combined with --all")
+        if args.json_output and args.status is None:
+            parser.error("speakr upload --json requires --status")
         if args.retry_all and (args.path is not None or args.all_jobs or args.status is not None):
             parser.error("speakr upload --retry-all cannot be combined with another upload form")
     setup_logging(args.verbose)
@@ -1301,6 +1463,7 @@ def main(argv: list[str] | None = None) -> int:
                 all_jobs=args.all_jobs,
                 status_job=status_job,
                 status_all=status_all,
+                json_output=args.json_output,
                 retry_job=args.retry_job,
                 retry_all=args.retry_all,
                 relink_job=relink_args[0],

@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -32,6 +33,9 @@ def _job(
     operation: str = "post",
     resume_intent: str = "post",
     origin: str = ORIGIN,
+    missing_tags=None,
+    upload_tags_unknown: bool = False,
+    sidecar_warning: bool = False,
 ):
     # Return the smallest job-shaped object needed by the command handlers.
     return SimpleNamespace(
@@ -45,6 +49,9 @@ def _job(
         remote_recording_id=42,
         last_error_code="transfer_unknown",
         last_http_status=503,
+        missing_tags=missing_tags,
+        upload_tags_unknown=upload_tags_unknown,
+        sidecar_warning=sidecar_warning,
         reconciliation_eligible=operation == "reconcile",
     )
 
@@ -159,7 +166,8 @@ def test_speakr_parser_exposes_all_decision_forms_and_rejects_credential_flags()
     parser = build_parser()
     forms = (
         ["recording.mkv"], ["--all"], ["--status", "JOB"],
-        ["--status", "--all"], ["--retry", "JOB"], ["--retry-all"],
+        ["--status", "JOB", "--json"], ["--status", "--all"],
+        ["--status", "--all", "--json"], ["--retry", "JOB"], ["--retry-all"],
         ["--relink", "JOB", "new.mkv"], ["--forget", "JOB"],
     )
 
@@ -259,7 +267,7 @@ def test_existing_command_dispatch_remains_unchanged() -> None:
 
 
 def test_status_and_status_all_are_local_and_secret_free() -> None:
-    # Status for one job must not resolve credentials or contact the network.
+    # Status for one job uses the table by default and never resolves credentials.
     job = _job()
     fake = FakePublisher((job,))
     with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
@@ -268,18 +276,112 @@ def test_status_and_status_all_are_local_and_secret_free() -> None:
             _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), status_job=job.job_id,
         )
         assert result == 0
-        assert job.job_id in output and HASH in output
+        assert "Job" in output and "State" in output and "Attempts" in output
+        assert job.job_id in output and "Transfer unknown" in output and "HTTP 503" in output
+        assert HASH not in output
         assert TOKEN not in output and "Design review" not in output
         assert not any(call[0] == "run_one" for call in fake.calls)
 
-    # Listing all jobs follows the same local, secret-free path.
+    # JSON keeps the previous sorted-key object contract for one job.
+    fake = FakePublisher((job,))
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.require_speakr_token", side_effect=AssertionError):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), status_job=job.job_id,
+            json_output=True,
+        )
+    assert result == 0 and json.loads(output)["sha256"] == HASH
+
+    # Listing all jobs follows the same local, secret-free table path.
     fake = FakePublisher((job,))
     with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
             patch("meeting_recorder.__main__.require_speakr_token", side_effect=AssertionError):
         result, output = _output(
             _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), all_jobs=True, status_all=True,
         )
-    assert result == 0 and job.job_id in output and TOKEN not in output
+    assert result == 0 and job.job_id in output and "Issue" in output and TOKEN not in output
+
+
+def test_status_table_combines_issues_and_humanizes_values() -> None:
+    # One row must retain every actionable condition in the single Issue column.
+    job = _job(
+        "combined", PublicationState.METADATA_PENDING,
+        missing_tags=(SimpleNamespace(tag_id=1, name="missing"),),
+        upload_tags_unknown=True,
+        sidecar_warning=True,
+    )
+    fake = FakePublisher((job,))
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake):
+        with patch("meeting_recorder.__main__.shutil.get_terminal_size",
+                   return_value=os.terminal_size((160, 24))):
+            result, output = _output(
+                _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), status_job=job.job_id,
+            )
+
+    assert result == 0
+    assert "Metadata pending" in output and "Transfer unknown (HTTP 503)" in output
+    assert "; 1 missing tag;" in output
+    assert "Upload tags unknown" in output and "Sidecar warning" in output
+
+    # A row with no conditions uses the requested em dash marker.
+    healthy = _job("healthy", PublicationState.PUBLISHED)
+    healthy.last_error_code = None
+    healthy.last_http_status = None
+    fake = FakePublisher((healthy,))
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), status_job=healthy.job_id,
+        )
+    assert result == 0 and "—" in output
+
+
+def test_status_table_empty_and_json_all_preserve_order() -> None:
+    # An empty local store still prints the four table headers and no data row.
+    empty = FakePublisher()
+    empty.jobs.clear()
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=empty):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), all_jobs=True, status_all=True,
+        )
+    empty_lines = output.splitlines()
+    assert result == 0 and empty_lines == [
+        "Job  State  Attempts  Issue", "---  -----  --------  -----",
+    ]
+
+    # JSON all emits one compact sorted-key object per line in publisher order.
+    first = _job("first", PublicationState.QUEUED)
+    second = _job("second", PublicationState.PUBLISHED)
+    fake = FakePublisher((first, second))
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), all_jobs=True, status_all=True,
+            json_output=True,
+        )
+    lines = output.splitlines()
+    assert result == 0 and [json.loads(line)["job_id"] for line in lines] == ["first", "second"]
+    assert all(line.startswith('{"action":') for line in lines)
+
+
+def test_status_table_wraps_issue_and_shortens_job_ids_without_ansi() -> None:
+    # A narrow terminal keeps fixed columns readable, wraps issues, and shortens IDs.
+    job = _job(
+        "job-" + "x" * 60,
+        PublicationState.BLOCKED,
+        missing_tags=tuple(SimpleNamespace(tag_id=index, name="missing") for index in range(1, 4)),
+        upload_tags_unknown=True,
+        sidecar_warning=True,
+    )
+    fake = FakePublisher((job,))
+    with patch("meeting_recorder.__main__._speakr_publisher", return_value=fake), \
+            patch("meeting_recorder.__main__.shutil.get_terminal_size", return_value=os.terminal_size((42, 24))):
+        result, output = _output(
+            _cmd_speakr_upload, SimpleNamespace(speakr_url=ORIGIN), status_job=job.job_id,
+        )
+
+    assert result == 0 and "State" in output and "Attempts" in output
+    assert job.job_id not in output and "…" in output
+    assert "missing tags" in output and "Upload" in output and "unknown" in output
+    assert "\x1b[" not in output
 
 
 def test_path_upload_and_all_use_configured_origin_and_token() -> None:
