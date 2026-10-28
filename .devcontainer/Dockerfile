@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # Keep the baseline limited to Python checks and ordinary source-control work.
 RUN apt-get update \
